@@ -39,6 +39,27 @@ unpublished.
   `CommitSegment`; threshold failures include recent piece errors.
 - `proto_timestamp` and block/range math no longer panic on satellite extremes.
 - `cargo deny check` and `proto/check-pin.sh` pass again; rustdoc is warning-free.
+- Satellite RPCs use a small connection pool (up to 8) instead of one locked
+  connection, so concurrent uploads no longer serialize on every segment RPC.
+- Download orders are allocated incrementally (initial step, 1.5x growth) like
+  Go, so a long-tail-cancelled piece is only settled for what was read.
+- `Access::parse` stores the canonical macaroon, rejects conflicting store
+  entries, and never rewrites non-UTF-8 bucket names.
+- Go-signed `OrderLimit`/`PieceHash` goldens (`signed_go.jsonl`) verify with the
+  leaf certificate and are rejected by the CA certificate.
+
+### Added
+
+- `Config.message_timeout` (per-read/write deadline, default 10 min).
+- `UploadOptions.retention` / `UploadOptions.legal_hold`, sent in `BeginObject`.
+- `storj-ec`: NEON/SSSE3 `addmul` (≈8x scalar), `ReedSolomon::decode_plan`
+  (matrix inverted once per share set), in-place stripe encoding.
+- `storj-encryption`: in-place block transforms, in-place store adds, redacted
+  `Debug` for `Store`/`Lookup`/`PathIter`, zeroized derivation scratch.
+- `cargo-fuzz` targets under `fuzz/` (DRPC frames, macaroons, grants, path
+  components, CompressedBatch).
+- Mock satellite enforces `disallow_*` caveats per RPC; mock storage node honors
+  download order allocation and verifies orders and the uplink piece hash.
 
 ### Changed
 
