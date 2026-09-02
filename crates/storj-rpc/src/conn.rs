@@ -100,6 +100,21 @@ impl<T> Conn<T> {
     }
 }
 
+/// Handle for one in-flight streaming RPC (pool still allows only one per conn).
+#[derive(Debug)]
+pub struct RpcStream {
+    stream_id: u64,
+    next_message_id: u64,
+}
+
+impl RpcStream {
+    /// DRPC stream id for this invoke.
+    #[must_use]
+    pub fn stream_id(&self) -> u64 {
+        self.stream_id
+    }
+}
+
 impl<T: AsyncWrite + Unpin> Conn<T> {
     /// Write the TLS mux prefix. Call before any invoke when talking to a
     /// muxed listener; on real Storj this happens *before* TLS, not here.
@@ -262,6 +277,90 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Conn<T> {
                 other => return Err(Error::UnexpectedKind(other)),
             }
         }
+    }
+
+    /// Send `Invoke` for a streaming RPC. Does not send `CloseSend`.
+    pub async fn open_stream(&mut self, rpc: &str) -> Result<RpcStream, Error> {
+        let stream_id = self.next_stream_id;
+        self.next_stream_id += 1;
+        let mut stream = RpcStream {
+            stream_id,
+            next_message_id: 0,
+        };
+        self.send_kind(&mut stream, Kind::INVOKE, rpc.as_bytes())
+            .await?;
+        self.flush().await?;
+        Ok(stream)
+    }
+
+    /// Send a protobuf-encoded message on `stream`.
+    pub async fn send_msg(&mut self, stream: &mut RpcStream, data: &[u8]) -> Result<(), Error> {
+        self.send_kind(stream, Kind::MESSAGE, data).await?;
+        self.flush().await
+    }
+
+    /// Half-close the client send side (`CloseSend`).
+    pub async fn close_send(&mut self, stream: &mut RpcStream) -> Result<(), Error> {
+        self.send_kind(stream, Kind::CLOSE_SEND, &[]).await?;
+        self.flush().await
+    }
+
+    /// Fully close the stream (`Close`).
+    pub async fn close_stream(&mut self, stream: &mut RpcStream) -> Result<(), Error> {
+        self.send_kind(stream, Kind::CLOSE, &[]).await?;
+        self.flush().await
+    }
+
+    /// Read the next `Message` for `stream`. `Close`/`CloseSend` become [`Error::Closed`].
+    pub async fn recv_msg(&mut self, stream: &RpcStream) -> Result<Vec<u8>, Error> {
+        loop {
+            let pkt = self.read_packet().await?;
+            if pkt.stream_id != stream.stream_id {
+                if pkt.stream_id < stream.stream_id {
+                    continue;
+                }
+                return Err(Error::UnexpectedStream {
+                    got: pkt.stream_id,
+                    expected: stream.stream_id,
+                });
+            }
+            match pkt.kind {
+                Kind::MESSAGE => return Ok(pkt.data),
+                Kind::ERROR => {
+                    let (code, message) = unmarshal_error(&pkt.data);
+                    return Err(Error::Remote { code, message });
+                }
+                Kind::CLOSE | Kind::CLOSE_SEND => return Err(Error::Closed),
+                Kind::CANCEL => {
+                    return Err(Error::Remote {
+                        code: 0,
+                        message: "canceled".into(),
+                    });
+                }
+                _ if pkt.control => continue,
+                other => return Err(Error::UnexpectedKind(other)),
+            }
+        }
+    }
+
+    /// Like [`Self::recv_msg`], but `Close`/`CloseSend` yield `Ok(None)` (end of stream).
+    pub async fn recv_msg_opt(&mut self, stream: &RpcStream) -> Result<Option<Vec<u8>>, Error> {
+        match self.recv_msg(stream).await {
+            Ok(data) => Ok(Some(data)),
+            Err(Error::Closed) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn send_kind(
+        &mut self,
+        stream: &mut RpcStream,
+        kind: Kind,
+        data: &[u8],
+    ) -> Result<(), Error> {
+        stream.next_message_id += 1;
+        self.write_packet_data(stream.stream_id, stream.next_message_id, kind, false, data)
+            .await
     }
 }
 
@@ -568,6 +667,50 @@ mod tests {
         assert_eq!(second.data, b"body");
         assert_eq!(second.stream_id, 1);
         assert_eq!(second.message_id, 2);
+    }
+
+    #[tokio::test]
+    async fn streaming_client_messages_then_response() {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(async move {
+            let mut server = Conn::new(server_io);
+            let invoke = server.read_packet().await?;
+            assert_eq!(invoke.kind, Kind::INVOKE);
+            assert_eq!(invoke.data, b"/piecestore.Piecestore/Upload");
+            let mut acc = Vec::new();
+            loop {
+                let pkt = server.read_packet().await?;
+                match pkt.kind {
+                    Kind::MESSAGE => acc.extend_from_slice(&pkt.data),
+                    Kind::CLOSE_SEND => break,
+                    other => panic!("unexpected {other}"),
+                }
+            }
+            server
+                .write_packet(&Packet {
+                    stream_id: invoke.stream_id,
+                    message_id: 1,
+                    kind: Kind::MESSAGE,
+                    control: false,
+                    data: acc,
+                })
+                .await?;
+            drain_until_closed(&mut server).await
+        });
+
+        let mut client = Conn::new(client_io);
+        let mut stream = client
+            .open_stream("/piecestore.Piecestore/Upload")
+            .await
+            .unwrap();
+        client.send_msg(&mut stream, b"ab").await.unwrap();
+        client.send_msg(&mut stream, b"cd").await.unwrap();
+        client.close_send(&mut stream).await.unwrap();
+        let out = client.recv_msg(&stream).await.unwrap();
+        assert_eq!(out, b"abcd");
+        client.close_stream(&mut stream).await.unwrap();
+        drop(client);
+        server.await.unwrap().unwrap();
     }
 
     #[tokio::test]

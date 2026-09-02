@@ -3,9 +3,9 @@
 use std::fmt;
 use std::str::FromStr;
 
-use p256::ecdsa::signature::Verifier;
-use p256::ecdsa::{Signature, VerifyingKey};
-use p256::pkcs8::EncodePublicKey;
+use p256::ecdsa::signature::{Signer, Verifier};
+use p256::ecdsa::{Signature, SigningKey, VerifyingKey};
+use p256::pkcs8::{DecodePrivateKey, EncodePublicKey};
 use rcgen::{
     BasicConstraints, CertificateParams, CustomExtension, DistinguishedName, DnType,
     ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose, PKCS_ECDSA_P256_SHA256,
@@ -42,6 +42,12 @@ pub enum IdentityError {
     /// Certificate parse, chain, or generation failure.
     #[error("{0}")]
     Certificate(String),
+    /// Generated identity is required for CA signing (PEM loads have no CA key).
+    #[error("identity has no CA private key")]
+    NoCaKey,
+    /// ECDSA signature over SHA-256 digest did not verify.
+    #[error("invalid signature")]
+    Signature,
 }
 
 /// 32-byte Storj NodeID: double-SHA256 of the CA PKIX public key, last byte = ID version.
@@ -62,6 +68,12 @@ impl NodeId {
     #[must_use]
     pub fn as_bytes(&self) -> &[u8; NODE_ID_SIZE] {
         &self.0
+    }
+
+    /// Construct from raw 32 bytes (including the version in the last byte).
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; NODE_ID_SIZE]) -> Self {
+        Self(bytes)
     }
 
     /// Decode a Base58Check NodeID (`storj.NodeIDFromString`).
@@ -121,6 +133,8 @@ pub struct Identity {
     leaf: CertificateDer<'static>,
     ca: CertificateDer<'static>,
     key_pkcs8: Vec<u8>,
+    /// PKCS#8 of the CA key; present for [`Self::generate`], not PEM loads.
+    ca_key_pkcs8: Option<Vec<u8>>,
 }
 
 impl Identity {
@@ -168,6 +182,7 @@ impl Identity {
             leaf: leaf_der,
             ca: ca_der,
             key_pkcs8: leaf_key.serialize_der(),
+            ca_key_pkcs8: Some(ca_key.serialize_der()),
         })
     }
 
@@ -230,8 +245,40 @@ impl Identity {
             leaf,
             ca,
             key_pkcs8,
+            ca_key_pkcs8: None,
         })
     }
+
+    /// SHA-256 digest + ECDSA P-256 (Go `pkcrypto.HashAndSign`) using the CA key.
+    pub fn hash_and_sign(&self, data: &[u8]) -> Result<Vec<u8>, IdentityError> {
+        let der = self.ca_key_pkcs8.as_deref().ok_or(IdentityError::NoCaKey)?;
+        let sk = SigningKey::from_pkcs8_der(der)
+            .map_err(|e| IdentityError::Certificate(e.to_string()))?;
+        let sig: Signature = sk.sign(data);
+        Ok(sig.to_der().as_bytes().to_vec())
+    }
+
+    /// SHA-256 + ECDSA P-256 verify using this identity's CA certificate.
+    pub fn hash_and_verify(&self, data: &[u8], signature: &[u8]) -> Result<(), IdentityError> {
+        hash_and_verify(self.ca.as_ref(), data, signature)
+    }
+}
+
+/// Verify `signature` as Go `pkcrypto.HashAndVerifySignature` against a CA cert.
+pub fn hash_and_verify(
+    ca_cert_der: &[u8],
+    data: &[u8],
+    signature: &[u8],
+) -> Result<(), IdentityError> {
+    let vk = verifying_key_from_cert_der(ca_cert_der)?;
+    let sig = Signature::from_der(signature).map_err(|_| IdentityError::Signature)?;
+    vk.verify(data, &sig).map_err(|_| IdentityError::Signature)
+}
+
+fn verifying_key_from_cert_der(der: &[u8]) -> Result<VerifyingKey, IdentityError> {
+    let cert = parse_cert(der)?;
+    let sec1 = cert.public_key().subject_public_key.as_ref();
+    VerifyingKey::from_sec1_bytes(sec1).map_err(|e| IdentityError::Certificate(e.to_string()))
 }
 
 fn storj_dn() -> DistinguishedName {
@@ -396,6 +443,27 @@ mod tests {
             NodeId::from_certificate_der(ident.ca_der()).unwrap()
         );
         verify_cert_pair(ident.leaf_der(), ident.ca_der()).unwrap();
+    }
+
+    #[test]
+    fn hash_and_sign_roundtrip() {
+        let ident = Identity::generate().expect("generate");
+        let msg = b"order-limit-bytes";
+        let sig = ident.hash_and_sign(msg).expect("sign");
+        ident.hash_and_verify(msg, &sig).expect("verify self");
+        hash_and_verify(ident.ca_der().as_ref(), msg, &sig).expect("verify der");
+        assert!(hash_and_verify(ident.ca_der().as_ref(), b"tampered", &sig).is_err());
+        let other = Identity::generate().expect("other");
+        assert!(other.hash_and_verify(msg, &sig).is_err());
+    }
+
+    #[test]
+    fn pem_identity_cannot_sign() {
+        let ident = Identity::from_pem(GO_DUMP).expect("go dump");
+        assert!(matches!(
+            ident.hash_and_sign(b"x"),
+            Err(IdentityError::NoCaKey)
+        ));
     }
 
     #[test]
