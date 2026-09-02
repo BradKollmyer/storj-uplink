@@ -100,3 +100,31 @@ fn path_component_matches_go() {
         assert_eq!(hex::encode(got), get("out_hex"));
     }
 }
+
+#[test]
+fn path_encrypt_decrypt_empty_unicode_prefixes() {
+    use storj::encryption::{CipherSuite, Store, decrypt_path, encrypt_path, encrypt_prefix};
+
+    let mut store = Store::new();
+    store.set_default_key(EncryptionKey::from_bytes([7u8; 32]).inner().clone());
+    store.set_default_path_cipher(CipherSuite::AES_GCM);
+
+    for path in [
+        "",
+        "/",
+        "file.txt",
+        "file.txt/",
+        "café",
+        "café/naïve",
+        "logs/",
+    ] {
+        let enc = encrypt_path("bucket", path, &store).unwrap();
+        let dec = decrypt_path("bucket", &enc, &store).unwrap();
+        assert_eq!(dec, path.as_bytes(), "path={path:?}");
+
+        let penc = encrypt_prefix("bucket", path, &store).unwrap();
+        assert_eq!(path.ends_with('/'), penc.ends_with(b"/"), "prefix {path:?}");
+        let pdec = decrypt_path("bucket", &penc, &store).unwrap();
+        assert_eq!(pdec, path.as_bytes(), "prefix path={path:?}");
+    }
+}

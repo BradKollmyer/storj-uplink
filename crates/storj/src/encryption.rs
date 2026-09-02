@@ -1,4 +1,4 @@
-//! Encryption key derivation. Path/content ciphers land in later PRs.
+//! Encryption key derivation and path cipher (re-exported from `storj-encryption`).
 //!
 //! Matches `storj.io/common/encryption.DeriveRootKey`:
 //! ```text
@@ -8,23 +8,18 @@
 //! ```
 //! `EncryptionKey::derive` uses **p=1**. `request_with_passphrase` uses **p=8**.
 
-use hmac::{Hmac, Mac};
-use sha2::{Sha256, Sha512};
-use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
-
-use crate::constants::{
-    ARGON2_MEMORY_KIB, ARGON2_OUTPUT_LEN, ARGON2_PARALLELISM_DERIVE, ARGON2_TIME, PATH_HMAC_PREFIX,
-};
+use crate::constants::ARGON2_PARALLELISM_DERIVE;
 use crate::error::{Error, ErrorKind, Result};
 
-type HmacSha256 = Hmac<Sha256>;
-type HmacSha512 = Hmac<Sha512>;
+pub use storj_encryption::{
+    Base, CipherSuite, Lookup, PathIter, Store, decrypt_path, decrypt_path_with_cipher,
+    derive_content_key, derive_key, derive_path_key, derive_path_key_component, encrypt_path,
+    encrypt_path_with_cipher, encrypt_prefix,
+};
 
 /// 32-byte root/path key. Zeroized on drop.
-#[derive(Clone, Zeroize, ZeroizeOnDrop)]
-pub struct EncryptionKey {
-    bytes: [u8; 32],
-}
+#[derive(Clone)]
+pub struct EncryptionKey(storj_encryption::Key);
 
 impl EncryptionKey {
     /// Argon2id with caller-supplied salt (multitenancy).
@@ -35,12 +30,23 @@ impl EncryptionKey {
 
     /// Raw key bytes. Callers must not log this.
     pub fn as_bytes(&self) -> &[u8; 32] {
-        &self.bytes
+        self.0.as_bytes()
     }
 
     /// Build from an already-derived 32-byte key.
     pub fn from_bytes(bytes: [u8; 32]) -> Self {
-        Self { bytes }
+        Self(storj_encryption::Key::from_bytes(bytes))
+    }
+
+    /// Inner `storj-encryption` key.
+    pub fn inner(&self) -> &storj_encryption::Key {
+        &self.0
+    }
+}
+
+impl From<storj_encryption::Key> for EncryptionKey {
+    fn from(key: storj_encryption::Key) -> Self {
+        Self(key)
     }
 }
 
@@ -61,48 +67,19 @@ pub fn derive_root_key(
     path: &[u8],
     parallelism: u32,
 ) -> Result<EncryptionKey> {
-    let mixed = hmac_sha256(password, salt)?;
-    let path_salt = hmac_sha256(&mixed, path)?;
-
-    let params = argon2::Params::new(
-        ARGON2_MEMORY_KIB,
-        ARGON2_TIME,
-        parallelism,
-        Some(ARGON2_OUTPUT_LEN),
-    )
-    .map_err(|e| Error::new(ErrorKind::Protocol, format!("argon2 params: {e}")))?;
-    let argon = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
-
-    let mut out = Zeroizing::new([0u8; 32]);
-    argon
-        .hash_password_into(password, &path_salt, &mut *out)
-        .map_err(|e| Error::new(ErrorKind::Protocol, format!("argon2: {e}")))?;
-
-    Ok(EncryptionKey { bytes: *out })
-}
-
-fn hmac_sha256(key: &[u8], data: &[u8]) -> Result<[u8; 32]> {
-    let mut mac = HmacSha256::new_from_slice(key)
-        .map_err(|e| Error::new(ErrorKind::Protocol, format!("hmac: {e}")))?;
-    mac.update(data);
-    Ok(mac.finalize().into_bytes().into())
-}
-
-/// Path-component HD step: `HMAC-SHA512(key, "path:" + component)[0..32]`.
-pub fn derive_path_key_component(key: &[u8; 32], component: &str) -> [u8; 32] {
-    let mut mac = HmacSha512::new_from_slice(key).expect("HMAC-SHA512 accepts 32-byte keys");
-    mac.update(PATH_HMAC_PREFIX);
-    mac.update(component.as_bytes());
-    let full = mac.finalize().into_bytes();
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&full[..32]);
-    out
+    storj_encryption::derive_root_key(password, salt, path, parallelism)
+        .map(EncryptionKey)
+        .map_err(|e| Error::new(ErrorKind::Protocol, e.to_string()).with_source(e))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::constants::ARGON2_PARALLELISM_REQUEST;
+    use hmac::{Hmac, Mac};
+    use sha2::Sha512;
+
+    type HmacSha512 = Hmac<Sha512>;
 
     #[test]
     fn derive_is_deterministic() {
