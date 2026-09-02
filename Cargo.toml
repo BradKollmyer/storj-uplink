@@ -12,6 +12,7 @@ repository = "https://github.com/storj/storj-rust"
 [workspace.dependencies]
 storj = { path = "crates/storj" }
 storj-access = { path = "crates/storj-access" }
+storj-ec = { path = "crates/storj-ec" }
 storj-test = { path = "crates/storj-test" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "time"] }
 bytes = "1"
@@ -23,6 +24,7 @@ sha2 = "0.10"
 futures-core = "0.3"
 futures-util = "0.3"
 hex = "0.4"
+reed-solomon-erasure = "6"
 
 [workspace.lints.rust]
 missing_docs = "allow"

@@ -16,7 +16,7 @@ Maps to `docs/design-native-uplink.md` § Testing Strategy.
 | `grant_golden.rs` | Parse Go grants | PR 3 | ignore |
 | `encryption_golden.rs` | Go `DeriveRootKey` / path HMAC | fixtures checked in | yes |
 | `share_restrict.rs` | `share()` intersection | PR 6 | ignore |
-| `ec_golden.rs` (encode/decode) | infectious vectors | PR 8 | ignore |
+| `ec_golden.rs` (encode/decode) | infectious vectors | PR 8 | yes (BW still ignore) |
 | `project_buckets.rs` | Bucket CRUD | PR 11 | ignore |
 | `project_objects.rs` | List/stat/delete/copy/move | PR 23 | ignore |
 | `upload_download.rs` (I/O) | Pipeline | PR 13–14, 22 | ignore |
