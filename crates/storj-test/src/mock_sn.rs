@@ -22,6 +22,7 @@ pub struct MockStorageNode {
     identity: Identity,
     address: String,
     delay: Arc<Mutex<Duration>>,
+    fail_next: Arc<Mutex<bool>>,
     #[allow(dead_code)]
     store: Arc<Mutex<HashMap<Vec<u8>, Vec<u8>>>>,
     join: JoinHandle<()>,
@@ -37,11 +38,13 @@ impl MockStorageNode {
         let addr = listener.local_addr().expect("sn local addr");
         let address = addr.to_string();
         let delay = Arc::new(Mutex::new(Duration::ZERO));
+        let fail_next = Arc::new(Mutex::new(false));
         let store = Arc::new(Mutex::new(HashMap::new()));
         let server_cfg = server_config(&identity).expect("mock SN tls");
         let acceptor = TlsAcceptor::from(Arc::new(server_cfg));
         let sn = identity.clone();
         let delay_c = Arc::clone(&delay);
+        let fail_c = Arc::clone(&fail_next);
         let store_c = Arc::clone(&store);
         let join = tokio::spawn(async move {
             loop {
@@ -53,9 +56,10 @@ impl MockStorageNode {
                 let sn = sn.clone();
                 let sat_ca = satellite_ca.clone();
                 let delay = Arc::clone(&delay_c);
+                let fail_next = Arc::clone(&fail_c);
                 let store = Arc::clone(&store_c);
                 tokio::spawn(async move {
-                    let _ = serve_conn(tcp, acceptor, sn, sat_ca, delay, store).await;
+                    let _ = serve_conn(tcp, acceptor, sn, sat_ca, delay, fail_next, store).await;
                 });
             }
         });
@@ -63,6 +67,7 @@ impl MockStorageNode {
             identity,
             address,
             delay,
+            fail_next,
             store,
             join,
         }
@@ -82,6 +87,11 @@ impl MockStorageNode {
     pub async fn set_delay(&self, d: Duration) {
         *self.delay.lock().await = d;
     }
+
+    /// Next Upload closes without a piece-hash response.
+    pub async fn fail_next_upload(&self) {
+        *self.fail_next.lock().await = true;
+    }
 }
 
 impl Drop for MockStorageNode {
@@ -96,6 +106,7 @@ async fn serve_conn(
     sn: Identity,
     satellite_ca: Vec<u8>,
     delay: Arc<Mutex<Duration>>,
+    fail_next: Arc<Mutex<bool>>,
     store: Arc<Mutex<HashMap<Vec<u8>, Vec<u8>>>>,
 ) -> Result<(), storj_rpc::Error> {
     read_tls_mux_prefix(&mut tcp).await?;
@@ -120,6 +131,7 @@ async fn serve_conn(
             &sn,
             &satellite_ca,
             &delay,
+            &fail_next,
             &store,
         )
         .await
@@ -136,6 +148,7 @@ async fn serve_upload(
     sn: &Identity,
     satellite_ca: &[u8],
     delay: &Mutex<Duration>,
+    fail_next: &Mutex<bool>,
     store: &Mutex<HashMap<Vec<u8>, Vec<u8>>>,
 ) -> Result<(), storj_uplink::Error> {
     let mut limit = None;
@@ -181,6 +194,15 @@ async fn serve_upload(
     let wait = *delay.lock().await;
     if !wait.is_zero() {
         tokio::time::sleep(wait).await;
+    }
+    {
+        let mut g = fail_next.lock().await;
+        if *g {
+            *g = false;
+            return Err(storj_uplink::Error::protocol(
+                "injected piece upload failure",
+            ));
+        }
     }
     let limit = limit.ok_or_else(|| storj_uplink::Error::protocol("missing order limit"))?;
     let uplink_done = done.ok_or_else(|| storj_uplink::Error::protocol("missing piece hash"))?;

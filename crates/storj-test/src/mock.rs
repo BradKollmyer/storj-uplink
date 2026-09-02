@@ -1,6 +1,6 @@
 //! In-process mock satellite: loopback TLS + DRPC unary for ProjectInfo and buckets.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -36,6 +36,7 @@ const RPC_NOT_FOUND: u64 = 5;
 const RPC_ALREADY_EXISTS: u64 = 6;
 const RPC_PERMISSION_DENIED: u64 = 7;
 const RPC_FAILED_PRECONDITION: u64 = 9;
+const RPC_INTERNAL: u64 = 13;
 const RPC_UNIMPLEMENTED: u64 = 12;
 
 const PROJECT_SALT: &[u8] = b"0123456789abcdef";
@@ -65,6 +66,10 @@ struct MockState {
     retry_begin: usize,
     next_id: u64,
     piece_key: Vec<u8>,
+    fail_commit: bool,
+    last_retry_segment_id: Option<Vec<u8>>,
+    last_commit_segment_id: Option<Vec<u8>>,
+    sn_tags: Vec<HashMap<String, Vec<u8>>>,
 }
 
 /// Loopback TLS satellite that speaks `ProjectInfo`, buckets, and upload RPCs.
@@ -113,6 +118,10 @@ impl MockSatellite {
             retry_begin: 0,
             next_id: 1,
             piece_key,
+            fail_commit: false,
+            last_retry_segment_id: None,
+            last_commit_segment_id: None,
+            sn_tags: vec![HashMap::new(); 6],
         }));
 
         let server_cfg = server_config(&identity).expect("mock server tls");
@@ -222,6 +231,29 @@ impl MockSatellite {
     /// Aborted stream ids.
     pub fn aborted_count(&self) -> usize {
         self.state.lock().expect("mock state").aborted.len()
+    }
+
+    /// Next `CommitObject` returns an error (then clears).
+    pub fn fail_next_commit_object(&self) {
+        self.state.lock().expect("mock state").fail_commit = true;
+    }
+
+    /// Segment id last sent on `CommitSegment`.
+    pub fn last_commit_segment_id(&self) -> Option<Vec<u8>> {
+        self.state
+            .lock()
+            .expect("mock state")
+            .last_commit_segment_id
+            .clone()
+    }
+
+    /// Segment id last returned by `RetryBeginSegmentPieces`.
+    pub fn last_retry_segment_id(&self) -> Option<Vec<u8>> {
+        self.state
+            .lock()
+            .expect("mock state")
+            .last_retry_segment_id
+            .clone()
     }
 
     /// Mark `bucket` as containing an object (for `BucketNotEmpty` tests).
@@ -552,6 +584,10 @@ fn commit_object(
 ) -> Result<CommitObjectResponse, (u64, String)> {
     let mut st = state.lock().expect("mock state");
     check_key(&req.header, &st)?;
+    if st.fail_commit {
+        st.fail_commit = false;
+        return Err((RPC_INTERNAL, "commit object failed".into()));
+    }
     let pending = st
         .pending
         .remove(&req.stream_id)
@@ -613,12 +649,14 @@ fn begin_segment(
     st.next_id += 1;
     let segment_id = st.next_id.to_be_bytes().to_vec();
     let piece_key = st.piece_key.clone();
+    let sn_tags = st.sn_tags.clone();
     drop(st);
     let pk = PiecePrivateKey::from_bytes(&piece_key)
         .map_err(|e| (RPC_INVALID_ARGUMENT, e.to_string()))?;
     let n = sns.len().min(4);
     let mut addressed_limits = Vec::new();
     for (i, sn) in sns.iter().take(n).enumerate() {
+        let tags = sn_tags.get(i).cloned().unwrap_or_default();
         addressed_limits.push(signed_limit(
             identity,
             sn,
@@ -626,6 +664,7 @@ fn begin_segment(
             i as i32,
             &segment_id,
             req.max_order_limit.max(64 * 1024),
+            tags,
         )?);
     }
     Ok(BeginSegmentResponse {
@@ -650,27 +689,34 @@ fn retry_pieces(
     let mut st = state.lock().expect("mock state");
     check_key(&req.header, &st)?;
     st.retry_begin += 1;
+    st.next_id += 1;
+    let new_id = st.next_id.to_be_bytes().to_vec();
+    st.last_retry_segment_id = Some(new_id.clone());
     let piece_key = st.piece_key.clone();
+    let sn_tags = st.sn_tags.clone();
     drop(st);
     let pk = PiecePrivateKey::from_bytes(&piece_key)
         .map_err(|e| (RPC_INVALID_ARGUMENT, e.to_string()))?;
     let mut addressed_limits = Vec::new();
     for (i, num) in req.retry_piece_numbers.iter().enumerate() {
+        let sn_idx = (4 + i) % sns.len().max(1);
         let sn = sns
-            .get((4 + i) % sns.len())
+            .get(sn_idx)
             .or_else(|| sns.first())
             .ok_or_else(|| (RPC_INVALID_ARGUMENT, "no storage nodes".into()))?;
+        let tags = sn_tags.get(sn_idx).cloned().unwrap_or_default();
         addressed_limits.push(signed_limit(
             identity,
             sn,
             &pk,
             *num,
-            &req.segment_id,
+            &new_id,
             64 * 1024,
+            tags,
         )?);
     }
     Ok(RetryBeginSegmentPiecesResponse {
-        segment_id: req.segment_id,
+        segment_id: new_id,
         addressed_limits,
     })
 }
@@ -679,8 +725,17 @@ fn commit_segment(
     req: CommitSegmentRequest,
     state: &Mutex<MockState>,
 ) -> Result<CommitSegmentResponse, (u64, String)> {
-    let st = state.lock().expect("mock state");
+    let mut st = state.lock().expect("mock state");
     check_key(&req.header, &st)?;
+    if let Some(ref expected) = st.last_retry_segment_id {
+        if &req.segment_id != expected {
+            return Err((
+                RPC_INVALID_ARGUMENT,
+                "stale segment id after RetryBeginSegmentPieces".into(),
+            ));
+        }
+    }
+    st.last_commit_segment_id = Some(req.segment_id.clone());
     Ok(CommitSegmentResponse {
         successful_pieces: req.upload_result.len() as i32,
     })
@@ -720,6 +775,7 @@ fn signed_limit(
     piece_num: i32,
     segment_id: &[u8],
     limit: i64,
+    tags: HashMap<String, Vec<u8>>,
 ) -> Result<AddressedOrderLimit, (u64, String)> {
     let now = timestamp(SystemTime::now());
     let mut piece_id = [0u8; 32];
@@ -756,7 +812,7 @@ fn signed_limit(
             address: sn.address().to_string(),
             ..Default::default()
         }),
-        tags: Default::default(),
+        tags,
     })
 }
 

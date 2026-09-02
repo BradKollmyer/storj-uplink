@@ -13,7 +13,7 @@ pub use crate::pipeline::{
     EncryptedUserData, MAX_INLINE_SEGMENT_SIZE, MAX_SEGMENT_SIZE, encrypt_user_data,
 };
 pub use crate::segment::{
-    LongTailUpload, PieceAssignment, SnPool, SnTransport, cohort_needed, dial_sn,
+    LongTailUpload, PieceAssignment, SnPool, SnTransport, cohort_needed, cohort_satisfied, dial_sn,
     upload_pieces_long_tail,
 };
 

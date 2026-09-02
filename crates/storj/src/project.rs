@@ -450,6 +450,14 @@ pub(crate) async fn commit_upload(inner: UploadInner) -> Result<Object> {
     };
     use storj_uplink::segment::{LongTailUpload, PieceAssignment, upload_pieces_long_tail};
 
+    let abort = PendingAbort {
+        project: Arc::clone(&inner.project),
+        bucket: inner.bucket.clone(),
+        encrypted_object_key: inner.encrypted_object_key.clone(),
+        stream_id: inner.stream_id.clone(),
+    };
+    let mut abort_on_drop = AbortOnDrop(Some(abort));
+
     let UploadInner {
         project,
         bucket,
@@ -521,7 +529,7 @@ pub(crate) async fn commit_upload(inner: UploadInner) -> Result<Object> {
         let metainfo = &project.metainfo;
         let bucket_c = bucket.clone();
         let key_c = key.clone();
-        let results = upload_pieces_long_tail(
+        let (segment_id, results) = upload_pieces_long_tail(
             LongTailUpload {
                 assignments,
                 segment_id: begin.segment_id.clone(),
@@ -555,7 +563,7 @@ pub(crate) async fn commit_upload(inner: UploadInner) -> Result<Object> {
                 &bucket,
                 &key,
                 CommitSegmentRequest {
-                    segment_id: begin.segment_id,
+                    segment_id,
                     encrypted_key_nonce: encrypted_key_nonce.to_vec(),
                     encrypted_key: encrypted_key.clone(),
                     size_encrypted_data: enc_size,
@@ -574,6 +582,7 @@ pub(crate) async fn commit_upload(inner: UploadInner) -> Result<Object> {
         last_plain,
         cipher,
         &content_key,
+        block_size,
     )
     .map_err(|e| Error::new(ErrorKind::Protocol, e.to_string()).with_source(e))?;
 
@@ -581,10 +590,55 @@ pub(crate) async fn commit_upload(inner: UploadInner) -> Result<Object> {
         .metainfo
         .commit_object(&bucket, &key, stream_id, user)
         .await?;
+    abort_on_drop.disarm();
     let mut obj = object_from_proto(committed.object, &key);
     obj.system.content_length = last_plain;
     obj.custom = custom_pairs.into_iter().collect();
     Ok(obj)
+}
+
+struct PendingAbort {
+    project: Arc<ProjectInner>,
+    bucket: String,
+    encrypted_object_key: Vec<u8>,
+    stream_id: Vec<u8>,
+}
+
+struct AbortOnDrop(Option<PendingAbort>);
+
+impl AbortOnDrop {
+    fn disarm(&mut self) {
+        self.0.take();
+    }
+}
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        let Some(pending) = self.0.take() else {
+            return;
+        };
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let _ = abort_pending(pending).await;
+            });
+        }
+    }
+}
+
+async fn abort_pending(pending: PendingAbort) -> Result<()> {
+    abort_upload(UploadInner {
+        project: pending.project,
+        bucket: pending.bucket,
+        key: String::new(),
+        encrypted_object_key: pending.encrypted_object_key,
+        stream_id: pending.stream_id,
+        content_key: storj_encryption::Key::from_bytes([0u8; 32]),
+        cipher: storj_encryption::CipherSuite::AES_GCM,
+        block_size: 0,
+        custom: CustomMetadata::new(),
+        plaintext: Vec::new(),
+    })
+    .await
 }
 
 pub(crate) async fn abort_upload(inner: UploadInner) -> Result<()> {

@@ -98,16 +98,57 @@ async fn long_tail_cancels_slow_pieces() {
         .expect("commit");
     assert_eq!(obj.system.content_length, 5000);
     assert!(mock.remote_segment_count() >= 1);
+
+    mock.set_sn_delay(3, std::time::Duration::ZERO).await;
+    let mut upload = project
+        .upload_object(&name, "again", Default::default())
+        .await
+        .unwrap();
+    upload.write_all(&vec![8u8; 5000]).await.unwrap();
+    let obj = tokio::time::timeout(std::time::Duration::from_secs(15), upload.commit())
+        .await
+        .expect("second remote upload must redial cancelled SN")
+        .expect("second commit");
+    assert_eq!(obj.system.content_length, 5000);
+}
+
+#[tokio::test]
+async fn retry_rotates_segment_id_for_commit() {
+    use tokio::io::AsyncWriteExt;
+    let mock = storj_test::MockSatellite::start().await;
+    mock.storage_nodes()[0].fail_next_upload().await;
+    mock.storage_nodes()[1].fail_next_upload().await;
+    let project = storj::Project::open(&mock.access()).await.expect("open");
+    let name = format!(
+        "retry-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    project.ensure_bucket(&name).await.unwrap();
+    let mut upload = project
+        .upload_object(&name, "r", Default::default())
+        .await
+        .unwrap();
+    upload.write_all(&vec![9u8; 5000]).await.unwrap();
+    upload.commit().await.expect("commit after retry");
+    assert!(mock.retry_begin_count() >= 1);
+    assert_eq!(
+        mock.last_commit_segment_id(),
+        mock.last_retry_segment_id(),
+        "CommitSegment must use the rotated segment id"
+    );
 }
 
 #[test]
-#[ignore = "PR 13: reconstruction fails with k-1 pieces"]
+#[ignore = "PR 14: reconstruction fails with k-1 pieces"]
 fn k_minus_one_pieces_fails_download() {
     panic!("mock SN set of size k-1");
 }
 
 #[test]
-#[ignore = "PR 13: commit timeout"]
+#[ignore = "later: CommitSegment hang → Canceled or Protocol"]
 fn commit_segment_timeout() {
     panic!("mock metainfo CommitSegment hang → Canceled or Protocol");
 }

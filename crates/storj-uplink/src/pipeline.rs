@@ -224,6 +224,7 @@ pub fn encrypt_user_data(
     last_segment_size: i64,
     cipher: CipherSuite,
     derived_content_key: &Key,
+    encryption_block_size: usize,
 ) -> Result<EncryptedUserData> {
     let mut user_defined = std::collections::HashMap::new();
     for (k, v) in custom {
@@ -247,10 +248,15 @@ pub fn encrypt_user_data(
         &encrypted_metadata_nonce,
     )?;
     let encrypted_stream_info = encrypt(&stream_info, cipher, &metadata_key, &[0u8; NONCE_SIZE])?;
+    let block = if encryption_block_size == 0 {
+        DEFAULT_ENCRYPTED_BLOCK_SIZE
+    } else {
+        encryption_block_size
+    };
     let encrypted_metadata = StreamMeta {
         encrypted_stream_info,
         encryption_type: cipher.0,
-        encryption_block_size: 0,
+        encryption_block_size: i32::try_from(block).unwrap_or(i32::MAX),
         number_of_segments: 1,
     }
     .encode_to_vec();
@@ -332,6 +338,30 @@ mod tests {
         let n = content_nonce(0, 0);
         assert_eq!(n[0], 1);
         assert!(n[1..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn stream_meta_block_size_is_encrypted_block() {
+        let key = Key::from_bytes([9u8; 32]);
+        let user =
+            encrypt_user_data(&[], 64 * 1024 * 1024, 11, CipherSuite::AES_GCM, &key, 0).unwrap();
+        let meta = StreamMeta::decode(user.encrypted_metadata.as_slice()).unwrap();
+        assert_eq!(
+            meta.encryption_block_size,
+            DEFAULT_ENCRYPTED_BLOCK_SIZE as i32
+        );
+        assert_eq!(meta.encryption_block_size, 7424);
+        let user = encrypt_user_data(
+            &[],
+            64 * 1024 * 1024,
+            11,
+            CipherSuite::AES_GCM,
+            &key,
+            DEFAULT_ENCRYPTED_BLOCK_SIZE,
+        )
+        .unwrap();
+        let meta = StreamMeta::decode(user.encrypted_metadata.as_slice()).unwrap();
+        assert_eq!(meta.encryption_block_size, 7424);
     }
 
     #[test]

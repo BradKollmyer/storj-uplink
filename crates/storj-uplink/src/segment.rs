@@ -81,7 +81,7 @@ fn node_id_from_bytes(b: &[u8]) -> Result<NodeId> {
     Ok(NodeId::from_bytes(arr))
 }
 
-/// Required successful pieces from [`CohortRequirements`], else `default_o`.
+/// Lower bound on successful pieces for [`CohortRequirements`] (Go `min()`).
 #[must_use]
 pub fn cohort_needed(req: Option<&CohortRequirements>, default_o: i32) -> i32 {
     let Some(req) = req else {
@@ -107,10 +107,81 @@ pub fn cohort_needed(req: Option<&CohortRequirements>, default_o: i32) -> i32 {
                 .as_deref()
                 .map(|c| cohort_needed(Some(c), default_o))
                 .unwrap_or(default_o);
-            child.saturating_sub(w.amount.max(0))
+            child.saturating_add(w.amount.max(0))
         }
         None => default_o,
     }
+}
+
+/// Whether the successful pieces’ tags satisfy `req` (Go `meetsCohortRequirements`).
+#[must_use]
+pub fn cohort_satisfied(
+    req: Option<&CohortRequirements>,
+    tags: &[HashMap<String, Vec<u8>>],
+) -> bool {
+    let Some(req) = req else {
+        return true;
+    };
+    cohort_valid(req, tags)
+}
+
+fn cohort_valid(req: &CohortRequirements, tags: &[HashMap<String, Vec<u8>>]) -> bool {
+    match req.requirement.as_ref() {
+        Some(cohort_requirements::Requirement::Literal(lit)) => (tags.len() as i32) >= lit.value,
+        Some(cohort_requirements::Requirement::And(and)) => {
+            and.requirements.iter().all(|r| cohort_valid(r, tags))
+        }
+        Some(cohort_requirements::Requirement::Withhold(w)) => {
+            let remaining = withhold_tags(w.tag_key.as_str(), w.amount, tags);
+            match w.child.as_deref() {
+                Some(child) => cohort_valid(child, &remaining),
+                None => true,
+            }
+        }
+        None => true,
+    }
+}
+
+/// Remove pieces whose tag value is among the top `amount` values by count (Go matcherWithhold).
+fn withhold_tags(
+    key: &str,
+    amount: i32,
+    tags: &[HashMap<String, Vec<u8>>],
+) -> Vec<HashMap<String, Vec<u8>>> {
+    if amount <= 0 {
+        return tags.to_vec();
+    }
+    let amount = amount as usize;
+    let mut counts: HashMap<Vec<u8>, usize> = HashMap::new();
+    for t in tags {
+        let v = t.get(key).cloned().unwrap_or_default();
+        *counts.entry(v).or_insert(0) += 1;
+    }
+    let mut topn: HashMap<Vec<u8>, usize> = HashMap::new();
+    for (value, count) in &counts {
+        if value.is_empty() {
+            continue;
+        }
+        if topn.len() < amount {
+            topn.insert(value.clone(), *count);
+            continue;
+        }
+        let replace = topn
+            .iter()
+            .find(|(_, c)| count > *c)
+            .map(|(k, _)| k.clone());
+        if let Some(old) = replace {
+            topn.remove(&old);
+            topn.insert(value.clone(), *count);
+        }
+    }
+    tags.iter()
+        .filter(|t| {
+            let v = t.get(key).cloned().unwrap_or_default();
+            !topn.contains_key(&v)
+        })
+        .cloned()
+        .collect()
 }
 
 /// Dial a storage node: TCP + `DRPC!!!1` + NodeID-pinned TLS.
@@ -189,24 +260,19 @@ pub struct LongTailUpload {
 /// Upload `pieces` with long-tail cancellation and limit retry.
 ///
 /// `retry` is `RetryBeginSegmentPieces(segment_id, failed_piece_nums)`.
+/// Returns the latest `segment_id` (rotated on retry) and the successful pieces.
 pub async fn upload_pieces_long_tail<F, Fut>(
     mut job: LongTailUpload,
     mut retry: F,
-) -> Result<Vec<PieceResult>>
+) -> Result<(Vec<u8>, Vec<PieceResult>)>
 where
     F: FnMut(Vec<u8>, Vec<i32>) -> Fut,
     Fut: std::future::Future<Output = Result<(Vec<u8>, Vec<AddressedOrderLimit>)>>,
 {
-    let needed = cohort_needed(
-        job.cohort.as_ref(),
-        i32::try_from(job.rs.o).unwrap_or(i32::MAX),
-    )
-    .max(1) as usize;
-    let needed = needed.min(job.rs.n).min(job.assignments.len().max(1));
     let mut successes: Vec<PieceResult> = Vec::new();
     let mut attempts = 0u32;
 
-    while successes.len() < needed && attempts < 4 {
+    while !requirements_met(&job, &successes) && attempts < 4 {
         attempts += 1;
         let done_nums: std::collections::HashSet<i32> =
             successes.iter().map(|s| s.piece_num).collect();
@@ -220,11 +286,10 @@ where
             break;
         }
 
-        let remaining = needed.saturating_sub(successes.len());
-        let (round_ok, failed_nums) = upload_round(&job, pending, remaining).await?;
+        let (round_ok, failed_nums) = upload_round(&job, pending, &successes).await?;
         successes.extend(round_ok);
 
-        if successes.len() >= needed {
+        if requirements_met(&job, &successes) {
             break;
         }
         if failed_nums.is_empty() {
@@ -252,19 +317,39 @@ where
         }
     }
 
-    if successes.len() < needed {
+    if !requirements_met(&job, &successes) {
         return Err(Error::protocol(format!(
-            "segment upload: {} successful pieces, need {needed}",
+            "segment upload: {} successful pieces do not meet cohort/o",
             successes.len()
         )));
     }
-    Ok(successes)
+    Ok((job.segment_id, successes))
+}
+
+fn success_tags(job: &LongTailUpload, successes: &[PieceResult]) -> Vec<HashMap<String, Vec<u8>>> {
+    successes
+        .iter()
+        .filter_map(|s| {
+            job.assignments
+                .iter()
+                .find(|a| a.piece_num == s.piece_num)
+                .map(|a| a.tags.clone())
+        })
+        .collect()
+}
+
+fn requirements_met(job: &LongTailUpload, successes: &[PieceResult]) -> bool {
+    let tags = success_tags(job, successes);
+    match job.cohort.as_ref() {
+        None => tags.len() >= job.rs.o,
+        Some(req) => cohort_valid(req, &tags),
+    }
 }
 
 async fn upload_round(
     job: &LongTailUpload,
     pending: Vec<PieceAssignment>,
-    stop_at: usize,
+    already: &[PieceResult],
 ) -> Result<(Vec<PieceResult>, Vec<i32>)> {
     let mut set = JoinSet::new();
     for asg in pending {
@@ -286,7 +371,9 @@ async fn upload_round(
         match joined {
             Ok(Ok(result)) => {
                 successes.push(result);
-                if successes.len() >= stop_at {
+                let mut all = already.to_vec();
+                all.extend(successes.iter().cloned());
+                if requirements_met(job, &all) {
                     set.abort_all();
                     while set.join_next().await.is_some() {}
                     break;
@@ -312,14 +399,31 @@ async fn upload_one_piece(
     dial_timeout: Duration,
 ) -> std::result::Result<PieceResult, (i32, Error)> {
     let node = asg.node_id;
-    let mut pooled: Pooled<SnTransport> = pool
+    let pooled: Pooled<SnTransport> = pool
         .checkout(node, || async {
             dial_sn(&identity, node, &asg.address, dial_timeout).await
         })
         .await
         .map_err(|e| (asg.piece_num, e))?;
-    let transport = pooled
-        .get_mut()
+    struct RecycleOnDrop {
+        pooled: Option<Pooled<SnTransport>>,
+    }
+    impl Drop for RecycleOnDrop {
+        fn drop(&mut self) {
+            if let Some(mut pooled) = self.pooled.take() {
+                if pooled.get().is_none_or(|t| t.conn.is_none()) {
+                    pooled.skip_recycle();
+                }
+            }
+        }
+    }
+    let mut held = RecycleOnDrop {
+        pooled: Some(pooled),
+    };
+    let transport = held
+        .pooled
+        .as_mut()
+        .and_then(Pooled::get_mut)
         .ok_or_else(|| (asg.piece_num, Error::protocol("pooled SN conn missing")))?;
     match put_piece(transport, &satellite_ca, &piece_key, &asg.limit, &data).await {
         Ok(hash) => Ok(SegmentPieceUploadResult {
@@ -348,4 +452,75 @@ async fn put_piece(
     let result = client.upload(limit, piece_key, data).await;
     transport.conn = Some(client.into_conn());
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tags(pairs: &[(&str, &str)]) -> HashMap<String, Vec<u8>> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), v.as_bytes().to_vec()))
+            .collect()
+    }
+
+    fn withhold(amount: i32, literal: i32) -> CohortRequirements {
+        CohortRequirements {
+            requirement: Some(cohort_requirements::Requirement::Withhold(Box::new(
+                cohort_requirements::Withhold {
+                    tag_key: "region".into(),
+                    amount,
+                    child: Some(Box::new(CohortRequirements {
+                        requirement: Some(cohort_requirements::Requirement::Literal(
+                            cohort_requirements::Literal { value: literal },
+                        )),
+                    })),
+                },
+            ))),
+        }
+    }
+
+    #[test]
+    fn withhold_same_tag_fails_mixed_passes() {
+        let req = withhold(1, 2);
+        let same = vec![
+            tags(&[("region", "us")]),
+            tags(&[("region", "us")]),
+            tags(&[("region", "us")]),
+        ];
+        assert!(
+            !cohort_satisfied(Some(&req), &same),
+            "same-tag o-set must fail withhold"
+        );
+        let mixed = vec![
+            tags(&[("region", "us")]),
+            tags(&[("region", "eu")]),
+            tags(&[("region", "ap")]),
+        ];
+        assert!(
+            cohort_satisfied(Some(&req), &mixed),
+            "mixed-tag set must pass withhold"
+        );
+    }
+
+    #[test]
+    fn literal_counts_pieces() {
+        let req = CohortRequirements {
+            requirement: Some(cohort_requirements::Requirement::Literal(
+                cohort_requirements::Literal { value: 3 },
+            )),
+        };
+        assert!(!cohort_satisfied(Some(&req), &[tags(&[])],));
+        assert!(cohort_satisfied(
+            Some(&req),
+            &[tags(&[]), tags(&[]), tags(&[])]
+        ));
+    }
+
+    #[test]
+    fn cohort_needed_withhold_adds_amount() {
+        let req = withhold(1, 3);
+        assert_eq!(cohort_needed(Some(&req), 3), 4);
+    }
 }

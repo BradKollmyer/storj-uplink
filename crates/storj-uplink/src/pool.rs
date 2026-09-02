@@ -106,6 +106,7 @@ impl<T> Slot<T> {
             conn: Some(conn),
             node: self.node,
             pool: Arc::clone(&self.pool),
+            recycle: true,
         }
     }
 }
@@ -225,6 +226,7 @@ pub struct Pooled<T> {
     conn: Option<T>,
     node: NodeId,
     pool: Arc<PoolInner<T>>,
+    recycle: bool,
 }
 
 impl<T> Pooled<T> {
@@ -244,6 +246,11 @@ impl<T> Pooled<T> {
     pub fn get_mut(&mut self) -> Option<&mut T> {
         self.conn.as_mut()
     }
+
+    /// Do not return this connection to the idle pool (mid-RPC cancel / poison).
+    pub fn skip_recycle(&mut self) {
+        self.recycle = false;
+    }
 }
 
 impl<T> Drop for Pooled<T> {
@@ -252,7 +259,9 @@ impl<T> Drop for Pooled<T> {
             {
                 let mut g = self.pool.guard();
                 g.in_use = g.in_use.saturating_sub(1);
-                g.push_idle(self.node, conn);
+                if self.recycle {
+                    g.push_idle(self.node, conn);
+                }
             }
             self.pool.notify.notify_one();
         }
@@ -371,5 +380,33 @@ mod tests {
         .expect("leaked slot")
         .unwrap();
         assert_eq!(*got.get().expect("conn"), 7);
+    }
+
+    #[tokio::test]
+    async fn skip_recycle_does_not_reuse() {
+        let pool = ConnectionPool::new(PoolConfig::for_redundancy_n(1));
+        let node = nid(1);
+        let dials = Arc::new(AtomicUsize::new(0));
+        {
+            let dials = Arc::clone(&dials);
+            let mut poisoned = pool
+                .checkout(node, || async move {
+                    dials.fetch_add(1, Ordering::SeqCst);
+                    Ok::<_, Error>(1u32)
+                })
+                .await
+                .unwrap();
+            poisoned.skip_recycle();
+        }
+        assert_eq!(pool.idle_count(), 0);
+        let dials2 = Arc::clone(&dials);
+        let _again = pool
+            .checkout(node, || async move {
+                dials2.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, Error>(2u32)
+            })
+            .await
+            .unwrap();
+        assert_eq!(dials.load(Ordering::SeqCst), 2, "skipped conn must redial");
     }
 }

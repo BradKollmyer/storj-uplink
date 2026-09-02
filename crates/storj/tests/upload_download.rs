@@ -4,6 +4,7 @@
 
 use std::time::Duration;
 
+use storj::constants::MAX_SEGMENT_SIZE;
 use storj::{DownloadOptions, ErrorKind, Project};
 use storj_test::{INTEROP_SIZES, MockSatellite, size_label};
 use tokio::io::AsyncWriteExt;
@@ -203,6 +204,42 @@ async fn abort_uncommitted() {
         .unwrap();
     upload.write_all(b"nope").await.unwrap();
     upload.abort().await.unwrap();
+    assert_eq!(mock.committed_count(), 0);
+    assert!(mock.aborted_count() >= 1);
+}
+
+#[tokio::test]
+async fn write_beyond_one_segment_fails() {
+    let mock = MockSatellite::start().await;
+    let project = open_project(&mock).await;
+    let bucket = unique("big");
+    project.ensure_bucket(&bucket).await.unwrap();
+    let mut upload = project
+        .upload_object(&bucket, "too-big", Default::default())
+        .await
+        .unwrap();
+    let data = vec![0u8; MAX_SEGMENT_SIZE as usize + 1];
+    let err = upload.write_all(&data).await.unwrap_err();
+    assert!(err.to_string().contains("64MiB") || err.to_string().contains("single-segment"));
+    drop(upload);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(mock.committed_count(), 0);
+}
+
+#[tokio::test]
+async fn failed_commit_object_aborts() {
+    let mock = MockSatellite::start().await;
+    mock.fail_next_commit_object();
+    let project = open_project(&mock).await;
+    let bucket = unique("failc");
+    project.ensure_bucket(&bucket).await.unwrap();
+    let mut upload = project
+        .upload_object(&bucket, "x", Default::default())
+        .await
+        .unwrap();
+    upload.write_all(b"hello").await.unwrap();
+    assert!(upload.commit().await.is_err());
+    tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(mock.committed_count(), 0);
     assert!(mock.aborted_count() >= 1);
 }
