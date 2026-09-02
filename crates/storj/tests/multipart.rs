@@ -1,7 +1,9 @@
 //! Multipart upload API (PR 24). Min part 5 MiB except last; max 10_000 parts.
 
 use futures_util::StreamExt;
-use storj::constants::{MAX_MULTIPART_PARTS, MIN_MULTIPART_PART_SIZE, STREAM_ID_BASE58_VERSION};
+use storj::constants::{
+    MAX_MULTIPART_PARTS, MAX_SEGMENT_SIZE, MIN_MULTIPART_PART_SIZE, STREAM_ID_BASE58_VERSION,
+};
 use storj::{
     CommitUploadOptions, CustomMetadata, ErrorKind, ListUploadsOptions, Project, UploadOptions,
 };
@@ -192,10 +194,9 @@ async fn abort_multipart() {
         .await
         .expect_err("commit after abort");
     assert!(
-        err.kind() == ErrorKind::ObjectNotFound
-            || err.kind() == ErrorKind::UploadIdInvalid
-            || err.kind() == ErrorKind::Protocol
-            || err.kind() == ErrorKind::BucketNotFound
+        err.kind() == ErrorKind::ObjectNotFound || err.kind() == ErrorKind::UploadIdInvalid,
+        "commit after abort: {}",
+        err.kind()
     );
 
     let bad = project
@@ -250,4 +251,71 @@ async fn list_uploads_prefix_slash_rule() {
         listed.iter().any(|u| u.upload_id == info.upload_id),
         "pending upload should be listed"
     );
+
+    let nested = project
+        .begin_upload(&bucket, "pending/nested/x", Default::default())
+        .await
+        .unwrap();
+    let collapsed: Vec<_> = project
+        .list_uploads(
+            &bucket,
+            ListUploadsOptions {
+                prefix: "pending/".into(),
+                recursive: false,
+                system: true,
+                ..Default::default()
+            },
+        )
+        .collect()
+        .await;
+    let collapsed: Vec<_> = collapsed
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(
+        collapsed.iter().any(|u| u.upload_id == info.upload_id),
+        "object under prefix should be listed"
+    );
+    assert!(
+        collapsed.iter().all(|u| !u.upload_id.is_empty()),
+        "prefix entries must not be returned as uploads"
+    );
+    assert!(
+        !collapsed
+            .iter()
+            .any(|u| u.upload_id == storj_access::check_encode(b"", STREAM_ID_BASE58_VERSION)),
+        "empty stream_id must not be encoded as an upload id"
+    );
+    let _ = nested;
+}
+
+#[tokio::test]
+async fn part_etag_survives_exact_segment_size() {
+    let mock = MockSatellite::start().await;
+    let project = open_project(&mock).await;
+    let bucket = unique("etag64");
+    project.ensure_bucket(&bucket).await.unwrap();
+    let key = "exact.bin";
+    let info = project
+        .begin_upload(&bucket, key, Default::default())
+        .await
+        .unwrap();
+    let payload = vec![0x5Au8; MAX_SEGMENT_SIZE as usize];
+    let mut part = project
+        .upload_part(&bucket, key, &info.upload_id, 1)
+        .await
+        .unwrap();
+    part.set_etag(b"exact-seg-etag").await.unwrap();
+    part.write_all(&payload).await.unwrap();
+    part.commit().await.unwrap();
+
+    let parts: Vec<_> = project
+        .list_upload_parts(&bucket, key, &info.upload_id, Default::default())
+        .collect()
+        .await;
+    let parts: Vec<_> = parts.into_iter().collect::<Result<Vec<_>, _>>().unwrap();
+    assert_eq!(parts.len(), 1);
+    assert_eq!(parts[0].part_number, 1);
+    assert_eq!(parts[0].size, MAX_SEGMENT_SIZE as i64);
+    assert_eq!(parts[0].etag, b"exact-seg-etag");
 }

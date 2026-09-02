@@ -1035,7 +1035,7 @@ fn list_segments(
 ) -> Result<ListSegmentsResponse, (u64, String)> {
     let st = state.lock().expect("mock state");
     check_key(&req.header, &st)?;
-    let (segments, encryption_parameters) = if let Some(committed) = st
+    let (mut segments, encryption_parameters) = if let Some(committed) = st
         .committed
         .values()
         .find(|c| c.object.stream_id == req.stream_id)
@@ -1050,6 +1050,7 @@ fn list_segments(
         return Err((RPC_NOT_FOUND, "object not found".into()));
     };
     drop(st);
+    segments.sort_by_key(|s| (s.position.part_number, s.position.index));
 
     let total: i64 = segments.iter().map(|s| s.plain_size).sum();
     let window = resolve_mock_range(req.range.as_ref(), total)?;

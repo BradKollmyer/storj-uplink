@@ -395,11 +395,12 @@ impl Project {
         let content_key =
             storj_encryption::derive_content_key(bucket, key.as_bytes(), &self.inner.store)
                 .map_err(map_enc)?;
-        let listed = self
+        let mut listed = self
             .inner
             .metainfo
             .list_all_segments(bucket, key, stream_id.clone())
             .await?;
+        listed.items.sort_by_key(segment_list_order);
         let (cipher, block_size) = encryption_from_params(listed.encryption_parameters.as_ref());
         let last_segment_plain = listed.items.last().map(|i| i.plain_size).unwrap_or(0);
         let total_plain: i64 = listed.items.iter().map(|i| i.plain_size).sum();
@@ -508,6 +509,11 @@ impl Project {
                         .unwrap_or_default();
                     st.done = !page.more;
                     for item in page.items {
+                        if item.status == storj_proto::metainfo::object::Status::Prefix as i32
+                            || item.stream_id.is_empty()
+                        {
+                            continue;
+                        }
                         let key_bytes = storj_encryption::decrypt_path(
                             &st.bucket,
                             &item.encrypted_object_key,
@@ -651,11 +657,12 @@ async fn list_parts_page(
     stream_id: Vec<u8>,
     cursor: u32,
 ) -> Result<VecDeque<Part>> {
-    let listed = project
+    let mut listed = project
         .inner
         .metainfo
         .list_all_segments(bucket, key, stream_id)
         .await?;
+    listed.items.sort_by_key(segment_list_order);
     let (cipher, _) = encryption_from_params(listed.encryption_parameters.as_ref());
     let content_key =
         storj_encryption::derive_content_key(bucket, key.as_bytes(), &project.inner.store)
@@ -685,6 +692,12 @@ async fn list_parts_page(
         }
     }
     Ok(parts)
+}
+
+fn segment_list_order(item: &storj_proto::metainfo::SegmentListItem) -> (i32, i32) {
+    item.position
+        .map(|p| (p.part_number, p.index))
+        .unwrap_or_default()
 }
 
 fn decrypt_part_etag(
@@ -1316,8 +1329,7 @@ pub(crate) async fn commit_part(mut inner: UploadInner) -> Result<()> {
 pub(crate) async fn abort_part(inner: UploadInner) -> Result<()> {
     let UploadInner { pending_flush, .. } = inner;
     if let Some(handle) = pending_flush {
-        handle.abort();
-        let _ = handle.await;
+        join_aborted_flush(handle).await?;
     }
     Ok(())
 }
@@ -1332,8 +1344,7 @@ pub(crate) async fn abort_upload(inner: UploadInner) -> Result<()> {
         ..
     } = inner;
     if let Some(handle) = pending_flush {
-        handle.abort();
-        let _ = handle.await;
+        join_aborted_flush(handle).await?;
     }
     let _ = project
         .metainfo
@@ -1343,6 +1354,15 @@ pub(crate) async fn abort_upload(inner: UploadInner) -> Result<()> {
         .metainfo
         .finish_delete_object(&bucket, stream_id)
         .await
+}
+
+async fn join_aborted_flush(handle: tokio::task::JoinHandle<Result<FlushedSegment>>) -> Result<()> {
+    handle.abort();
+    match handle.await {
+        Ok(_) => Ok(()),
+        Err(e) if e.is_cancelled() => Ok(()),
+        Err(e) => std::panic::resume_unwind(e.into_panic()),
+    }
 }
 
 #[cfg(test)]

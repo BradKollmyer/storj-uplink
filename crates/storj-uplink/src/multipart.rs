@@ -9,8 +9,8 @@ use crate::{Error, Result};
 /// Distinct from grant encoding, which uses version 0.
 pub const STREAM_ID_VERSION: u8 = 1;
 
-/// HMAC info for deriving a part ETag key from a segment content key.
-const ETAG_HMAC_INFO: &str = "etag";
+/// HMAC info for deriving a part ETag key (Go `deriveETagKey` / `DeriveKey(..., "storj-etag-v1")`).
+const ETAG_HMAC_INFO: &str = "storj-etag-v1";
 
 /// Encode a satellite StreamID as a public `upload_id` (Base58Check version 1).
 #[must_use]
@@ -99,5 +99,25 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn etag_uses_storj_etag_v1_info() {
+        assert_eq!(ETAG_HMAC_INFO, "storj-etag-v1");
+        let key = Key::from_bytes([9u8; 32]);
+        let etag = b"part-etag";
+        let enc = encrypt_etag(etag, CipherSuite::AES_GCM, &key).unwrap();
+        let expected_key = derive_key(&key, "storj-etag-v1");
+        let expected = encrypt(
+            etag,
+            CipherSuite::AES_GCM,
+            &expected_key,
+            &[0u8; NONCE_SIZE],
+        )
+        .unwrap();
+        assert_eq!(enc, expected);
+        let legacy_key = derive_key(&key, "etag");
+        let legacy = encrypt(etag, CipherSuite::AES_GCM, &legacy_key, &[0u8; NONCE_SIZE]).unwrap();
+        assert_ne!(enc, legacy);
     }
 }

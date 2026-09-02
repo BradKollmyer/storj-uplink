@@ -65,6 +65,9 @@ impl UploadInner {
     }
 
     fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
         let max = crate::constants::MAX_SEGMENT_SIZE as usize;
         loop {
             match self.poll_pending_flush(cx) {
@@ -72,6 +75,7 @@ impl UploadInner {
                 Poll::Pending if self.plaintext.len() >= max => return Poll::Pending,
                 Poll::Pending | Poll::Ready(Ok(())) => {}
             }
+            // A following write proves this full window is not last; hold it for ETag otherwise.
             if self.plaintext.len() >= max && self.pending_flush.is_none() {
                 crate::project::spawn_flush_segment(self);
                 continue;
@@ -82,9 +86,6 @@ impl UploadInner {
             }
             let n = buf.len().min(room);
             self.plaintext.extend_from_slice(&buf[..n]);
-            if self.plaintext.len() >= max && self.pending_flush.is_none() {
-                crate::project::spawn_flush_segment(self);
-            }
             return Poll::Ready(Ok(n));
         }
     }
