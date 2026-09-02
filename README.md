@@ -22,7 +22,7 @@ re-exported.
 
 ```toml
 [dependencies]
-storj = { git = "https://github.com/storj/storj-uplink" }
+storj = { git = "https://github.com/BradKollmyer/storj-uplink" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util"] }
 ```
 
