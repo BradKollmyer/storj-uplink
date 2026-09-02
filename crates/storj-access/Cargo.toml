@@ -1,0 +1,12 @@
+[package]
+name = "storj-access"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Access grant parse, restrict, and serialize (workspace-internal until 1.0)"
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true

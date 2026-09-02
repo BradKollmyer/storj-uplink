@@ -9,6 +9,12 @@ use storj::{
 };
 
 #[test]
+fn version_matches_cargo_pkg() {
+    assert_eq!(storj::version(), env!("CARGO_PKG_VERSION"));
+    assert!(!storj::version().is_empty());
+}
+
+#[test]
 fn error_kinds_cover_2025_user_visible_codes() {
     let kinds = [
         ErrorKind::TooManyRequests,

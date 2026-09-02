@@ -1,8 +1,22 @@
 # storj-rust
 
-Native Rust Uplink client for [Storj](https://storj.io). Not an FFI wrapper around `uplink-c`, and not a drop-in for crates.io `uplink` 0.11.0 (May 2025).
+Native Rust [Uplink](https://pkg.go.dev/storj.io/uplink) client for [Storj](https://storj.io).
 
-Design: [`docs/design-native-uplink.md`](docs/design-native-uplink.md).
+The published crate is [`storj`](https://crates.io/crates/storj). It implements the Storj client protocol in Rust (Tokio + rustls): access grants, satellite metainfo, storage-node piecestore, and client-side encryption. Design: [`docs/design-native-uplink.md`](docs/design-native-uplink.md).
+
+## Non-goals
+
+This is **not**:
+
+- an S3 SDK (use GatewayMT + `aws-sdk-s3` / `object_store` if you want S3)
+- an FFI wrapper around [`uplink-c`](https://github.com/storj/uplink-c)
+- a drop-in for crates.io [`uplink` 0.11.0](https://docs.rs/uplink/0.11.0/uplink/) (May 2025); that crate is blocking FFI and `!Send`
+
+Go is **not** required to build or use the crate. It is only used to generate goldens and in the optional interop CI job.
+
+## License
+
+Dual-licensed MIT OR Apache-2.0. See [`LICENSE-MIT`](LICENSE-MIT) and [`LICENSE-APACHE`](LICENSE-APACHE).
 
 ## Tests
 
@@ -13,5 +27,3 @@ go run -C scripts .                 # Argon2 / path-HMAC goldens
 ```
 
 See [`crates/storj/tests/README.md`](crates/storj/tests/README.md).
-
-Go is **not** required to build or use the crate. It is only used to generate goldens and in the optional interop CI job.

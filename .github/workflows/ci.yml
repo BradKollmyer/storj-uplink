@@ -21,6 +21,18 @@ jobs:
       - name: compile all tests including ignored
         run: cargo test --workspace --no-run
 
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - name: cargo deny
+        run: cargo deny check
+
   vectors:
     runs-on: ubuntu-latest
     steps:

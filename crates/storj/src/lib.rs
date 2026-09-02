@@ -26,6 +26,11 @@ pub use types::{
 };
 pub use upload::{Download, PartUpload, Upload};
 
+/// Crate version from `Cargo.toml`.
+pub fn version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
 #[allow(dead_code)]
 fn _assert_send_sync() {
     fn check<T: Send + Sync>() {}

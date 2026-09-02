@@ -221,6 +221,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "storj-access"
+version = "0.1.0"
+
+[[package]]
 name = "storj-test"
 version = "0.1.0"
 dependencies = [

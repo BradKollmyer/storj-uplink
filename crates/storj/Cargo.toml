@@ -7,7 +7,6 @@ license.workspace = true
 description = "Native Rust Uplink client for the Storj decentralized object store"
 repository.workspace = true
 readme = "../../README.md"
-publish = false
 
 [dependencies]
 tokio.workspace = true
