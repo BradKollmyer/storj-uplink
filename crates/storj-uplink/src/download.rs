@@ -163,17 +163,31 @@ pub fn decode_encrypted(shares: &[(i32, Vec<u8>)], rs: &Redundancy) -> Result<Ve
     }
     let n_stripes = piece_len / share_size;
     let codec = ReedSolomon::new(rs.k, rs.n, share_size)?;
-    let mut out = Vec::with_capacity(n_stripes.saturating_mul(rs.stripe_size()));
-    for s in 0..n_stripes {
-        let mut slots: Vec<Option<&[u8]>> = vec![None; rs.n];
-        for (num, data) in shares {
-            let idx = usize::try_from(*num).unwrap_or(usize::MAX);
-            if idx < rs.n {
-                let off = s * share_size;
-                slots[idx] = Some(&data[off..off + share_size]);
-            }
+    // Invert the decode matrix once for this piece set (Go `NewRebuilder`),
+    // then decode every stripe straight into the output buffer.
+    let mut by_index: Vec<Option<&Vec<u8>>> = vec![None; rs.n];
+    let mut available = Vec::with_capacity(shares.len());
+    for (num, data) in shares {
+        let idx = usize::try_from(*num).unwrap_or(usize::MAX);
+        if idx < rs.n && by_index[idx].is_none() {
+            by_index[idx] = Some(data);
+            available.push(idx);
         }
-        out.extend_from_slice(&codec.decode_stripe(&slots)?);
+    }
+    let plan = codec.decode_plan(&available)?;
+    let inputs: Vec<&Vec<u8>> = plan
+        .indexes()
+        .iter()
+        .map(|&idx| by_index[idx].ok_or_else(|| Error::protocol("decode plan index missing")))
+        .collect::<Result<_>>()?;
+    let stripe = rs.stripe_size();
+    let mut out = vec![0u8; n_stripes.saturating_mul(stripe)];
+    let mut slots: Vec<&[u8]> = Vec::with_capacity(rs.k);
+    for s in 0..n_stripes {
+        let off = s * share_size;
+        slots.clear();
+        slots.extend(inputs.iter().map(|d| &d[off..off + share_size]));
+        plan.decode_into(&slots, &mut out[s * stripe..(s + 1) * stripe])?;
     }
     Ok(out)
 }

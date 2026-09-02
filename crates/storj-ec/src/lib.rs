@@ -12,9 +12,10 @@
 mod error;
 mod fec;
 mod gf;
+mod gf_simd;
 
 pub use error::{Error, Result};
-pub use fec::ReedSolomon;
+pub use fec::{DecodePlan, ReedSolomon};
 
 /// Encode a stripe (`k * share_size` bytes) into `n` shares.
 pub fn encode_stripe(k: usize, n: usize, share_size: usize, stripe: &[u8]) -> Result<Vec<Vec<u8>>> {

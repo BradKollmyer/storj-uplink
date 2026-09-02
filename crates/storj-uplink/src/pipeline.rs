@@ -147,15 +147,18 @@ pub fn encode_pieces(encrypted: &[u8], rs: &Redundancy) -> Result<Vec<Vec<u8>>> 
     let stripe = rs.stripe_size();
     let padded = pad_to_stripe(encrypted, stripe);
     let codec = ReedSolomon::new(rs.k, rs.n, rs.share_size)?;
-    let mut pieces = vec![Vec::new(); rs.n];
     if padded.is_empty() {
-        return Ok(pieces);
+        return Ok(vec![Vec::new(); rs.n]);
     }
-    for chunk in padded.chunks(stripe) {
-        let shares = codec.encode_stripe(chunk)?;
-        for (i, share) in shares.into_iter().enumerate() {
-            pieces[i].extend_from_slice(&share);
-        }
+    let n_stripes = padded.len() / stripe;
+    let ss = rs.share_size;
+    // Encode each stripe directly into its slot of every piece: no per-stripe
+    // share allocations or copies.
+    let mut pieces = vec![vec![0u8; n_stripes * ss]; rs.n];
+    for (s, chunk) in padded.chunks(stripe).enumerate() {
+        let off = s * ss;
+        let mut slots: Vec<&mut [u8]> = pieces.iter_mut().map(|p| &mut p[off..off + ss]).collect();
+        codec.encode_stripe_into(chunk, &mut slots)?;
     }
     Ok(pieces)
 }

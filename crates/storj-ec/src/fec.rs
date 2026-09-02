@@ -235,22 +235,64 @@ impl ReedSolomon {
 
     /// Infectious `Rebuild`: prefer data shares, fill holes from high indexes.
     fn rebuild(&self, shares: &[(usize, &[u8])]) -> Result<Vec<u8>> {
+        let ids: Vec<usize> = shares.iter().map(|(i, _)| *i).collect();
+        let plan = self.plan_from_sorted(&ids)?;
+        let sharesv: Vec<&[u8]> = plan
+            .indexes
+            .iter()
+            .map(|id| {
+                shares
+                    .iter()
+                    .find(|(i, _)| i == id)
+                    .map(|(_, d)| *d)
+                    .unwrap_or(&[])
+            })
+            .collect();
+        let mut stripe = vec![0u8; self.stripe_size()];
+        plan.decode_into(&sharesv, &mut stripe)?;
+        Ok(stripe)
+    }
+
+    /// Build a reusable [`DecodePlan`] for a fixed set of available share
+    /// indexes (at least `k` unique values in `0..n`). Go uplink hoists this
+    /// per download via `eestream.NewRebuilder`: the k×k matrix inversion is
+    /// done once and reused for every stripe of the piece set.
+    pub fn decode_plan(&self, available: &[usize]) -> Result<DecodePlan> {
+        if available.len() < self.k {
+            return Err(Error::TooFewShares {
+                have: available.len(),
+                need: self.k,
+            });
+        }
+        let mut ids = available.to_vec();
+        for &index in &ids {
+            if index >= self.n {
+                return Err(Error::InvalidShareIndex { index, n: self.n });
+            }
+        }
+        ids.sort_unstable();
+        for w in ids.windows(2) {
+            if w[0] == w[1] {
+                return Err(Error::DuplicateShare { index: w[0] });
+            }
+        }
+        self.plan_from_sorted(&ids)
+    }
+
+    /// `ids` sorted, unique, in `0..n`, at least `k` long.
+    fn plan_from_sorted(&self, ids: &[usize]) -> Result<DecodePlan> {
         let k = self.k;
-        let ss = self.share_size;
         let mut m_dec = vec![0u8; k * k];
         let mut indexes = vec![0usize; k];
-        let mut sharesv: Vec<&[u8]> = vec![&[]; k];
-
         let mut b = 0usize;
-        let mut e = shares.len();
+        let mut e = ids.len();
         for i in 0..k {
-            let (share_id, share_data) = if b < e && shares[b].0 == i {
-                let s = shares[b];
+            let share_id = if b < e && ids[b] == i {
                 b += 1;
-                s
+                ids[b - 1]
             } else {
                 e -= 1;
-                shares[e]
+                ids[e]
             };
             if share_id < k {
                 m_dec[i * (k + 1)] = 1;
@@ -258,26 +300,76 @@ impl ReedSolomon {
                 m_dec[i * k..i * k + k]
                     .copy_from_slice(&self.enc_matrix[share_id * k..share_id * k + k]);
             }
-            sharesv[i] = share_data;
             indexes[i] = share_id;
         }
-
         invert_matrix(&mut m_dec, k).map_err(Error::Reconstruct)?;
+        Ok(DecodePlan {
+            k,
+            share_size: self.share_size,
+            indexes,
+            m_dec,
+        })
+    }
+}
 
-        let mut stripe = vec![0u8; self.stripe_size()];
+/// A cached decode for one fixed set of share indexes; see
+/// [`ReedSolomon::decode_plan`]. Reusable across every stripe of a piece set.
+#[derive(Clone, Debug)]
+pub struct DecodePlan {
+    k: usize,
+    share_size: usize,
+    /// Share index consumed by each of the `k` decode slots, in slot order.
+    indexes: Vec<usize>,
+    /// Inverted k×k decode matrix.
+    m_dec: Vec<u8>,
+}
+
+impl DecodePlan {
+    /// Share indexes in the order [`Self::decode_into`] expects `shares`.
+    #[must_use]
+    pub fn indexes(&self) -> &[usize] {
+        &self.indexes
+    }
+
+    /// Reconstruct one stripe into `out` (`k * share_size` bytes).
+    /// `shares[i]` must be the share with index `indexes()[i]`.
+    pub fn decode_into(&self, shares: &[&[u8]], out: &mut [u8]) -> Result<()> {
+        let k = self.k;
+        let ss = self.share_size;
+        if shares.len() != k {
+            return Err(Error::TooFewShares {
+                have: shares.len(),
+                need: k,
+            });
+        }
+        for (i, s) in shares.iter().enumerate() {
+            if s.len() != ss {
+                return Err(Error::ShareSize {
+                    index: self.indexes[i],
+                    got: s.len(),
+                    want: ss,
+                });
+            }
+        }
+        if out.len() != k * ss {
+            return Err(Error::StripeSize {
+                got: out.len(),
+                want: k * ss,
+            });
+        }
         for i in 0..k {
-            if indexes[i] < k {
-                let dest = indexes[i];
-                stripe[dest * ss..(dest + 1) * ss].copy_from_slice(sharesv[i]);
+            if self.indexes[i] < k {
+                let dest = self.indexes[i];
+                out[dest * ss..(dest + 1) * ss].copy_from_slice(shares[i]);
             } else {
-                let dest = &mut stripe[i * ss..(i + 1) * ss];
+                let dest = &mut out[i * ss..(i + 1) * ss];
                 dest.fill(0);
-                for col in 0..k {
-                    addmul(dest, sharesv[col], m_dec[i * k + col]);
+                for (col, share) in shares.iter().enumerate() {
+                    addmul(dest, share, self.m_dec[i * k + col]);
                 }
             }
         }
-        Ok(stripe)
+        Ok(())
     }
 }
 
