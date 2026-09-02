@@ -1,6 +1,6 @@
 //! In-process mock satellite: loopback TLS + DRPC unary for ProjectInfo and buckets.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -37,6 +37,7 @@ struct MockState {
     api_key: Vec<u8>,
     project_salt: Vec<u8>,
     buckets: BTreeMap<String, BucketRec>,
+    get_bucket_denied: BTreeSet<String>,
 }
 
 /// Loopback TLS satellite that speaks `ProjectInfo` and bucket RPCs.
@@ -68,6 +69,7 @@ impl MockSatellite {
             api_key: api_key_raw.clone(),
             project_salt: project_salt.clone(),
             buckets: BTreeMap::new(),
+            get_bucket_denied: BTreeSet::new(),
         }));
 
         let server_cfg = server_config(&identity).expect("mock server tls");
@@ -128,6 +130,15 @@ impl MockSatellite {
         storj::Access::parse(&serialized).expect("parse mock grant")
     }
 
+    /// Make `GetBucket` return permission-denied for `bucket` (stat-failure tests).
+    pub fn deny_get_bucket(&self, bucket: &str) {
+        self.state
+            .lock()
+            .expect("mock state")
+            .get_bucket_denied
+            .insert(bucket.to_owned());
+    }
+
     /// Mark `bucket` as containing an object (for `BucketNotEmpty` tests).
     pub fn put_object(&self, bucket: &str) {
         let mut state = self.state.lock().expect("mock state");
@@ -154,10 +165,7 @@ async fn serve_conn(
     state: Arc<Mutex<MockState>>,
 ) -> Result<(), storj_rpc::Error> {
     read_tls_mux_prefix(&mut tcp).await?;
-    let tls = acceptor
-        .accept(tcp)
-        .await
-        .map_err(storj_rpc::Error::Io)?;
+    let tls = acceptor.accept(tcp).await.map_err(storj_rpc::Error::Io)?;
     let mut conn = Conn::new(tls);
     loop {
         match serve_one(&mut conn, &state).await {
@@ -260,6 +268,9 @@ fn handle_rpc(rpc: &str, body: &[u8], state: &Mutex<MockState>) -> Result<Vec<u8
             let state = state.lock().expect("mock state");
             check_key(&req.header, &state)?;
             let name = utf8_name(&req.name)?;
+            if state.get_bucket_denied.contains(&name) {
+                return Err((RPC_PERMISSION_DENIED, "permission denied".into()));
+            }
             let rec = state
                 .buckets
                 .get(&name)

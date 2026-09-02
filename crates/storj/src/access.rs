@@ -140,15 +140,20 @@ impl Access {
 
         let mut default_key = [0u8; 32];
         default_key.copy_from_slice(key.as_bytes());
+        // Go `EncryptionAccess.LimitTo`: drop the root key when the API key
+        // already has path caveats so the grant cannot decrypt outside them.
+        let enc = storj_access::EncryptionAccess {
+            default_key: Some(default_key),
+            default_path_cipher: storj_access::CipherSuite::AES_GCM,
+            store_entries: Vec::new(),
+            default_encryption_parameters: None,
+        }
+        .limit_to(&parsed)
+        .map_err(map_grant_err)?;
         Ok(Self::from_grant(storj_access::Grant::from_parts(
             node.to_string(),
             parsed.serialize_raw(),
-            storj_access::EncryptionAccess {
-                default_key: Some(default_key),
-                default_path_cipher: storj_access::CipherSuite::AES_GCM,
-                store_entries: Vec::new(),
-                default_encryption_parameters: None,
-            },
+            enc,
         )))
     }
 

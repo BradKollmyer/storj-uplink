@@ -76,6 +76,30 @@ async fn list_buckets_cursor() {
 }
 
 #[tokio::test]
+async fn create_bucket_stat_failure_does_not_invent_bucket() {
+    let mock = MockSatellite::start().await;
+    let project = open_test_project(&mock).await;
+    let name = unique_bucket();
+    project.create_bucket(&name).await.unwrap();
+    mock.deny_get_bucket(&name);
+
+    let err = project.create_bucket(&name).await.unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::BucketAlreadyExists);
+    assert!(
+        err.bucket().is_none(),
+        "failed GetBucket must not attach a UNIX_EPOCH placeholder"
+    );
+    assert!(
+        std::error::Error::source(&err).is_some(),
+        "stat failure should be chained"
+    );
+
+    let err = project.ensure_bucket(&name).await.unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::PermissionDenied);
+    assert!(err.bucket().is_none());
+}
+
+#[tokio::test]
 async fn empty_bucket_name_is_invalid() {
     let mock = MockSatellite::start().await;
     let project = open_test_project(&mock).await;

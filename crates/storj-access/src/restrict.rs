@@ -147,6 +147,16 @@ fn enc_from_store(store: &Store) -> EncryptionAccess {
     }
 }
 
+impl EncryptionAccess {
+    /// Keep only encryption bases allowed by the API key's path caveats.
+    ///
+    /// Go `EncryptionAccess.LimitTo`: a path-restricted API key must not
+    /// serialize the project root key.
+    pub fn limit_to(&self, api_key: &ApiKey) -> Result<Self, Error> {
+        limit_to(self, api_key)
+    }
+}
+
 /// Keep only encryption bases allowed by the API key's path caveats (Go `LimitTo`).
 fn limit_to(enc: &EncryptionAccess, api_key: &ApiKey) -> Result<EncryptionAccess, Error> {
     let (prefixes, restricted) = collapse_prefixes(api_key)?;
@@ -355,6 +365,46 @@ mod tests {
         assert_eq!(entry.key, [0x55; 32]);
         assert_eq!(entry.encrypted_path, b"enc-user1");
         assert_eq!(g.enc_access().default_key, Some([0x33; 32]));
+    }
+
+    #[test]
+    fn limit_to_unrestricted_key_keeps_default_key() {
+        let enc = EncryptionAccess {
+            default_key: Some([0x33; 32]),
+            default_path_cipher: CipherSuite::AES_GCM,
+            ..Default::default()
+        };
+        let api = ApiKey::from_parts(HEAD.to_vec(), &SECRET);
+        let limited = enc.limit_to(&api).unwrap();
+        assert_eq!(limited.default_key, Some([0x33; 32]));
+        assert!(limited.store_entries.is_empty());
+    }
+
+    #[test]
+    fn limit_to_path_restricted_key_drops_default_key() {
+        let enc = EncryptionAccess {
+            default_key: Some([0x33; 32]),
+            default_path_cipher: CipherSuite::AES_GCM,
+            ..Default::default()
+        };
+        let store = store_from_enc(&enc).unwrap();
+        let enc_path = encrypt_path("app", "user1", &store).unwrap();
+        let api = ApiKey::from_parts(HEAD.to_vec(), &SECRET).restrict(&Caveat {
+            allowed_paths: vec![CaveatPath {
+                bucket: b"app".to_vec(),
+                encrypted_path_prefix: enc_path,
+            }],
+            nonce: vec![1, 2, 3, 4],
+            ..Caveat::default()
+        });
+        let limited = enc.limit_to(&api).unwrap();
+        assert!(
+            limited.default_key.is_none(),
+            "path-restricted API key must not serialize the project root key"
+        );
+        assert_eq!(limited.store_entries.len(), 1);
+        assert_eq!(limited.store_entries[0].bucket, b"app");
+        assert_eq!(limited.store_entries[0].unencrypted_path, b"user1");
     }
 
     #[test]

@@ -74,24 +74,21 @@ impl Project {
         match self.inner.metainfo.create_bucket(name).await {
             Ok(bucket) => Ok(bucket),
             Err(e) if e.kind() == ErrorKind::BucketAlreadyExists => {
-                let existing = match self.inner.metainfo.get_bucket(name).await {
-                    Ok(b) => b,
-                    Err(_) => Bucket {
-                        name: name.to_owned(),
-                        created: UNIX_EPOCH,
-                    },
-                };
-                Err(Error::new(
-                    ErrorKind::BucketAlreadyExists,
-                    format!("bucket already exists ({name:?})"),
-                )
-                .with_bucket(existing))
+                match self.inner.metainfo.get_bucket(name).await {
+                    Ok(existing) => Err(e.with_bucket(existing)),
+                    // Do not invent a UNIX_EPOCH placeholder; ensure_bucket
+                    // must not treat a failed Stat as success.
+                    Err(stat_err) => Err(e.with_source(stat_err)),
+                }
             }
             Err(e) => Err(e),
         }
     }
 
     /// Create the bucket if missing; return it either way.
+    ///
+    /// If create reports already-exists but could not stat the existing bucket,
+    /// this fails rather than returning a placeholder.
     pub async fn ensure_bucket(&self, name: &str) -> Result<Bucket> {
         match self.create_bucket(name).await {
             Ok(bucket) => Ok(bucket),
