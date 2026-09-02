@@ -14,7 +14,7 @@ pub struct Error {
 }
 
 impl Error {
-    fn new(message: impl Into<String>) -> Self {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
         }
@@ -172,6 +172,12 @@ impl Grant {
         if scope.api_key.is_empty() {
             return Err(Error::new("access grant is missing api key"));
         }
+        crate::macaroon::Macaroon::parse(&scope.api_key).map_err(|e| {
+            Error::new(format!(
+                "access grant has malformed api key: {}",
+                e.message()
+            ))
+        })?;
         let Some(enc_pb) = scope.encryption_access else {
             return Err(Error::new("access grant is missing encryption access"));
         };
@@ -367,10 +373,14 @@ mod tests {
         }
     }
 
+    fn sample_api_key() -> Vec<u8> {
+        crate::macaroon::ApiKey::from_parts(vec![0x11; 32], &[0x22; 32]).serialize_raw()
+    }
+
     fn sample_grant() -> Grant {
         Grant::from_parts(
             "12edKaxTestSatelliteId@127.0.0.1:7777",
-            vec![2, 0, 32, 0x11],
+            sample_api_key(),
             sample_enc(),
         )
     }
@@ -406,7 +416,7 @@ mod tests {
     fn parse_rejects_missing_fields() {
         let missing_sat = pb::Scope {
             satellite_addr: String::new(),
-            api_key: vec![1, 2, 3],
+            api_key: sample_api_key(),
             encryption_access: Some(pb::EncryptionAccess::default()),
         };
         let s = base58::check_encode(&missing_sat.encode_to_vec(), 0);
@@ -428,7 +438,7 @@ mod tests {
 
         let missing_enc = pb::Scope {
             satellite_addr: "sat".into(),
-            api_key: vec![1, 2, 3],
+            api_key: sample_api_key(),
             encryption_access: None,
         };
         let s = base58::check_encode(&missing_enc.encode_to_vec(), 0);
@@ -436,13 +446,25 @@ mod tests {
             Grant::parse(&s).unwrap_err().message(),
             "access grant is missing encryption access"
         );
+
+        let malformed = pb::Scope {
+            satellite_addr: "sat".into(),
+            api_key: vec![1, 2, 3],
+            encryption_access: Some(pb::EncryptionAccess::default()),
+        };
+        let s = base58::check_encode(&malformed.encode_to_vec(), 0);
+        let msg = Grant::parse(&s).unwrap_err().message().to_string();
+        assert!(
+            msg.contains("malformed api key"),
+            "unexpected message: {msg}"
+        );
     }
 
     #[test]
     fn unspecified_path_cipher_defaults_to_aesgcm() {
         let scope = pb::Scope {
             satellite_addr: "sat".into(),
-            api_key: vec![1, 2, 3],
+            api_key: sample_api_key(),
             encryption_access: Some(pb::EncryptionAccess {
                 default_key: vec![0x33; 32],
                 default_path_cipher: 0,
@@ -458,7 +480,7 @@ mod tests {
     fn rejects_short_keys() {
         let scope = pb::Scope {
             satellite_addr: "sat".into(),
-            api_key: vec![1],
+            api_key: sample_api_key(),
             encryption_access: Some(pb::EncryptionAccess {
                 default_key: vec![1, 2, 3],
                 default_path_cipher: 2,
@@ -492,7 +514,7 @@ mod tests {
     fn mutated_serialize_drops_original_and_field_4() {
         let mut scope = pb::Scope {
             satellite_addr: "sat".into(),
-            api_key: vec![9, 9, 9],
+            api_key: sample_api_key(),
             encryption_access: Some(pb::EncryptionAccess {
                 default_key: vec![0x33; 32],
                 default_path_cipher: 2,

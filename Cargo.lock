@@ -280,6 +280,7 @@ version = "0.1.0"
 dependencies = [
  "bs58",
  "hex",
+ "hmac",
  "prost",
  "sha2",
 ]

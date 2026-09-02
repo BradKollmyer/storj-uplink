@@ -10,6 +10,7 @@ publish = false
 
 [dependencies]
 bs58.workspace = true
+hmac.workspace = true
 prost.workspace = true
 sha2.workspace = true
 
