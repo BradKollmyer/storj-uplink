@@ -460,6 +460,7 @@ dependencies = [
  "hex",
  "prost",
  "sha2",
+ "storj-proto",
 ]
 
 [[package]]

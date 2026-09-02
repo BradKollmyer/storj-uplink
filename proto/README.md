@@ -24,13 +24,15 @@ STORJ_UPLINK_SHA=2fef38720d8395837567da60ab69016099dca9f5
 | `piecestore2.proto` | `piecestore2.proto` (piecestore RPC) |
 | `orders.proto` | `orders.proto` |
 | `encryption.proto` | `encryption.proto` |
+| `encryption_access.proto` | `encryption_access.proto` (grant store) |
+| `scope.proto` | `scope.proto` (access grant Scope) |
 | `node.proto` | `node.proto` |
 | `noise.proto` | `noise.proto` |
 | `pointerdb.proto` | `pointerdb.proto` |
 | `gogo.proto` | `gogo.proto` (gogo options; not generated to Rust) |
 
-Import closure of metainfo / piecestore / orders. Grant `scope.proto` /
-`encryption_access.proto` land with the access-grant PR.
+`proto/check-pin.sh` globs `proto/*.proto` against `storj/common` `pb/` at the pin.
+Grant types are generated into `crates/storj-proto/src/gen/` and used by `storj-access`.
 
 Checked-in prost types live in `crates/storj-proto/src/gen/`.
 

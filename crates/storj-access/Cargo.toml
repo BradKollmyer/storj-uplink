@@ -12,6 +12,7 @@ publish = false
 bs58.workspace = true
 prost.workspace = true
 sha2.workspace = true
+storj-proto.workspace = true
 
 [dev-dependencies]
 hex.workspace = true

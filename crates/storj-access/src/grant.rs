@@ -560,11 +560,15 @@ mod tests {
         assert_eq!(g.enc_access().default_path_cipher, CipherSuite::AES_GCM);
         assert_eq!(
             hex::encode(g.api_key()),
-            "020220111111111111111111111111111111111111111111111111111111111111111100000620f0926e6c10f7df4255267f188f709515131b530a341cde14415129209b7ef42a"
+            "0202201111111111111111111111111111111111111111111111111111111111111111000006203da4552191fbdcc8c196a729816b881dca3a4cc0799bfe65b3f0a2e1f307cf49"
         );
 
         g.mark_mutated();
         let reencoded = g.serialize().unwrap();
+        assert_eq!(
+            reencoded, original,
+            "Rust re-encode must match Go grant.Serialize"
+        );
         let again = Grant::parse(&reencoded).unwrap();
         assert_eq!(again.satellite_addr(), g.satellite_addr());
         assert_eq!(again.api_key(), g.api_key());

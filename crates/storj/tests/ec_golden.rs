@@ -20,7 +20,7 @@ fn encode_decode_known_stripe() {
     let path = storj_test::fixture("rs_shares.jsonl");
     assert!(
         path.exists(),
-        "run go run ./scripts/gen-vectors.go to emit infectious shares"
+        "run go run -C scripts . to emit infectious shares"
     );
     // Implementation: encode stripe, drop n-k shares, decode, compare plaintext.
 }
