@@ -2,8 +2,10 @@
 
 use std::time::{Duration, SystemTime};
 use storj::{
-    BucketObjectLockConfiguration, Permission, Retention, RetentionMode, SetObjectRetentionOptions,
+    BucketObjectLockConfiguration, DefaultRetention, ErrorKind, Permission, Project, Retention,
+    RetentionMode, SetObjectRetentionOptions,
 };
+use storj_test::MockSatellite;
 
 #[test]
 fn permission_full_includes_lock_bits_for_share() {
@@ -37,13 +39,259 @@ fn retention_modes() {
 }
 
 #[tokio::test]
-#[ignore = "PR 25a: Object Lock RPCs"]
 async fn put_get_retention_and_legal_hold() {
-    panic!("needs metainfo Object Lock RPCs");
+    let mock = MockSatellite::start().await;
+    let project = open_test_project(&mock).await;
+    let bucket = unique_bucket();
+    project.create_bucket(&bucket).await.expect("create bucket");
+    project
+        .set_bucket_object_lock_configuration(
+            &bucket,
+            BucketObjectLockConfiguration {
+                enabled: true,
+                default_retention: None,
+            },
+        )
+        .await
+        .expect("enable lock");
+
+    let key = "dir/obj";
+    let until = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    let retention = Retention {
+        mode: RetentionMode::Compliance,
+        retain_until: until,
+    };
+    project
+        .set_object_retention(
+            &bucket,
+            key,
+            None,
+            retention.clone(),
+            SetObjectRetentionOptions::default(),
+        )
+        .await
+        .expect("set retention");
+    let got = project
+        .get_object_retention(&bucket, key, None)
+        .await
+        .expect("get retention");
+    assert_eq!(got, Some(retention));
+
+    assert!(
+        !project
+            .get_object_legal_hold(&bucket, key, None)
+            .await
+            .expect("get legal hold")
+    );
+    project
+        .set_object_legal_hold(&bucket, key, None, true)
+        .await
+        .expect("set legal hold");
+    assert!(
+        project
+            .get_object_legal_hold(&bucket, key, None)
+            .await
+            .expect("get legal hold enabled")
+    );
+
+    let gov = Retention {
+        mode: RetentionMode::Governance,
+        retain_until: until + Duration::from_secs(3600),
+    };
+    project
+        .set_object_retention(
+            &bucket,
+            key,
+            None,
+            gov.clone(),
+            SetObjectRetentionOptions {
+                bypass_governance_retention: true,
+            },
+        )
+        .await
+        .expect("set governance with bypass");
+    assert_eq!(
+        project
+            .get_object_retention(&bucket, key, None)
+            .await
+            .expect("get governance"),
+        Some(gov)
+    );
+
+    let missing = project
+        .get_object_retention(&bucket, "no-such", None)
+        .await
+        .unwrap_err();
+    assert_eq!(missing.kind(), ErrorKind::ObjectNotFound);
+
+    let no_bucket = project
+        .get_object_retention("does-not-exist-zzzz", key, None)
+        .await
+        .unwrap_err();
+    assert_eq!(no_bucket.kind(), ErrorKind::BucketNotFound);
 }
 
 #[tokio::test]
-#[ignore = "PR 25a: bucket lock configuration"]
 async fn bucket_object_lock_configuration() {
-    panic!("needs Get/SetBucketObjectLockConfiguration");
+    let mock = MockSatellite::start().await;
+    let project = open_test_project(&mock).await;
+    let bucket = unique_bucket();
+    project.create_bucket(&bucket).await.expect("create bucket");
+
+    let unset = project
+        .get_bucket_object_lock_configuration(&bucket)
+        .await
+        .unwrap_err();
+    assert_eq!(unset.kind(), ErrorKind::Protocol);
+    assert!(
+        unset
+            .to_string()
+            .contains("object lock is not enabled for this bucket"),
+        "{unset}"
+    );
+
+    let cfg = BucketObjectLockConfiguration {
+        enabled: true,
+        default_retention: Some(DefaultRetention {
+            mode: RetentionMode::Governance,
+            days: 7,
+            years: 0,
+        }),
+    };
+    project
+        .set_bucket_object_lock_configuration(&bucket, cfg.clone())
+        .await
+        .expect("set lock config");
+    let got = project
+        .get_bucket_object_lock_configuration(&bucket)
+        .await
+        .expect("get lock config");
+    assert_eq!(got, cfg);
+
+    let years = BucketObjectLockConfiguration {
+        enabled: true,
+        default_retention: Some(DefaultRetention {
+            mode: RetentionMode::Compliance,
+            days: 0,
+            years: 2,
+        }),
+    };
+    project
+        .set_bucket_object_lock_configuration(&bucket, years.clone())
+        .await
+        .expect("set years");
+    assert_eq!(
+        project
+            .get_bucket_object_lock_configuration(&bucket)
+            .await
+            .expect("get years"),
+        years
+    );
+
+    let both = project
+        .set_bucket_object_lock_configuration(
+            &bucket,
+            BucketObjectLockConfiguration {
+                enabled: true,
+                default_retention: Some(DefaultRetention {
+                    mode: RetentionMode::Compliance,
+                    days: 1,
+                    years: 1,
+                }),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(both.kind(), ErrorKind::Protocol);
+    assert!(
+        both.to_string()
+            .contains("bucket object lock configuration is invalid"),
+        "{both}"
+    );
+
+    let missing = project
+        .get_bucket_object_lock_configuration("does-not-exist-zzzz")
+        .await
+        .unwrap_err();
+    assert_eq!(missing.kind(), ErrorKind::BucketNotFound);
+
+    let empty = project
+        .set_bucket_object_lock_configuration("", cfg)
+        .await
+        .unwrap_err();
+    assert_eq!(empty.kind(), ErrorKind::BucketNameInvalid);
+}
+
+#[tokio::test]
+async fn get_retention_none_when_only_legal_hold_set() {
+    let mock = MockSatellite::start().await;
+    let project = open_test_project(&mock).await;
+    let bucket = unique_bucket();
+    project.create_bucket(&bucket).await.unwrap();
+    project
+        .set_object_legal_hold(&bucket, "k", None, true)
+        .await
+        .unwrap();
+    let got = project
+        .get_object_retention(&bucket, "k", None)
+        .await
+        .expect("no retention");
+    assert_eq!(got, None);
+}
+
+#[tokio::test]
+async fn empty_object_key_is_invalid_before_rpc() {
+    let mock = MockSatellite::start().await;
+    let project = open_test_project(&mock).await;
+    let bucket = unique_bucket();
+    project.create_bucket(&bucket).await.unwrap();
+
+    let err = project
+        .get_object_retention(&bucket, "", None)
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::ObjectKeyInvalid);
+
+    let err = project
+        .set_object_retention(
+            &bucket,
+            "",
+            None,
+            Retention {
+                mode: RetentionMode::Compliance,
+                retain_until: SystemTime::UNIX_EPOCH + Duration::from_secs(60),
+            },
+            SetObjectRetentionOptions::default(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::ObjectKeyInvalid);
+
+    let err = project
+        .get_object_legal_hold(&bucket, "", None)
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::ObjectKeyInvalid);
+
+    let err = project
+        .set_object_legal_hold(&bucket, "", None, true)
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::ObjectKeyInvalid);
+}
+
+async fn open_test_project(mock: &MockSatellite) -> Project {
+    Project::open(&mock.access())
+        .await
+        .expect("open mock project")
+}
+
+fn unique_bucket() -> String {
+    format!(
+        "t-{}",
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    )
 }
