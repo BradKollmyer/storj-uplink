@@ -20,8 +20,9 @@ use storj_proto::metainfo::{
     ListSegmentsRequest, ListSegmentsResponse, MakeInlineSegmentRequest, MakeInlineSegmentResponse,
     Object as ProtoObject, ObjectListItem, ProjectInfoRequest, ProjectInfoResponse, Range,
     RequestHeader, RetryBeginSegmentPiecesRequest, RetryBeginSegmentPiecesResponse,
-    SegmentListItem, SegmentPosition, batch_request_item, batch_response_item, cohort_requirements,
-    object::Status as ObjectStatus, range,
+    RevokeApiKeyRequest, RevokeApiKeyResponse, SegmentListItem, SegmentPosition,
+    UpdateObjectMetadataRequest, UpdateObjectMetadataResponse, batch_request_item,
+    batch_response_item, cohort_requirements, object::Status as ObjectStatus, range,
 };
 use storj_proto::node::NodeAddress;
 use storj_proto::orders::{OrderLimit, PieceAction};
@@ -112,6 +113,7 @@ struct MockState {
     stale_segment_ids: BTreeSet<Vec<u8>>,
     sn_tags: Vec<HashMap<String, Vec<u8>>>,
     omit_delete_meta: bool,
+    revoked: BTreeSet<Vec<u8>>,
 }
 
 /// Loopback TLS satellite that speaks `ProjectInfo`, buckets, and upload RPCs.
@@ -167,6 +169,7 @@ impl MockSatellite {
             stale_segment_ids: BTreeSet::new(),
             sn_tags: vec![HashMap::new(); 6],
             omit_delete_meta: false,
+            revoked: BTreeSet::new(),
         }));
 
         let server_cfg = server_config(&identity).expect("mock server tls");
@@ -563,6 +566,16 @@ fn handle_rpc(
                 .collect();
             Ok(ListBucketsResponse { items, more }.encode_to_vec())
         }
+        rpc::REVOKE_API_KEY => {
+            let req = RevokeApiKeyRequest::decode(body).map_err(decode_err)?;
+            revoke_api_key(req, state)?;
+            Ok(RevokeApiKeyResponse {}.encode_to_vec())
+        }
+        rpc::UPDATE_OBJECT_METADATA => {
+            let req = UpdateObjectMetadataRequest::decode(body).map_err(decode_err)?;
+            update_object_metadata(req, state)?;
+            Ok(UpdateObjectMetadataResponse {}.encode_to_vec())
+        }
         rpc::COMPRESSED_BATCH => {
             let req = CompressedBatchRequest::decode(body).map_err(decode_err)?;
             let batch = decode_batch_request(&req)
@@ -645,6 +658,12 @@ fn handle_batch_item(
         }
         Some(Request::ObjectFinishMove(req)) => {
             batch_response_item::Response::ObjectFinishMove(finish_move(req, state)?)
+        }
+        Some(Request::ObjectUpdateMetadata(req)) => {
+            batch_response_item::Response::ObjectUpdateMetadata(update_object_metadata(req, state)?)
+        }
+        Some(Request::RevokeApiKey(req)) => {
+            batch_response_item::Response::RevokeApiKey(revoke_api_key(req, state)?)
         }
         Some(Request::BucketCreate(req)) => {
             let body = handle_rpc(
@@ -1629,10 +1648,70 @@ fn signed_limit(
 
 fn check_key(header: &Option<RequestHeader>, state: &MockState) -> Result<(), (u64, String)> {
     let got = header.as_ref().map(|h| h.api_key.as_slice()).unwrap_or(&[]);
-    if got != state.api_key.as_slice() {
+    if state.revoked.iter().any(|k| k.as_slice() == got) {
         return Err((RPC_PERMISSION_DENIED, "permission denied".into()));
     }
-    Ok(())
+    if same_macaroon_head(got, &state.api_key) {
+        return Ok(());
+    }
+    Err((RPC_PERMISSION_DENIED, "permission denied".into()))
+}
+
+fn same_macaroon_head(left: &[u8], right: &[u8]) -> bool {
+    match (
+        storj_access::ApiKey::parse_raw(left),
+        storj_access::ApiKey::parse_raw(right),
+    ) {
+        (Ok(a), Ok(b)) => a.head() == b.head(),
+        _ => left == right,
+    }
+}
+
+fn revoke_api_key(
+    req: RevokeApiKeyRequest,
+    state: &Mutex<MockState>,
+) -> Result<RevokeApiKeyResponse, (u64, String)> {
+    let mut st = state.lock().expect("mock state");
+    check_key(&req.header, &st)?;
+    let header_key = req
+        .header
+        .as_ref()
+        .map(|h| h.api_key.as_slice())
+        .unwrap_or(&[]);
+    if req.api_key == header_key {
+        return Err((RPC_PERMISSION_DENIED, "API key cannot revoke itself".into()));
+    }
+    if !same_macaroon_head(&req.api_key, header_key) {
+        return Err((RPC_PERMISSION_DENIED, "permission denied".into()));
+    }
+    st.revoked.insert(req.api_key);
+    Ok(RevokeApiKeyResponse {})
+}
+
+fn update_object_metadata(
+    req: UpdateObjectMetadataRequest,
+    state: &Mutex<MockState>,
+) -> Result<UpdateObjectMetadataResponse, (u64, String)> {
+    let mut st = state.lock().expect("mock state");
+    check_key(&req.header, &st)?;
+    let name = utf8_name(&req.bucket)?;
+    if !st.buckets.contains_key(&name) {
+        return Err((RPC_NOT_FOUND, format!("bucket not found: {name}")));
+    }
+    let rec = st
+        .committed
+        .get_mut(&(name, req.encrypted_object_key))
+        .ok_or_else(|| (RPC_NOT_FOUND, "object not found".into()))?;
+    if !req.stream_id.is_empty() && req.stream_id != rec.object.stream_id {
+        return Err((RPC_NOT_FOUND, "object not found".into()));
+    }
+    rec.object.encrypted_metadata = req.encrypted_metadata;
+    rec.object.encrypted_metadata_nonce = req.encrypted_metadata_nonce;
+    rec.object.encrypted_metadata_encrypted_key = req.encrypted_metadata_encrypted_key;
+    if req.set_encrypted_etag {
+        rec.object.encrypted_etag = req.encrypted_etag;
+    }
+    Ok(UpdateObjectMetadataResponse {})
 }
 
 fn utf8_name(name: &[u8]) -> Result<String, (u64, String)> {

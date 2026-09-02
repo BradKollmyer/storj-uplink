@@ -2,7 +2,7 @@
 
 use futures_util::StreamExt;
 use storj::encryption::{CipherSuite, Store, encrypt_path};
-use storj::{EncryptionKey, ErrorKind, ListObjectsOptions, Project};
+use storj::{CustomMetadata, EncryptionKey, ErrorKind, ListObjectsOptions, Permission, Project};
 use storj_test::MockSatellite;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -331,4 +331,121 @@ fn unique(prefix: &str) -> String {
             .unwrap()
             .as_nanos()
     )
+}
+
+#[tokio::test]
+async fn update_object_metadata_then_stat_and_download() {
+    let mock = MockSatellite::start().await;
+    let project = open_test_project(&mock).await;
+    let bucket = unique("updmeta");
+    project.ensure_bucket(&bucket).await.unwrap();
+    upload(&project, &bucket, "k", b"hello").await;
+
+    let mut original = CustomMetadata::new();
+    original.insert("app:title".into(), "old".into());
+    project
+        .update_object_metadata(&bucket, "k", original)
+        .await
+        .expect("first metadata");
+    let st = project.stat_object(&bucket, "k").await.expect("stat");
+    assert_eq!(st.custom.get("app:title").map(String::as_str), Some("old"));
+
+    let mut updated = CustomMetadata::new();
+    updated.insert("app:title".into(), "new".into());
+    updated.insert("app:tag".into(), "v2".into());
+    project
+        .update_object_metadata(&bucket, "k", updated)
+        .await
+        .expect("replace metadata");
+
+    let st = project.stat_object(&bucket, "k").await.expect("stat after");
+    assert_eq!(st.custom.get("app:title").map(String::as_str), Some("new"));
+    assert_eq!(st.custom.get("app:tag").map(String::as_str), Some("v2"));
+    assert_eq!(st.system.content_length, 5);
+
+    let dl = project
+        .download_object(&bucket, "k", Default::default())
+        .await
+        .expect("download");
+    assert_eq!(
+        dl.info().custom.get("app:title").map(String::as_str),
+        Some("new")
+    );
+    assert_eq!(
+        dl.info().custom.get("app:tag").map(String::as_str),
+        Some("v2")
+    );
+}
+
+#[tokio::test]
+async fn update_object_metadata_empty_key_and_missing() {
+    let mock = MockSatellite::start().await;
+    let project = open_test_project(&mock).await;
+    let bucket = unique("updmiss");
+    project.ensure_bucket(&bucket).await.unwrap();
+
+    let empty = project
+        .update_object_metadata(&bucket, "", CustomMetadata::new())
+        .await
+        .unwrap_err();
+    assert_eq!(empty.kind(), ErrorKind::ObjectKeyInvalid);
+
+    let missing = project
+        .update_object_metadata(&bucket, "nope", CustomMetadata::new())
+        .await
+        .unwrap_err();
+    assert_eq!(missing.kind(), ErrorKind::ObjectNotFound);
+}
+
+#[tokio::test]
+async fn update_object_metadata_decrypt_failure_not_swallowed() {
+    let mock = MockSatellite::start().await;
+    let project = open_test_project(&mock).await;
+    let bucket = unique("updbad");
+    project.ensure_bucket(&bucket).await.unwrap();
+    upload(&project, &bucket, "k", b"x").await;
+    mock.corrupt_encrypted_metadata();
+    let err = project
+        .update_object_metadata(&bucket, "k", CustomMetadata::new())
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::DecryptionFailed);
+}
+
+#[tokio::test]
+async fn revoke_access_child_parent_still_works() {
+    let mock = MockSatellite::start().await;
+    let parent_access = mock.access();
+    let child_access = parent_access
+        .share(Permission::full(), &[])
+        .expect("share child");
+    let parent = Project::open(&parent_access).await.expect("open parent");
+    let bucket = unique("rev");
+    parent.ensure_bucket(&bucket).await.unwrap();
+    upload(&parent, &bucket, "k", b"payload").await;
+
+    parent
+        .revoke_access(&child_access)
+        .await
+        .expect("revoke child");
+
+    let st = parent
+        .stat_object(&bucket, "k")
+        .await
+        .expect("parent still works");
+    assert_eq!(st.key, "k");
+
+    let child = Project::open(&child_access).await.expect("open child");
+    let err = child.stat_object(&bucket, "k").await.unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::PermissionDenied);
+}
+
+#[tokio::test]
+async fn revoke_access_cannot_revoke_self() {
+    let mock = MockSatellite::start().await;
+    let access = mock.access();
+    let project = Project::open(&access).await.expect("open");
+    let err = project.revoke_access(&access).await.unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::PermissionDenied);
+    assert!(err.to_string().contains("cannot revoke itself"), "{err}");
 }

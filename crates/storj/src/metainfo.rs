@@ -19,7 +19,8 @@ use storj_proto::metainfo::{
     FinishDeleteObjectRequest, FinishMoveObjectRequest, GetBucketRequest, GetObjectRequest,
     ListBucketsRequest, ListObjectsRequest, ListSegmentsRequest, MakeInlineSegmentRequest,
     ObjectListItemIncludes, ProjectInfoRequest, ProjectInfoResponse, Range, RequestHeader,
-    RetryBeginSegmentPiecesRequest, SegmentPosition, batch_request_item, batch_response_item,
+    RetryBeginSegmentPiecesRequest, RevokeApiKeyRequest, SegmentPosition,
+    UpdateObjectMetadataRequest, batch_request_item, batch_response_item,
 };
 use storj_proto::rpc;
 use storj_rpc::tls::client_config;
@@ -111,6 +112,10 @@ impl MetainfoClient {
 
     pub(crate) fn identity(&self) -> &Identity {
         &self.identity
+    }
+
+    pub(crate) fn api_key(&self) -> &[u8] {
+        &self.api_key
     }
 
     pub(crate) async fn satellite_ca(&self) -> Vec<u8> {
@@ -857,6 +862,51 @@ impl MetainfoClient {
                 "unexpected FinishMoveObject response",
             )),
         }
+    }
+
+    pub(crate) async fn update_object_metadata(
+        &self,
+        bucket: &str,
+        key: &str,
+        encrypted_object_key: Vec<u8>,
+        stream_id: Vec<u8>,
+        user: storj_uplink::upload::EncryptedUserData,
+    ) -> Result<()> {
+        let req = UpdateObjectMetadataRequest {
+            header: Some(self.header()),
+            bucket: bucket.as_bytes().to_vec(),
+            encrypted_object_key,
+            stream_id,
+            encrypted_metadata: user.encrypted_metadata,
+            encrypted_metadata_nonce: user.encrypted_metadata_nonce.to_vec(),
+            encrypted_metadata_encrypted_key: user.encrypted_metadata_encrypted_key,
+            encrypted_etag: user.encrypted_etag,
+            set_encrypted_etag: false,
+            ..Default::default()
+        };
+        let body = self
+            .invoke(
+                rpc::UPDATE_OBJECT_METADATA,
+                &req.encode_to_vec(),
+                bucket,
+                key,
+            )
+            .await?;
+        let _ =
+            metainfo::UpdateObjectMetadataResponse::decode(body.as_slice()).map_err(map_decode)?;
+        Ok(())
+    }
+
+    pub(crate) async fn revoke_api_key(&self, api_key: Vec<u8>) -> Result<()> {
+        let req = RevokeApiKeyRequest {
+            header: Some(self.header()),
+            api_key,
+        };
+        let body = self
+            .invoke(rpc::REVOKE_API_KEY, &req.encode_to_vec(), "", "")
+            .await?;
+        let _ = metainfo::RevokeApiKeyResponse::decode(body.as_slice()).map_err(map_decode)?;
+        Ok(())
     }
 }
 

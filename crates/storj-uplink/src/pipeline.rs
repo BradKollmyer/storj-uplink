@@ -307,6 +307,24 @@ pub fn decrypt_user_data(
     cipher: CipherSuite,
     derived_content_key: &Key,
 ) -> Result<(StreamMeta, SerializableMeta)> {
+    let (meta, _info, custom) = decrypt_user_data_full(
+        encrypted_metadata,
+        encrypted_metadata_encrypted_key,
+        encrypted_metadata_nonce,
+        cipher,
+        derived_content_key,
+    )?;
+    Ok((meta, custom))
+}
+
+/// Decrypt user data and the inner [`StreamInfo`] (needed to replace custom metadata).
+pub fn decrypt_user_data_full(
+    encrypted_metadata: &[u8],
+    encrypted_metadata_encrypted_key: &[u8],
+    encrypted_metadata_nonce: &[u8],
+    cipher: CipherSuite,
+    derived_content_key: &Key,
+) -> Result<(StreamMeta, StreamInfo, SerializableMeta)> {
     let meta = StreamMeta::decode(encrypted_metadata)?;
     let cipher = if meta.encryption_type != 0 {
         CipherSuite(meta.encryption_type)
@@ -332,7 +350,7 @@ pub fn decrypt_user_data(
     } else {
         SerializableMeta::decode(info.metadata.as_slice())?
     };
-    Ok((meta, custom))
+    Ok((meta, info, custom))
 }
 
 #[cfg(test)]

@@ -16,6 +16,8 @@ pub const DELETE_BUCKET: &str = "/metainfo.Metainfo/DeleteBucket";
 pub const LIST_BUCKETS: &str = "/metainfo.Metainfo/ListBuckets";
 /// Revoke an API key (`Project::revoke_access`).
 pub const REVOKE_API_KEY: &str = "/metainfo.Metainfo/RevokeAPIKey";
+/// Replace object custom metadata (`Project::update_object_metadata`).
+pub const UPDATE_OBJECT_METADATA: &str = "/metainfo.Metainfo/UpdateObjectMetadata";
 /// Begin an object upload (`BeginObject`).
 pub const BEGIN_OBJECT: &str = "/metainfo.Metainfo/BeginObject";
 /// Commit an object (`CommitObject`).

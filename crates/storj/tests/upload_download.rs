@@ -507,3 +507,96 @@ async fn failed_commit_object_aborts() {
     assert_eq!(mock.committed_count(), 0);
     assert!(mock.aborted_count() >= 1);
 }
+
+#[tokio::test]
+async fn upload_from_download_to_round_trip() {
+    let mock = MockSatellite::start().await;
+    let project = open_project(&mock).await;
+    let bucket = unique("fromto");
+    project.ensure_bucket(&bucket).await.unwrap();
+
+    let payload = b"upload_from then download_to";
+    let obj = project
+        .upload_from(&bucket, "rt.txt", payload.as_slice(), Default::default())
+        .await
+        .expect("upload_from");
+    assert_eq!(obj.key, "rt.txt");
+    assert_eq!(obj.system.content_length, payload.len() as i64);
+    assert_eq!(mock.committed_count(), 1);
+
+    let mut got = Vec::new();
+    let info = project
+        .download_to(&bucket, "rt.txt", &mut got, Default::default())
+        .await
+        .expect("download_to");
+    assert_eq!(info.key, "rt.txt");
+    assert_eq!(got, payload);
+}
+
+#[tokio::test]
+async fn upload_from_aborts_on_reader_error() {
+    let mock = MockSatellite::start().await;
+    let project = open_project(&mock).await;
+    let bucket = unique("fromerr");
+    project.ensure_bucket(&bucket).await.unwrap();
+
+    let err = project
+        .upload_from(
+            &bucket,
+            "boom.bin",
+            FailAfter { left: 4 },
+            Default::default(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::Io);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(mock.committed_count(), 0);
+    assert!(mock.aborted_count() >= 1);
+}
+
+#[tokio::test]
+async fn upload_from_empty_key_is_invalid() {
+    let mock = MockSatellite::start().await;
+    let project = open_project(&mock).await;
+    let bucket = unique("fromek");
+    project.ensure_bucket(&bucket).await.unwrap();
+    let err = project
+        .upload_from(&bucket, "", tokio::io::empty(), Default::default())
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::ObjectKeyInvalid);
+}
+
+#[tokio::test]
+async fn download_to_empty_key_is_invalid() {
+    let mock = MockSatellite::start().await;
+    let project = open_project(&mock).await;
+    let err = project
+        .download_to("b", "", tokio::io::sink(), Default::default())
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::ObjectKeyInvalid);
+}
+
+struct FailAfter {
+    left: usize,
+}
+
+impl tokio::io::AsyncRead for FailAfter {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if self.left == 0 {
+            return std::task::Poll::Ready(Err(std::io::Error::other("reader failed")));
+        }
+        if buf.remaining() == 0 {
+            return std::task::Poll::Ready(Ok(()));
+        }
+        buf.put_slice(b"x");
+        self.left -= 1;
+        std::task::Poll::Ready(Ok(()))
+    }
+}

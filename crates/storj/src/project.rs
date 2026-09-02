@@ -6,7 +6,7 @@ use std::sync::Arc;
 use futures_core::Stream;
 use futures_util::stream;
 
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 use crate::access::Access;
 use crate::bucket::require_bucket_name;
@@ -164,14 +164,79 @@ impl Project {
         key: &str,
         metadata: CustomMetadata,
     ) -> Result<()> {
-        let _ = (bucket, key, metadata);
-        Err(Error::not_implemented("Project::update_object_metadata"))
+        require_bucket_name(bucket)?;
+        require_object_key(key)?;
+        let enc_path =
+            storj_encryption::encrypt_path(bucket, key, &self.inner.store).map_err(map_enc)?;
+        let resp = self
+            .inner
+            .metainfo
+            .get_object(bucket, key, enc_path.clone())
+            .await?;
+        let Some(pb) = resp.object else {
+            return Err(Error::new(
+                ErrorKind::ObjectNotFound,
+                format!("object not found ({key:?})"),
+            ));
+        };
+        let content_key =
+            storj_encryption::derive_content_key(bucket, key.as_bytes(), &self.inner.store)
+                .map_err(map_enc)?;
+        let (mut cipher, mut block_size) =
+            encryption_from_params(pb.encryption_parameters.as_ref());
+        let (segments_size, last_segment_size, number_of_segments) =
+            if pb.encrypted_metadata.is_empty() {
+                (0, 0, 0)
+            } else {
+                let (meta, info, _) = storj_uplink::pipeline::decrypt_user_data_full(
+                    &pb.encrypted_metadata,
+                    &pb.encrypted_metadata_encrypted_key,
+                    &pb.encrypted_metadata_nonce,
+                    cipher,
+                    &content_key,
+                )
+                .map_err(map_uplink)?;
+                if meta.encryption_type != 0 {
+                    cipher = storj_encryption::CipherSuite(meta.encryption_type);
+                }
+                if meta.encryption_block_size > 0 {
+                    if let Ok(b) = usize::try_from(meta.encryption_block_size) {
+                        block_size = b;
+                    }
+                }
+                (
+                    info.segments_size,
+                    info.last_segment_size,
+                    meta.number_of_segments,
+                )
+            };
+        let custom_pairs: Vec<(String, String)> = metadata.into_iter().collect();
+        let user = storj_uplink::pipeline::encrypt_user_data(
+            &custom_pairs,
+            segments_size,
+            last_segment_size,
+            number_of_segments,
+            cipher,
+            &content_key,
+            block_size,
+        )
+        .map_err(map_uplink)?;
+        self.inner
+            .metainfo
+            .update_object_metadata(bucket, key, enc_path, pb.stream_id, user)
+            .await
     }
 
-    /// Revoke the API key in `access`. Cannot revoke self.
+    /// Revoke the API key in `access`. Cannot revoke self. Satellite-cached delay possible.
     pub async fn revoke_access(&self, access: &Access) -> Result<()> {
-        let _ = access;
-        Err(Error::not_implemented("Project::revoke_access"))
+        let raw = access.api_key_raw();
+        if raw == self.inner.metainfo.api_key() {
+            return Err(Error::new(
+                ErrorKind::PermissionDenied,
+                "permission denied (API key cannot revoke itself)",
+            ));
+        }
+        self.inner.metainfo.revoke_api_key(raw.to_vec()).await
     }
 
     /// Get object retention (Object Lock).
@@ -318,8 +383,15 @@ impl Project {
         reader: impl AsyncRead + Send,
         opts: UploadOptions,
     ) -> Result<Object> {
-        let _ = (bucket, key, reader, opts);
-        Err(Error::not_implemented("Project::upload_from"))
+        let mut upload = self.upload_object(bucket, key, opts).await?;
+        let mut reader = std::pin::pin!(reader);
+        match tokio::io::copy(&mut reader, &mut upload).await {
+            Ok(_) => upload.commit().await,
+            Err(e) => {
+                let _ = upload.abort().await;
+                Err(e.into())
+            }
+        }
     }
 
     /// Object → `AsyncWrite`.
@@ -330,9 +402,16 @@ impl Project {
         writer: impl AsyncWrite + Send,
         opts: DownloadOptions,
     ) -> Result<Object> {
-        opts.validate()?;
-        let _ = (bucket, key, writer);
-        Err(Error::not_implemented("Project::download_to"))
+        let mut download = self.download_object(bucket, key, opts).await?;
+        let info = download.info().clone();
+        let mut writer = std::pin::pin!(writer);
+        let copy = tokio::io::copy(&mut download, &mut writer).await;
+        let flush = writer.flush().await;
+        let close = download.close().await;
+        copy?;
+        flush?;
+        close?;
+        Ok(info)
     }
 }
 
@@ -948,7 +1027,7 @@ pub(crate) async fn abort_upload(inner: UploadInner) -> Result<()> {
 mod tests {
     use super::*;
     use crate::error::ErrorKind;
-    use tokio::io::{empty, sink};
+    use tokio::io::sink;
 
     fn placeholder() -> Project {
         // Disconnected client for methods that must fail without dialing.
@@ -968,25 +1047,6 @@ mod tests {
 
     fn placeholder_metainfo() -> MetainfoClient {
         MetainfoClient::disconnected_placeholder()
-    }
-
-    #[tokio::test]
-    async fn upload_from_not_implemented() {
-        let e = placeholder()
-            .upload_from("b", "k", empty(), UploadOptions::default())
-            .await
-            .unwrap_err();
-        assert_eq!(e.kind(), ErrorKind::Protocol);
-        assert!(e.to_string().contains("not implemented"));
-    }
-
-    #[tokio::test]
-    async fn download_to_not_implemented() {
-        let e = placeholder()
-            .download_to("b", "k", sink(), DownloadOptions::default())
-            .await
-            .unwrap_err();
-        assert_eq!(e.kind(), ErrorKind::Protocol);
     }
 
     #[tokio::test]
