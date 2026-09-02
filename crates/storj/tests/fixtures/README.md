@@ -17,4 +17,4 @@ Expected files:
 | `path_hmac.jsonl` | HMAC-SHA512 `"path:"+component` vectors |
 | `rs_stripe.bin` / `rs_shares.jsonl` | Infectious-compatible RS encode of a known stripe (PR 8) |
 
-`grant_go.txt` in git is a stub so ignored tests compile (`include_str!`). Replace it by running the generator.
+`grant_go.txt` is a synthetic Scope produced by Go `grant.Serialize` / `ParseAccess` (deterministic test macaroon + encryption keys, not a production secret).

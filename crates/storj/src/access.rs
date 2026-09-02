@@ -1,20 +1,22 @@
-//! Access grants. Parse/serialize/share of the protobuf Scope land in later PRs.
+//! Access grants. Parse/serialize of the protobuf Scope; share lands in a later PR.
+
+use std::sync::Arc;
 
 use crate::encryption::EncryptionKey;
 use crate::error::{Error, ErrorKind, Result};
 use crate::types::{Config, require_encryption_prefix};
 
-/// Parsed access grant. Cheap to clone (will be `Arc` internally).
+/// Parsed access grant. Cheap to clone (`Arc` internally).
 /// 2025 name: `uplink::access::Grant`.
 #[derive(Clone)]
 pub struct Access {
-    satellite_address: String,
+    inner: Arc<storj_access::Grant>,
 }
 
 impl std::fmt::Debug for Access {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Access")
-            .field("satellite_address", &self.satellite_address)
+            .field("satellite_address", &self.satellite_address())
             .field("api_key", &"[REDACTED]")
             .finish()
     }
@@ -24,20 +26,28 @@ impl Access {
     /// Parse a serialized grant (`base58check` protobuf Scope).
     /// 2025: `Grant::new`.
     pub fn parse(serialized: &str) -> Result<Self> {
-        if serialized.is_empty() {
-            return Err(Error::new(ErrorKind::InvalidGrant, "empty access grant"));
-        }
-        Err(Error::not_implemented("Access::parse"))
+        let grant = storj_access::Grant::parse(serialized).map_err(|e| {
+            Error::new(ErrorKind::InvalidGrant, e.message().to_owned()).with_source(e)
+        })?;
+        Ok(Self {
+            inner: Arc::new(grant),
+        })
     }
 
     /// Serialize for storage or `Share` distribution.
+    ///
+    /// Unmodified grants return the original string so unknown protobuf fields
+    /// are preserved. `share` / `override_encryption_key` re-encode from fields
+    /// (and may drop unknown fields, same as Go).
     pub fn serialize(&self) -> Result<String> {
-        Err(Error::not_implemented("Access::serialize"))
+        self.inner
+            .serialize()
+            .map_err(|e| Error::new(ErrorKind::InvalidGrant, e.message().to_owned()).with_source(e))
     }
 
     /// Satellite NodeURL, e.g. `12EayRS2…@us1.storj.io:7777`.
     pub fn satellite_address(&self) -> &str {
-        &self.satellite_address
+        self.inner.satellite_addr()
     }
 
     /// Restrict permissions and (optionally) path prefixes.
@@ -89,7 +99,11 @@ impl Access {
     #[cfg(test)]
     pub(crate) fn placeholder(satellite_address: impl Into<String>) -> Self {
         Self {
-            satellite_address: satellite_address.into(),
+            inner: Arc::new(storj_access::Grant::from_parts(
+                satellite_address.into(),
+                Vec::new(),
+                storj_access::EncryptionAccess::default(),
+            )),
         }
     }
 }
@@ -215,10 +229,10 @@ mod tests {
     }
 
     #[test]
-    fn parse_nonempty_not_implemented() {
+    fn parse_garbage_is_invalid_grant() {
         let e = Access::parse("12abcNotARealGrant").unwrap_err();
-        assert_eq!(e.kind(), ErrorKind::Protocol);
-        assert!(e.to_string().contains("not implemented"));
+        assert_eq!(e.kind(), ErrorKind::InvalidGrant);
+        assert!(!e.to_string().contains("not implemented"));
     }
 
     #[test]

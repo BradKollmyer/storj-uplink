@@ -13,7 +13,7 @@ Maps to `docs/design-native-uplink.md` § Testing Strategy.
 | `multipart.rs` (limits) | 5 MiB / 10k parts | — | yes |
 | `ec_golden.rs` (scheme consts) | RS `29/35/80/110-256B` test-only | — | yes |
 | `upload_download.rs` (sizes / range validate) | Exit-criterion sizes | — | yes |
-| `grant_golden.rs` | Parse Go grants | PR 3 | ignore |
+| `grant_golden.rs` | Parse Go grants | PR 3 | yes |
 | `encryption_golden.rs` | Go `DeriveRootKey` / path HMAC | fixtures checked in | yes |
 | `share_restrict.rs` | `share()` intersection | PR 6 | ignore |
 | `ec_golden.rs` (encode/decode) | infectious vectors | PR 8 | ignore |

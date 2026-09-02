@@ -99,8 +99,15 @@ fn download_options_match_go_defaults() {
 #[tokio::test]
 async fn project_open_returns_result() {
     // 2025 Project::open returned Self. Ours returns Result (native dial can fail).
-    let err = Access::parse("not-empty-but-unimplemented").unwrap_err();
-    assert_eq!(err.kind(), ErrorKind::Protocol);
+    let serialized = include_str!("fixtures/grant_go.txt").trim();
+    let access = Access::parse(serialized).expect("fixture grant");
+    match Project::open(&access).await {
+        Ok(_) => panic!("Project::open must return Result (native dial can fail)"),
+        Err(err) => {
+            assert_eq!(err.kind(), ErrorKind::Protocol);
+            assert!(err.to_string().contains("not implemented"));
+        }
+    }
 }
 
 #[test]

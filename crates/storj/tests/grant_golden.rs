@@ -13,13 +13,12 @@ fn load_grant(name: &str) -> String {
 }
 
 #[test]
-#[ignore = "PR 3: Access::parse / Base58Check Scope"]
 fn parse_go_serialized_grant() {
     let serialized = load_grant("grant_go.txt");
     let access = Access::parse(serialized.trim()).expect("parse Go grant");
-    assert!(
-        !access.satellite_address().is_empty(),
-        "satellite address required after parse"
+    assert_eq!(
+        access.satellite_address(),
+        "12edKaxTestSatelliteId@127.0.0.1:7777"
     );
     let round = access.serialize().expect("serialize");
     let reparsed = Access::parse(&round).expect("reparse own serialize");
@@ -27,7 +26,6 @@ fn parse_go_serialized_grant() {
 }
 
 #[test]
-#[ignore = "PR 3: Access::parse rejects version != 0"]
 fn parse_rejects_empty_and_garbage() {
     assert_eq!(
         Access::parse("").unwrap_err().kind(),
@@ -37,10 +35,14 @@ fn parse_rejects_empty_and_garbage() {
         Access::parse("!!!not-base58!!!").unwrap_err().kind(),
         ErrorKind::InvalidGrant
     );
+    // Go `base58.CheckEncode([]byte("Hello World"), 1)` — version != 0.
+    assert_eq!(
+        Access::parse("ABsn8bcafMZENwm1nSs3C").unwrap_err().kind(),
+        ErrorKind::InvalidGrant
+    );
 }
 
 #[test]
-#[ignore = "PR 3: unknown protobuf fields preserved until share()"]
 fn unmodified_serialize_is_identity() {
     let serialized = load_grant("grant_go.txt");
     let access = Access::parse(serialized.trim()).unwrap();

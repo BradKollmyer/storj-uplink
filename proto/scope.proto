@@ -1,0 +1,21 @@
+// Copyright (C) 2019 Storj Labs, Inc.
+// See LICENSE for copying information.
+//
+// Vendored from storj.io/common/pb/scope.proto
+// (same layout as storj.io/common/grant/internal/pb). Do not invent fields.
+
+syntax = "proto3";
+
+option go_package = "storj.io/common/pb";
+
+package scope;
+
+import "encryption_access.proto";
+
+message Scope {
+    string satellite_addr = 1;
+
+    bytes api_key = 2;
+
+    encryption_access.EncryptionAccess encryption_access = 3;
+}

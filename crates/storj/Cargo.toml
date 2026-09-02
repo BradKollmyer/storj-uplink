@@ -16,6 +16,7 @@ hmac.workspace = true
 sha2.workspace = true
 futures-core.workspace = true
 futures-util.workspace = true
+storj-access.workspace = true
 
 [dev-dependencies]
 hex.workspace = true

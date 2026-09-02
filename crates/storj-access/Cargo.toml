@@ -8,5 +8,13 @@ description = "Access grant parse, restrict, and serialize (workspace-internal u
 repository.workspace = true
 publish = false
 
+[dependencies]
+bs58.workspace = true
+prost.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+hex.workspace = true
+
 [lints]
 workspace = true
