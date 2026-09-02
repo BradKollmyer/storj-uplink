@@ -1,5 +1,8 @@
 //! Prost types matching vendored `proto/{encryption,encryption_access,scope,caveat}.proto`
 //! (copied from `storj.io/common/pb` / `grant/internal/pb` / `macaroon`).
+//!
+//! `Caveat` field order is the encode-order source of truth (picobuf `Encode`).
+//! Do not regenerate it from `caveat.proto` without Restrict goldens.
 
 use prost::Message;
 

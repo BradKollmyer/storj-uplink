@@ -2,7 +2,12 @@
 // See LICENSE for copying information.
 //
 // Vendored from storj.io/common/macaroon/types.proto. Do not invent fields.
-// pico custom_type annotations omitted; prost encodes the same protobuf wire.
+// pico custom_type annotations omitted.
+//
+// Field *declaration* order is picobuf Encode order (1–9, 10, 11–15, 20–22, 30),
+// not the types.proto source order (11–15 listed before allowed_paths = 10).
+// HMAC is over the exact protobuf bytes, so `pb.rs` must keep this order.
+// Do not regenerate prost types from this file without Restrict golden tests.
 
 syntax = "proto3";
 
@@ -23,11 +28,6 @@ message Caveat {
   bool disallow_get_retention = 7;
   bool disallow_put_legal_hold = 8;
   bool disallow_get_legal_hold = 9;
-  bool disallow_bypass_governance_retention = 11;
-  bool disallow_put_bucket_object_lock_configuration = 12;
-  bool disallow_get_bucket_object_lock_configuration = 13;
-  bool disallow_put_bucket_notification_configuration = 14;
-  bool disallow_get_bucket_notification_configuration = 15;
 
   // If any entries exist, require all access to happen in at least
   // one of them.
@@ -36,6 +36,12 @@ message Caveat {
     bytes encrypted_path_prefix = 2;
   }
   repeated Path allowed_paths = 10;
+
+  bool disallow_bypass_governance_retention = 11;
+  bool disallow_put_bucket_object_lock_configuration = 12;
+  bool disallow_get_bucket_object_lock_configuration = 13;
+  bool disallow_put_bucket_notification_configuration = 14;
+  bool disallow_get_bucket_notification_configuration = 15;
 
   // if set, the validity time window
   google.protobuf.Timestamp not_after = 20;

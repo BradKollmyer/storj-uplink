@@ -557,19 +557,30 @@ fn append_uvarint(buf: &mut Vec<u8>, mut x: u64) {
 
 fn parse_uvarint(data: &[u8]) -> Result<(&[u8], u64), Error> {
     let mut value: u64 = 0;
-    let mut shift = 0;
+    let mut shift = 0u32;
     for (i, &b) in data.iter().enumerate() {
-        if i >= 10 {
+        if i == 10 {
             return Err(Error::new("varint error"));
         }
-        value |= u64::from(b & 0x7f) << shift;
+        let chunk = u64::from(b & 0x7f);
+        // Go `binary.Uvarint`: 10th byte overflow if the payload exceeds 1.
+        // Also avoids `<< 63` panic (debug) / wrap (release) for chunk > 1.
+        if i == 9 && chunk > 1 {
+            return Err(Error::new("varint error"));
+        }
+        let shifted = chunk
+            .checked_shl(shift)
+            .ok_or_else(|| Error::new("varint error"))?;
+        value |= shifted;
         if b < 0x80 {
             if value > MAX_UVARINT {
                 return Err(Error::new("varint error"));
             }
             return Ok((&data[i + 1..], value));
         }
-        shift += 7;
+        shift = shift
+            .checked_add(7)
+            .ok_or_else(|| Error::new("varint error"))?;
     }
     Err(Error::new("varint error"))
 }
@@ -645,10 +656,14 @@ fn timestamp_from_system(t: SystemTime) -> pb::Timestamp {
         },
         Err(e) => {
             let d = e.duration();
-            let mut seconds = -i64::try_from(d.as_secs()).unwrap_or(i64::MAX);
-            let mut nanos = -(i32::try_from(d.subsec_nanos()).unwrap_or(0));
+            let secs = i64::try_from(d.as_secs()).unwrap_or(i64::MAX);
+            let mut seconds = secs.checked_neg().unwrap_or(i64::MIN);
+            let mut nanos = i32::try_from(d.subsec_nanos())
+                .unwrap_or(0)
+                .checked_neg()
+                .unwrap_or(0);
             if nanos < 0 {
-                seconds -= 1;
+                seconds = seconds.saturating_sub(1);
                 nanos += 1_000_000_000;
             }
             pb::Timestamp { seconds, nanos }
@@ -658,16 +673,12 @@ fn timestamp_from_system(t: SystemTime) -> pb::Timestamp {
 
 fn system_from_timestamp(ts: pb::Timestamp) -> Option<SystemTime> {
     let nanos = u64::try_from(ts.nanos.max(0)).ok()?;
+    let dur_secs = Duration::from_secs(ts.seconds.unsigned_abs());
+    let dur_nanos = Duration::from_nanos(nanos);
     if ts.seconds >= 0 {
-        let secs = u64::try_from(ts.seconds).ok()?;
-        UNIX_EPOCH
-            .checked_add(Duration::from_secs(secs))?
-            .checked_add(Duration::from_nanos(nanos))
+        UNIX_EPOCH.checked_add(dur_secs)?.checked_add(dur_nanos)
     } else {
-        let secs = u64::try_from(-ts.seconds).ok()?;
-        UNIX_EPOCH
-            .checked_sub(Duration::from_secs(secs))?
-            .checked_add(Duration::from_nanos(nanos))
+        UNIX_EPOCH.checked_sub(dur_secs)?.checked_add(dur_nanos)
     }
 }
 
@@ -726,6 +737,43 @@ mod tests {
 
     fn unrestricted() -> ApiKey {
         ApiKey::from_parts(HEAD.to_vec(), &SECRET)
+    }
+
+    const TAIL_BYTES: [u8; 32] = [0xab; 32];
+
+    fn assemble(header: &[(u32, &[u8])], caveats: &[&[(u32, &[u8])]], tail: &[u8]) -> Vec<u8> {
+        let mut data = vec![VERSION];
+        for &(ft, payload) in header {
+            serialize_packet(
+                &mut data,
+                Packet {
+                    field_type: ft,
+                    data: payload,
+                },
+            );
+        }
+        data.push(FIELD_EOS as u8);
+        for cav in caveats {
+            for &(ft, payload) in *cav {
+                serialize_packet(
+                    &mut data,
+                    Packet {
+                        field_type: ft,
+                        data: payload,
+                    },
+                );
+            }
+            data.push(FIELD_EOS as u8);
+        }
+        data.push(FIELD_EOS as u8);
+        serialize_packet(
+            &mut data,
+            Packet {
+                field_type: FIELD_SIGNATURE,
+                data: tail,
+            },
+        );
+        data
     }
 
     #[test]
@@ -972,5 +1020,153 @@ mod tests {
         let s = format!("{:?}", unrestricted());
         assert!(s.contains("REDACTED"));
         assert!(!s.contains("111111"));
+    }
+
+    #[test]
+    fn parse_uvarint_overflow_is_varint_error_not_panic() {
+        // Go `binary.Uvarint` overflow: nine 0x80 continuations then 0x02.
+        let mut raw = vec![VERSION];
+        raw.extend(std::iter::repeat_n(0x80, 9));
+        raw.push(0x02);
+        assert_eq!(Macaroon::parse(&raw).unwrap_err().message(), "varint error");
+        assert_eq!(
+            parse_uvarint(&[0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02])
+                .unwrap_err()
+                .message(),
+            "varint error"
+        );
+        // Unterminated continuation.
+        assert_eq!(
+            parse_uvarint(&[0x80]).unwrap_err().message(),
+            "varint error"
+        );
+        // Over MAX_UVARINT (0x7fffffff) but still a valid 32-bit-plus varint.
+        let (rest, v) = parse_uvarint(&[0x7f]).unwrap();
+        assert!(rest.is_empty());
+        assert_eq!(v, 0x7f);
+    }
+
+    #[test]
+    fn caveat_decode_i64_min_seconds_does_not_panic() {
+        let proto = pb::Caveat {
+            not_before: Some(pb::Timestamp {
+                seconds: i64::MIN,
+                nanos: 0,
+            }),
+            not_after: Some(pb::Timestamp {
+                seconds: i64::MIN,
+                nanos: 1,
+            }),
+            ..Default::default()
+        };
+        let decoded = Caveat::decode(&proto.encode_to_vec()).unwrap();
+        // Unrepresentable times are dropped, not panicked.
+        let _ = (decoded.not_before, decoded.not_after);
+    }
+
+    #[test]
+    fn parse_strips_location_and_verification_id() {
+        let first_party = assemble(
+            &[(FIELD_IDENTIFIER, &HEAD)],
+            &[&[(FIELD_IDENTIFIER, b"cav1".as_slice())]],
+            &TAIL_BYTES,
+        );
+        let with_header_loc = assemble(
+            &[(FIELD_LOCATION, b"sat.example"), (FIELD_IDENTIFIER, &HEAD)],
+            &[&[(FIELD_IDENTIFIER, b"cav1".as_slice())]],
+            &TAIL_BYTES,
+        );
+        let with_caveat_loc = assemble(
+            &[(FIELD_IDENTIFIER, &HEAD)],
+            &[&[
+                (FIELD_LOCATION, b"caveat-loc"),
+                (FIELD_IDENTIFIER, b"cav1".as_slice()),
+            ]],
+            &TAIL_BYTES,
+        );
+        let with_vid = assemble(
+            &[(FIELD_IDENTIFIER, &HEAD)],
+            &[&[
+                (FIELD_IDENTIFIER, b"cav1".as_slice()),
+                (FIELD_VERIFICATION_ID, b"vid"),
+            ]],
+            &TAIL_BYTES,
+        );
+
+        for raw in [&with_header_loc, &with_caveat_loc, &with_vid] {
+            let mac = Macaroon::parse(raw).unwrap();
+            assert_eq!(mac.head(), HEAD);
+            assert_eq!(mac.caveats(), &[b"cav1".to_vec()]);
+            assert_eq!(mac.tail(), &TAIL_BYTES);
+            // Go Serialize writes first-party form only (no location / vid).
+            assert_eq!(mac.serialize(), first_party);
+        }
+    }
+
+    #[test]
+    fn parse_rejects_malformed_caveat_and_header_fields() {
+        let extra = assemble(
+            &[(FIELD_IDENTIFIER, &HEAD)],
+            &[&[
+                (FIELD_IDENTIFIER, b"cav1".as_slice()),
+                (FIELD_VERIFICATION_ID, b"vid"),
+                (FIELD_SIGNATURE, &TAIL_BYTES),
+            ]],
+            &TAIL_BYTES,
+        );
+        assert_eq!(
+            Macaroon::parse(&extra).unwrap_err().message(),
+            "extra fields found in caveat"
+        );
+
+        let invalid_field = assemble(
+            &[(FIELD_IDENTIFIER, &HEAD)],
+            &[&[
+                (FIELD_IDENTIFIER, b"cav1".as_slice()),
+                (FIELD_SIGNATURE, &TAIL_BYTES),
+            ]],
+            &TAIL_BYTES,
+        );
+        assert_eq!(
+            Macaroon::parse(&invalid_field).unwrap_err().message(),
+            "invalid field found in caveat"
+        );
+
+        let no_ident = assemble(
+            &[(FIELD_IDENTIFIER, &HEAD)],
+            &[&[(FIELD_LOCATION, b"only-loc")]],
+            &TAIL_BYTES,
+        );
+        assert_eq!(
+            Macaroon::parse(&no_ident).unwrap_err().message(),
+            "no Identifier in caveat"
+        );
+
+        let bad_header = assemble(
+            &[
+                (FIELD_LOCATION, b"sat"),
+                (FIELD_IDENTIFIER, &HEAD),
+                (FIELD_VERIFICATION_ID, b"x"),
+            ],
+            &[],
+            &TAIL_BYTES,
+        );
+        assert_eq!(
+            Macaroon::parse(&bad_header).unwrap_err().message(),
+            "invalid macaroon header"
+        );
+
+        let out_of_order = assemble(
+            &[(FIELD_IDENTIFIER, &HEAD)],
+            &[&[
+                (FIELD_IDENTIFIER, b"cav1".as_slice()),
+                (FIELD_LOCATION, b"late-loc"),
+            ]],
+            &TAIL_BYTES,
+        );
+        assert_eq!(
+            Macaroon::parse(&out_of_order).unwrap_err().message(),
+            "fields out of order"
+        );
     }
 }
