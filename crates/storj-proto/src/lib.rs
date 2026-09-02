@@ -71,7 +71,7 @@ mod tests {
     #[test]
     fn project_info_header_is_field_15() {
         let req = metainfo::ProjectInfoRequest {
-            header: Some(RequestHeader::new(*b"key", *b"storj-rust")),
+            header: Some(RequestHeader::new(*b"key", *b"storj-uplink")),
         };
         let buf = req.encode_to_vec();
         // field 15, wire type 2 (len) => (15 << 3) | 2 = 0x7a
@@ -79,7 +79,7 @@ mod tests {
         let round = metainfo::ProjectInfoRequest::decode(buf.as_slice()).unwrap();
         let h = round.header.expect("header");
         assert_eq!(h.api_key, b"key");
-        assert_eq!(h.user_agent, b"storj-rust");
+        assert_eq!(h.user_agent, b"storj-uplink");
     }
 
     #[test]

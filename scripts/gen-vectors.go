@@ -39,7 +39,7 @@ func repoRoot() string {
 			return c
 		}
 	}
-	panic("run from the storj-rust repo root or scripts/ via go run -C scripts .")
+	panic("run from the storj-uplink repo root or scripts/ via go run -C scripts .")
 }
 
 func must[T any](v T, err error) T {

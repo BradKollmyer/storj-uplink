@@ -130,7 +130,7 @@ mod tests {
 
     fn sample_batch() -> BatchRequest {
         BatchRequest {
-            header: Some(RequestHeader::new(*b"api-key", *b"storj-rust")),
+            header: Some(RequestHeader::new(*b"api-key", *b"storj-uplink")),
             requests: vec![BatchRequestItem {
                 request: Some(batch_request_item::Request::ObjectGet(
                     crate::metainfo::GetObjectRequest {

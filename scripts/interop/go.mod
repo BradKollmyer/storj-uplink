@@ -1,4 +1,4 @@
-module storj-rust-interop
+module storj-uplink-interop
 
 go 1.25.0
 

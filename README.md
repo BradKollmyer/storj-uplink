@@ -1,4 +1,4 @@
-# storj-rust
+# storj-uplink
 
 Native Rust [Uplink](https://pkg.go.dev/storj.io/uplink) client for [Storj](https://storj.io).
 
@@ -22,7 +22,7 @@ re-exported.
 
 ```toml
 [dependencies]
-storj = { git = "https://github.com/storj/storj-rust" }
+storj = { git = "https://github.com/storj/storj-uplink" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util"] }
 ```
 

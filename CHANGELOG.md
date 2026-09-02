@@ -9,6 +9,12 @@ The public API is `storj::*` only. Internal crates (`storj-access`, `storj-proto
 `storj-rpc`, `storj-encryption`, `storj-ec`, `storj-uplink`, `storj-test`) stay
 unpublished.
 
+## [Unreleased]
+
+### Changed
+
+- Repository name is `storj-uplink` (was `storj-rust`). The public crate remains `storj`.
+
 ## [1.0.0] - 2026-09-02
 
 Native Uplink API freeze. This crate is not a wrapper around `uplink-c` and is

@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for contributing to `storj-rust`.
+Thanks for contributing to `storj-uplink`.
 
 ## License
 

@@ -1,4 +1,4 @@
-module storj-rust-vectors
+module storj-uplink-vectors
 
 go 1.25.0
 
