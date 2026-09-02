@@ -1,13 +1,18 @@
-# Fuzz targets
+# Fuzzing
 
-Parsers that must not panic (design Testing Strategy):
+`cargo-fuzz` targets for the parsers that consume untrusted bytes. The
+`fuzz` package is excluded from the workspace so it does not affect normal
+builds; it needs nightly Rust.
 
-| Target | Crate |
-|---|---|
-| `Access::parse` / grant Base58Check | `storj-access` |
-| Macaroon parser | `storj-access` |
-| RS encode/decode | `storj-ec` (crate tests cover infectious goldens) |
-| DRPC frame parser | `storj-rpc` |
-| Path decrypt | `storj-encryption` |
+```bash
+cargo install cargo-fuzz
+cd fuzz
+cargo +nightly fuzz list
+cargo +nightly fuzz run drpc_frame          # DRPC frame parse + packet reassembly
+cargo +nightly fuzz run macaroon_parse      # macaroon parse/serialize/validate
+cargo +nightly fuzz run grant_parse         # access grant parse/serialize
+cargo +nightly fuzz run path_iter           # path components + encrypted-component decode
+cargo +nightly fuzz run compressed_batch    # zstd CompressedBatch (64 MiB cap)
+```
 
-Use `cargo fuzz` against those entry points. Do not fuzz production grants into CI logs.
+Artifacts, corpus and coverage directories are git-ignored.

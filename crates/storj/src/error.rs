@@ -96,6 +96,17 @@ impl std::error::Error for Error {
 
 impl From<io::Error> for Error {
     fn from(e: io::Error) -> Self {
+        // An `io::Error` produced from a `storj::Error` (e.g. surfaced through
+        // `AsyncRead`/`AsyncWrite` and `tokio::io::copy`) carries the original
+        // as its inner error: unwrap it so the kind survives the round trip.
+        if e.get_ref().is_some_and(|inner| inner.is::<Error>()) {
+            if let Some(inner) = e.into_inner() {
+                if let Ok(orig) = inner.downcast::<Error>() {
+                    return *orig;
+                }
+            }
+            return Self::new(ErrorKind::Io, "io error");
+        }
         let kind = if e.kind() == io::ErrorKind::Interrupted {
             ErrorKind::Canceled
         } else {

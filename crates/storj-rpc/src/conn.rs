@@ -4,7 +4,12 @@
 //! connection is a **pool** invariant, not a wire rule: frames still carry
 //! `stream_id`.
 
+use std::collections::VecDeque;
+use std::future::{Future, poll_fn};
 use std::io;
+use std::pin::pin;
+use std::task::Poll;
+use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -12,6 +17,23 @@ use crate::frame::{
     DEFAULT_SPLIT_SIZE, DRPC_TLS_MUX_PREFIX, FrameError, Kind, MAX_PACKET_SIZE, Packet,
     PacketAssembler, append_packet_data, parse_frame, unmarshal_error,
 };
+
+/// Default per-operation transport deadline (Go `piecestore.Config.MessageTimeout`).
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+/// Bytes requested from the transport per read call.
+const READ_CHUNK: usize = 64 * 1024;
+
+/// Extra bytes past [`MAX_PACKET_SIZE`] a peer may buffer before we give up
+/// (Go `maxFrameOverhead`-style slack for the frame header).
+const MAX_BUFFERED: usize = MAX_PACKET_SIZE + 32;
+
+fn timed_out() -> Error {
+    Error::Io(io::Error::new(
+        io::ErrorKind::TimedOut,
+        "rpc operation timed out",
+    ))
+}
 
 /// Client-side DRPC errors.
 #[derive(Debug, thiserror::Error)]
@@ -72,13 +94,24 @@ pub async fn read_tls_mux_prefix<R: AsyncRead + Unpin>(r: &mut R) -> Result<[u8;
 }
 
 /// Client DRPC connection over a raw byte stream (no TLS).
+///
+/// Every awaited transport read and write is bounded by a per-call deadline
+/// ([`Conn::with_timeout`]); a slow-but-progressing stream never trips it
+/// because each read/write gets a fresh deadline. Any timeout, I/O error, or
+/// future dropped mid-write marks the connection [`Conn::is_poisoned`] so a
+/// pool can refuse to recycle it.
 pub struct Conn<T> {
     io: T,
     buf: Vec<u8>,
     pos: usize,
     next_stream_id: u64,
     assembler: PacketAssembler,
+    /// Packets drained off the transport by a non-blocking probe (see
+    /// [`Conn::check_peer`]) but not yet handed to a reader.
+    pending: VecDeque<Packet>,
     split_size: usize,
+    timeout: Duration,
+    poisoned: bool,
 }
 
 impl<T> Conn<T> {
@@ -90,13 +123,64 @@ impl<T> Conn<T> {
             pos: 0,
             next_stream_id: 1,
             assembler: PacketAssembler::default(),
+            pending: VecDeque::new(),
             split_size: DEFAULT_SPLIT_SIZE,
+            timeout: DEFAULT_TIMEOUT,
+            poisoned: false,
         }
+    }
+
+    /// Set the per-read/per-write transport deadline (default [`DEFAULT_TIMEOUT`]).
+    #[must_use]
+    pub fn with_timeout(mut self, d: Duration) -> Self {
+        self.timeout = d;
+        self
+    }
+
+    /// Set the per-read/per-write transport deadline (default [`DEFAULT_TIMEOUT`]).
+    pub fn set_timeout(&mut self, d: Duration) {
+        self.timeout = d;
+    }
+
+    /// Current per-read/per-write transport deadline.
+    #[must_use]
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
+    /// True once the transport may hold a half-written frame or has failed:
+    /// a write/read timed out or errored, or a future was dropped while a
+    /// write was in flight. A poisoned connection must not be reused.
+    #[must_use]
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned
     }
 
     /// Consume the connection and return the inner transport.
     pub fn into_inner(self) -> T {
         self.io
+    }
+}
+
+/// Await one transport operation under deadline `d`. Expiry becomes
+/// `Error::Io(TimedOut)`; expiry and I/O errors set `poisoned`.
+///
+/// Free function (not a method) so callers can borrow `self.io` for the
+/// future and `self.poisoned` for the flag disjointly.
+async fn timed<F, R>(d: Duration, poisoned: &mut bool, fut: F) -> Result<R, Error>
+where
+    F: Future<Output = io::Result<R>>,
+{
+    match tokio::time::timeout(d, fut).await {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => {
+            *poisoned = true;
+            Err(e.into())
+        }
+        Err(_) => {
+            *poisoned = true;
+            Err(timed_out())
+        }
     }
 }
 
@@ -119,7 +203,16 @@ impl<T: AsyncWrite + Unpin> Conn<T> {
     /// Write the TLS mux prefix. Call before any invoke when talking to a
     /// muxed listener; on real Storj this happens *before* TLS, not here.
     pub async fn write_tls_mux_prefix(&mut self) -> io::Result<()> {
-        write_tls_mux_prefix(&mut self.io).await
+        let res = async {
+            self.write_raw(DRPC_TLS_MUX_PREFIX).await?;
+            self.flush().await
+        }
+        .await;
+        match res {
+            Ok(()) => Ok(()),
+            Err(Error::Io(e)) => Err(e),
+            Err(other) => Err(io::Error::other(other)),
+        }
     }
 
     /// Write a single DRPC packet (split into frames if larger than split size).
@@ -135,8 +228,27 @@ impl<T: AsyncWrite + Unpin> Conn<T> {
         self.flush().await
     }
 
+    /// Flush the transport under the deadline. A flush may push buffered
+    /// (TLS) bytes, so it is treated like a write for poisoning.
     async fn flush(&mut self) -> Result<(), Error> {
-        self.io.flush().await?;
+        let was = self.poisoned;
+        self.poisoned = true;
+        timed(self.timeout, &mut self.poisoned, self.io.flush()).await?;
+        self.poisoned = was;
+        Ok(())
+    }
+
+    /// Write `buf` fully under the deadline.
+    ///
+    /// `write_all` is not cancel-safe: the flag is raised *before* the await
+    /// and restored only after it completes, so a future dropped mid-write
+    /// leaves the connection poisoned. Poisoning is sticky: a later
+    /// successful write never clears it.
+    async fn write_raw(&mut self, buf: &[u8]) -> Result<(), Error> {
+        let was = self.poisoned;
+        self.poisoned = true;
+        timed(self.timeout, &mut self.poisoned, self.io.write_all(buf)).await?;
+        self.poisoned = was;
         Ok(())
     }
 
@@ -158,29 +270,55 @@ impl<T: AsyncWrite + Unpin> Conn<T> {
             data,
             self.split_size,
         );
-        self.io.write_all(&buf).await?;
-        Ok(())
+        self.write_raw(&buf).await
     }
 }
 
 impl<T: AsyncRead + Unpin> Conn<T> {
     /// Read and check the TLS mux prefix. Call before reading frames.
     pub async fn read_tls_mux_prefix(&mut self) -> Result<[u8; 8], Error> {
-        read_tls_mux_prefix(&mut self.io).await
+        let mut got = [0u8; 8];
+        timed(
+            self.timeout,
+            &mut self.poisoned,
+            self.io.read_exact(&mut got),
+        )
+        .await?;
+        if got.as_slice() != DRPC_TLS_MUX_PREFIX {
+            return Err(Error::MuxPrefix { got });
+        }
+        Ok(got)
     }
 
     /// Read the next reassembled packet, including `stream_id`.
     pub async fn read_packet(&mut self) -> Result<Packet, Error> {
+        if let Some(pkt) = self.pending.pop_front() {
+            return Ok(pkt);
+        }
         loop {
-            match parse_frame(self.unparsed())? {
-                Some((frame, consumed)) => {
-                    self.consume(consumed);
-                    if let Some(pkt) = self.assembler.push(frame)? {
-                        return Ok(pkt);
-                    }
-                }
-                None => self.fill().await?,
+            let before = self.unparsed().len();
+            if let Some(pkt) = self.parse_one()? {
+                return Ok(pkt);
             }
+            // Only hit the transport when the buffer holds no complete frame;
+            // a consumed-but-not-done frame may be followed by more buffered
+            // frames of the same packet.
+            if self.unparsed().len() == before {
+                self.fill().await?;
+            }
+        }
+    }
+
+    /// Parse at most one frame from the buffer. `Ok(Some)` when it completed
+    /// a packet, `Ok(None)` when it did not (frame consumed but packet not
+    /// done, or buffer holds no complete frame).
+    fn parse_one(&mut self) -> Result<Option<Packet>, Error> {
+        match parse_frame(self.unparsed())? {
+            Some((frame, consumed)) => {
+                self.consume(consumed);
+                Ok(self.assembler.push(frame)?)
+            }
+            None => Ok(None),
         }
     }
 
@@ -196,26 +334,109 @@ impl<T: AsyncRead + Unpin> Conn<T> {
         }
     }
 
-    async fn fill(&mut self) -> Result<(), Error> {
+    /// Compact consumed bytes to the front and make sure at least
+    /// [`READ_CHUNK`] bytes of spare capacity are available.
+    fn prepare_read(&mut self) -> Result<(), Error> {
         if self.pos > 0 {
             self.buf.copy_within(self.pos.., 0);
             self.buf.truncate(self.buf.len() - self.pos);
             self.pos = 0;
         }
-        if self.buf.len() > MAX_PACKET_SIZE + 32 {
+        if self.buf.len() > MAX_BUFFERED {
             return Err(FrameError::Overflow.into());
         }
-        let mut tmp = [0u8; 4096];
-        let n = self.io.read(&mut tmp).await?;
-        if n == 0 {
-            // Partial frame bytes, or a not-done packet still in the assembler.
-            if self.buf.is_empty() && !self.assembler.in_progress() {
-                return Err(Error::Closed);
-            }
-            return Err(Error::Truncated);
-        }
-        self.buf.extend_from_slice(&tmp[..n]);
+        self.buf.reserve(READ_CHUNK);
         Ok(())
+    }
+
+    /// Map a zero-length read (EOF) to the right error.
+    fn eof_error(&self) -> Error {
+        // Partial frame bytes, or a not-done packet still in the assembler.
+        if self.buf.is_empty() && !self.assembler.in_progress() {
+            Error::Closed
+        } else {
+            Error::Truncated
+        }
+    }
+
+    /// One transport read (under the deadline) directly into the spare
+    /// capacity of `buf`, so a 64 KiB frame needs one syscall, not sixteen.
+    async fn fill(&mut self) -> Result<(), Error> {
+        self.prepare_read()?;
+        // `read_buf` is cancel-safe: a dropped future leaves `buf` untouched.
+        let n = timed(
+            self.timeout,
+            &mut self.poisoned,
+            self.io.read_buf(&mut self.buf),
+        )
+        .await?;
+        if n == 0 {
+            return Err(self.eof_error());
+        }
+        Ok(())
+    }
+
+    /// Non-blocking probe of the transport: drain whatever bytes are already
+    /// readable, reassemble them, and queue complete packets for
+    /// [`Self::read_packet`]. Returns immediately when nothing is pending.
+    ///
+    /// Lets a sender notice a peer `Error`/`Close` in the middle of a
+    /// streaming upload instead of only at `CloseSend` (Go's stream manager
+    /// reads concurrently; we have one task per conn).
+    async fn drain_ready(&mut self) -> Result<(), Error> {
+        loop {
+            // Parse everything already buffered before touching the transport.
+            loop {
+                let before = self.unparsed().len();
+                match self.parse_one()? {
+                    Some(pkt) => self.pending.push_back(pkt),
+                    // No progress: the buffer holds at most a partial frame.
+                    None if self.unparsed().len() == before => break,
+                    None => {}
+                }
+            }
+            self.prepare_read()?;
+            // Poll one cancel-safe `read_buf` exactly once; `Pending` means
+            // the peer has sent nothing new, and dropping the future is fine.
+            let polled = {
+                let mut read = pin!(self.io.read_buf(&mut self.buf));
+                poll_fn(|cx| match read.as_mut().poll(cx) {
+                    Poll::Pending => Poll::Ready(None),
+                    Poll::Ready(res) => Poll::Ready(Some(res)),
+                })
+                .await
+            };
+            match polled {
+                None => return Ok(()),
+                Some(Err(e)) => {
+                    self.poisoned = true;
+                    return Err(e.into());
+                }
+                Some(Ok(0)) => return Err(self.eof_error()),
+                Some(Ok(_)) => continue,
+            }
+        }
+    }
+
+    /// Surface a terminal packet the peer already sent for `stream_id`
+    /// (`Error`, `Close`, `Cancel`) without consuming it, so a subsequent
+    /// `recv_msg` reports the same outcome.
+    fn peer_terminated(&self, stream_id: u64) -> Option<Error> {
+        self.pending
+            .iter()
+            .filter(|pkt| pkt.stream_id == stream_id)
+            .find_map(|pkt| match pkt.kind {
+                Kind::ERROR => {
+                    let (code, message) = unmarshal_error(&pkt.data);
+                    Some(Error::Remote { code, message })
+                }
+                Kind::CLOSE => Some(Error::Closed),
+                Kind::CANCEL => Some(Error::Remote {
+                    code: 0,
+                    message: "canceled".into(),
+                }),
+                _ => None,
+            })
     }
 }
 
@@ -294,7 +515,18 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Conn<T> {
     }
 
     /// Send a protobuf-encoded message on `stream`.
+    ///
+    /// Before writing, drains any bytes the peer has already sent (without
+    /// blocking) so an `Error`/`Close`/`Cancel` the peer emitted mid-upload
+    /// is reported here rather than only at [`Self::close_send`]. Packets
+    /// drained this way are queued for the next [`Self::recv_msg`].
     pub async fn send_msg(&mut self, stream: &mut RpcStream, data: &[u8]) -> Result<(), Error> {
+        let drained = self.drain_ready().await;
+        // A queued Error/Close for this stream beats a generic EOF report.
+        if let Some(err) = self.peer_terminated(stream.stream_id) {
+            return Err(err);
+        }
+        drained?;
         self.send_kind(stream, Kind::MESSAGE, data).await?;
         self.flush().await
     }

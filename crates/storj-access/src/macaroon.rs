@@ -6,7 +6,9 @@
 //! produce `tail`.
 
 use std::fmt;
+
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use zeroize::Zeroize;
 
 use hmac::{Hmac, Mac};
 use prost::Message;
@@ -36,6 +38,16 @@ pub struct Macaroon {
     head: Vec<u8>,
     caveats: Vec<Vec<u8>>,
     tail: [u8; TAIL_LEN],
+}
+
+impl Drop for Macaroon {
+    fn drop(&mut self) {
+        self.head.zeroize();
+        self.tail.zeroize();
+        for c in &mut self.caveats {
+            c.zeroize();
+        }
+    }
 }
 
 impl fmt::Debug for Macaroon {
@@ -912,6 +924,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "SystemTime has 100 ns resolution on Windows; the Go golden uses 1 ns nanos"
+    )]
     fn restrict_timed_matches_go() {
         let cav = Caveat {
             disallow_writes: true,

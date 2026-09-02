@@ -81,8 +81,9 @@ impl From<[u8; 32]> for Key {
 /// `parallelism` is **8** for `Access::request_with_passphrase` and **1** for
 /// `Key::derive`. Using the wrong `p` yields a different root key than Go/console.
 pub fn derive_root_key(password: &[u8], salt: &[u8], path: &[u8], parallelism: u32) -> Result<Key> {
-    let mixed = hmac_sha256(password, salt)?;
-    let path_salt = hmac_sha256(&mixed, path)?;
+    // Both HMACs are derived from the passphrase: wipe them when done.
+    let mixed = Zeroizing::new(hmac_sha256(password, salt)?);
+    let path_salt = Zeroizing::new(hmac_sha256(&*mixed, path)?);
 
     let params = argon2::Params::new(
         ARGON2_MEMORY_KIB,
@@ -95,7 +96,7 @@ pub fn derive_root_key(password: &[u8], salt: &[u8], path: &[u8], parallelism: u
 
     let mut out = Zeroizing::new([0u8; 32]);
     argon
-        .hash_password_into(password, &path_salt, &mut *out)
+        .hash_password_into(password, &*path_salt, &mut *out)
         .map_err(|e| Error::new(ErrorKind::Protocol, format!("argon2: {e}")))?;
 
     Ok(Key { bytes: *out })
@@ -109,6 +110,9 @@ pub fn derive_key(key: &Key, message: &str) -> Key {
 }
 
 /// Path-component HD step: `HMAC-SHA512(key, "path:" + component)[0..32]`.
+///
+/// Returns a plain array: the caller owns zeroizing it (wrap in
+/// [`zeroize::Zeroizing`] or turn it into a [`Key`], which zeroizes on drop).
 pub fn derive_path_key_component(key: &[u8; 32], component: &str) -> [u8; 32] {
     Key::from_bytes(*key)
         .derive_path_component(component.as_bytes())
@@ -119,7 +123,8 @@ pub fn derive_path_key_component(key: &[u8; 32], component: &str) -> [u8; 32] {
 pub fn derive_nonce(derived_key: &Key) -> [u8; 24] {
     let mut mac = hmac_sha512(derived_key.as_bytes());
     mac.update(NONCE_HMAC_INFO);
-    let full = mac.finalize().into_bytes();
+    // The full 64-byte MAC contains the derived key material; wipe it.
+    let full = Zeroizing::new(mac.finalize().into_bytes());
     let mut out = [0u8; 24];
     out.copy_from_slice(&full[..24]);
     out
@@ -137,7 +142,8 @@ fn hmac_sha512(key: &[u8]) -> HmacSha512 {
 }
 
 fn truncate_key(mac: HmacSha512) -> Key {
-    let full = mac.finalize().into_bytes();
+    // The first 32 bytes *are* the derived key; wipe the whole 64-byte MAC.
+    let full = Zeroizing::new(mac.finalize().into_bytes());
     let mut out = [0u8; 32];
     out.copy_from_slice(&full[..32]);
     Key { bytes: out }

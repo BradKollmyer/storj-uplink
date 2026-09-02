@@ -1,0 +1,45 @@
+[package]
+name = "storj-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+storj-rpc = { path = "../crates/storj-rpc" }
+storj-access = { path = "../crates/storj-access" }
+storj-encryption = { path = "../crates/storj-encryption" }
+storj-proto = { path = "../crates/storj-proto" }
+
+[[bin]]
+name = "drpc_frame"
+path = "fuzz_targets/drpc_frame.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "macaroon_parse"
+path = "fuzz_targets/macaroon_parse.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "grant_parse"
+path = "fuzz_targets/grant_parse.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "path_iter"
+path = "fuzz_targets/path_iter.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "compressed_batch"
+path = "fuzz_targets/compressed_batch.rs"
+test = false
+doc = false

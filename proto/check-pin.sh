@@ -20,7 +20,12 @@ fail=0
 shopt -s nullglob
 for path in "$ROOT"/proto/*.proto; do
   f="$(basename "$path")"
-  url="https://raw.githubusercontent.com/storj/common/${COMMON_SHA}/pb/${f}"
+  case "$f" in
+    # Macaroon caveat types are not under pb/ upstream.
+    caveat.proto) upstream="macaroon/types.proto" ;;
+    *) upstream="pb/${f}" ;;
+  esac
+  url="https://raw.githubusercontent.com/storj/common/${COMMON_SHA}/${upstream}"
   tmp="$(mktemp)"
   if ! curl -fsSL "$url" -o "$tmp"; then
     echo "FETCH FAIL: $url" >&2
@@ -28,8 +33,27 @@ for path in "$ROOT"/proto/*.proto; do
     fail=1
     continue
   fi
+  if [[ "$f" == caveat.proto ]]; then
+    # The vendored caveat.proto deliberately drops the pico import/annotations
+    # and lists fields in picobuf *encode* order (see its header comment), so
+    # compare the normalized set of field declarations instead of raw bytes.
+    norm() {
+      grep -E '^[[:space:]]*(repeated[[:space:]]+)?[A-Za-z_.]+[[:space:]]+[A-Za-z_]+[[:space:]]*=[[:space:]]*[0-9]+' "$1" \
+        | sed -E 's/\[[^]]*\]//g; s/[[:space:]]+/ /g; s/^ //; s/ ;/;/; s/ *$//' \
+        | sort
+    }
+    if ! cmp -s <(norm "$tmp") <(norm "$path"); then
+      echo "DRIFT: proto/$f field set does not match storj/common@${COMMON_SHA} ${upstream}" >&2
+      diff <(norm "$tmp") <(norm "$path") >&2 || true
+      fail=1
+    else
+      echo "ok $f (normalized field set)"
+    fi
+    rm -f "$tmp"
+    continue
+  fi
   if ! cmp -s "$tmp" "$path"; then
-    echo "DRIFT: proto/$f does not match storj/common@${COMMON_SHA} pb/$f" >&2
+    echo "DRIFT: proto/$f does not match storj/common@${COMMON_SHA} ${upstream}" >&2
     fail=1
   else
     echo "ok $f"

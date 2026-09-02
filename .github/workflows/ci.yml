@@ -4,29 +4,56 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  test:
+  lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           components: rustfmt, clippy
       - name: fmt
         run: cargo fmt --all -- --check
       - name: clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: rustdoc
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps --locked
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
       - name: test
-        run: cargo test --workspace
-      - name: compile all tests including ignored
-        run: cargo test --workspace --no-run
+        run: cargo test --workspace --locked
+
+  # MSRV per README (rust-version in Cargo.toml).
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@85c23e28f7ccc75a9a153d45d385d94a85464876 # 1.85
+      - name: check on MSRV
+        run: cargo check --workspace --all-targets --locked
 
   # Mitigation 3 / R1: fail if vendored proto drifts from the pin without a PR.
   proto:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           components: rustfmt
       - name: checksum vendored protos against pin
@@ -35,32 +62,42 @@ jobs:
         run: |
           bash proto/gen-prost.sh
           cargo fmt --all
-          git diff --exit-code crates/storj-proto/src/gen
+          # `git status` also catches newly generated (untracked) files that
+          # `git diff` would miss.
+          if [ -n "$(git status --porcelain crates/storj-proto/src/gen)" ]; then
+            git status --porcelain crates/storj-proto/src/gen
+            git diff crates/storj-proto/src/gen
+            exit 1
+          fi
 
   deny:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
       - name: Install cargo-deny
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b # v2
         with:
           tool: cargo-deny@0.20.2
       - name: cargo deny
         run: cargo deny check
 
-  # Go generator vs checked-in fixtures (Argon2 p=1/p=8, path HMAC, grant).
+  # Go generator vs checked-in fixtures (Argon2 p=1/p=8, path HMAC, grant, RS).
   vectors:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: "1.25"
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
       - name: generate goldens
         run: go run -C scripts .
       - name: fixtures are not stale
-        run: git diff --exit-code crates/storj/tests/fixtures/derive_root_key.jsonl crates/storj/tests/fixtures/path_hmac.jsonl crates/storj/tests/fixtures/grant_go.txt
-      - name: kdf, path HMAC, and grant goldens match Go
-        run: cargo test -p storj --test encryption_kdf --test encryption_golden --test grant_golden
+        run: git diff --exit-code crates/storj/tests/fixtures/
+      - name: kdf, path HMAC, grant, and RS goldens match Go
+        run: >
+          cargo test --locked -p storj --test encryption_kdf --test encryption_golden
+          --test grant_golden --test ec_golden --test signing_golden
+      - name: storj-ec goldens match infectious
+        run: cargo test --locked -p storj-ec --test golden

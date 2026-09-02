@@ -221,9 +221,9 @@ pub fn sign_order_limit(limit: &mut OrderLimit, satellite: &Identity) -> Result<
 }
 
 /// Verify the satellite ECDSA signature on `limit`.
-pub fn verify_order_limit(limit: &OrderLimit, satellite_ca_der: &[u8]) -> Result<()> {
+pub fn verify_order_limit(limit: &OrderLimit, satellite_cert_der: &[u8]) -> Result<()> {
     let bytes = encode_order_limit(limit);
-    storj_rpc::hash_and_verify(satellite_ca_der, &bytes, &limit.satellite_signature)
+    storj_rpc::hash_and_verify(satellite_cert_der, &bytes, &limit.satellite_signature)
         .map_err(|_| Error::OrderLimitSignature)
 }
 
@@ -263,9 +263,9 @@ pub fn sign_piece_hash_node(hash: &mut PieceHash, node: &Identity) -> Result<()>
 }
 
 /// Verify a storage-node ECDSA signature on `hash`.
-pub fn verify_piece_hash_node(hash: &PieceHash, node_ca_der: &[u8]) -> Result<()> {
+pub fn verify_piece_hash_node(hash: &PieceHash, node_cert_der: &[u8]) -> Result<()> {
     let bytes = encode_piece_hash(hash);
-    storj_rpc::hash_and_verify(node_ca_der, &bytes, &hash.signature)
+    storj_rpc::hash_and_verify(node_cert_der, &bytes, &hash.signature)
         .map_err(|_| Error::PieceHashSignature)
 }
 
@@ -308,18 +308,18 @@ mod tests {
         let piece = PiecePrivateKey::generate();
         let mut limit = sample_limit(&sat, &piece.public().to_bytes());
         sign_order_limit(&mut limit, &sat).unwrap();
-        verify_order_limit(&limit, sat.ca_der().as_ref()).unwrap();
+        verify_order_limit(&limit, sat.leaf_der().as_ref()).unwrap();
 
         let mut tampered = limit.clone();
         tampered.limit += 1;
         assert!(matches!(
-            verify_order_limit(&tampered, sat.ca_der().as_ref()),
+            verify_order_limit(&tampered, sat.leaf_der().as_ref()),
             Err(Error::OrderLimitSignature)
         ));
 
         let other = Identity::generate().unwrap();
         assert!(matches!(
-            verify_order_limit(&limit, other.ca_der().as_ref()),
+            verify_order_limit(&limit, other.leaf_der().as_ref()),
             Err(Error::OrderLimitSignature)
         ));
     }
@@ -366,10 +366,10 @@ mod tests {
             hash_algorithm: PieceHashAlgo::Sha256.to_i32(),
         };
         sign_piece_hash_node(&mut hash, &node).unwrap();
-        verify_piece_hash_node(&hash, node.ca_der().as_ref()).unwrap();
+        verify_piece_hash_node(&hash, node.leaf_der().as_ref()).unwrap();
         let other = Identity::generate().unwrap();
         assert!(matches!(
-            verify_piece_hash_node(&hash, other.ca_der().as_ref()),
+            verify_piece_hash_node(&hash, other.leaf_der().as_ref()),
             Err(Error::PieceHashSignature)
         ));
     }

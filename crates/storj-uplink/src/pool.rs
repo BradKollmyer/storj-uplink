@@ -7,7 +7,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use storj_rpc::NodeId;
 use tokio::sync::Notify;
@@ -45,24 +45,39 @@ impl Default for PoolConfig {
 }
 
 struct Inner<T> {
-    idle: HashMap<NodeId, VecDeque<T>>,
+    /// Idle conns per node with the instant they were returned.
+    idle: HashMap<NodeId, VecDeque<(Instant, T)>>,
     idle_count: usize,
     in_use: usize,
+    idle_timeout: Duration,
 }
 
 impl<T> Inner<T> {
+    /// Pop the freshest usable idle conn for `node`, discarding any that sat
+    /// idle longer than `idle_timeout` (a peer will have closed those).
     fn pop_idle(&mut self, node: NodeId) -> Option<T> {
+        let timeout = self.idle_timeout;
         let slot = self.idle.get_mut(&node)?;
-        let conn = slot.pop_front()?;
+        let mut found = None;
+        while let Some((since, conn)) = slot.pop_front() {
+            self.idle_count = self.idle_count.saturating_sub(1);
+            if since.elapsed() < timeout {
+                found = Some(conn);
+                break;
+            }
+            // Stale: drop it and keep looking.
+        }
         if slot.is_empty() {
             self.idle.remove(&node);
         }
-        self.idle_count = self.idle_count.saturating_sub(1);
-        Some(conn)
+        found
     }
 
     fn push_idle(&mut self, node: NodeId, conn: T) {
-        self.idle.entry(node).or_default().push_back(conn);
+        self.idle
+            .entry(node)
+            .or_default()
+            .push_back((Instant::now(), conn));
         self.idle_count += 1;
     }
 
@@ -148,6 +163,7 @@ impl<T: Send + 'static> ConnectionPool<T> {
                     idle: HashMap::new(),
                     idle_count: 0,
                     in_use: 0,
+                    idle_timeout: config.idle_timeout,
                 }),
                 notify: Notify::new(),
             }),

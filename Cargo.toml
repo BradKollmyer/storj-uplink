@@ -1,13 +1,14 @@
 [workspace]
 resolver = "2"
 members = ["crates/*"]
+exclude = ["fuzz"]
 
 [workspace.package]
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 version = "1.0.0"
-repository = "https://github.com/storj/storj-uplink"
+repository = "https://github.com/BradKollmyer/storj-uplink"
 
 [workspace.dependencies]
 storj = { path = "crates/storj" }

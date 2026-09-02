@@ -160,13 +160,18 @@ async fn k_minus_one_pieces_fails_download() {
     for i in 1..4 {
         mock.fail_sn_download(i).await;
     }
-    let err = match project
+    // Downloads are lazy (segments are fetched on read, as in Go), so the
+    // piece shortage surfaces when the body is read, not when it is opened.
+    let mut download = project
         .download_object(&name, "r", Default::default())
         .await
-    {
+        .expect("open is lazy");
+    let mut body = Vec::new();
+    let err = match tokio::io::copy(&mut download, &mut body).await {
         Ok(_) => panic!("k-1 pieces must fail"),
         Err(e) => e,
     };
+    let err = storj::Error::from(err);
     assert_eq!(err.kind(), storj::ErrorKind::Protocol);
 }
 
@@ -192,4 +197,48 @@ fn compressed_batch_max_decode_matches_proto() {
         storj::constants::COMPRESSED_BATCH_MAX_DECODE,
         storj_proto::MAX_DECODE_MEMORY
     );
+}
+
+/// A storage node that accepts the piece and then never answers must not hang
+/// the upload: the per-message timeout fails the piece, the long tail retries
+/// on other nodes, and the object commits.
+#[tokio::test]
+async fn stalled_storage_node_times_out_and_upload_completes() {
+    use std::time::Duration;
+    use storj::Project;
+    use storj_test::MockSatellite;
+    use tokio::io::AsyncWriteExt;
+
+    let mock = MockSatellite::start().await;
+    let config = storj::Config {
+        message_timeout: Some(Duration::from_secs(1)),
+        ..Default::default()
+    };
+    let project = Project::open_with_config(&mock.access(), config)
+        .await
+        .expect("open");
+    let name = unique("stall");
+    project.ensure_bucket(&name).await.unwrap();
+    // Mock RS is k=2, n=4, o=3: stall two nodes so the threshold cannot be met
+    // without the timeout kicking in and the retry round replacing them.
+    mock.set_sn_delay(2, Duration::from_secs(60)).await;
+    mock.set_sn_delay(3, Duration::from_secs(60)).await;
+
+    let started = std::time::Instant::now();
+    let mut upload = project
+        .upload_object(&name, "s", Default::default())
+        .await
+        .unwrap();
+    upload.write_all(&vec![7u8; 5000]).await.unwrap();
+    upload.commit().await.expect("commit despite stalled nodes");
+    assert!(
+        started.elapsed() < Duration::from_secs(30),
+        "upload took {:?}; the stalled nodes were not timed out",
+        started.elapsed()
+    );
+    assert!(
+        mock.retry_begin_count() >= 1,
+        "stalled pieces must be retried"
+    );
+    assert_eq!(mock.committed_count(), 1);
 }

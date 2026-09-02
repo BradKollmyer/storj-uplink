@@ -37,7 +37,9 @@ fn main() {
             }
             let name = p.file_name()?.to_string_lossy();
             // gogo.proto is options only; not generated to Rust.
-            if name == "gogo.proto" {
+            // caveat.proto's types are hand-maintained in
+            // crates/storj-access/src/pb.rs (picobuf encode order matters).
+            if name == "gogo.proto" || name == "caveat.proto" {
                 return None;
             }
             Some(p.to_string_lossy().into_owned())

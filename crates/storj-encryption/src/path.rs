@@ -20,11 +20,21 @@ const ESCAPE_01: u8 = 0x01;
 ///
 /// Trailing slashes yield a final empty component (`"a/"` → `["a", ""]`).
 /// `"/"` is `["", ""]`. The empty path is already done.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct PathIter {
     raw: Vec<u8>,
     consumed: usize,
     last_empty: bool,
+}
+
+/// `Debug` hides the path bytes (they may be plaintext object keys).
+impl std::fmt::Debug for PathIter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PathIter")
+            .field("len", &self.raw.len())
+            .field("consumed", &self.consumed)
+            .finish()
+    }
 }
 
 impl PathIter {

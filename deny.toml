@@ -13,6 +13,11 @@ targets = [
 
 [advisories]
 yanked = "deny"
+ignore = [
+    # `instant` is pulled in only by `reed-solomon-erasure`, a dev-dependency
+    # of storj-ec used for a divergence test against infectious; never shipped.
+    { id = "RUSTSEC-2024-0384", reason = "dev-only via reed-solomon-erasure divergence test" },
+]
 
 [licenses]
 confidence-threshold = 0.8
@@ -32,7 +37,10 @@ allow = [
 
 [bans]
 multiple-versions = "warn"
-wildcards = "deny"
+# Workspace path deps carry no version (internal crates are `publish = false`
+# and `storj` is consumed via git/path, see README); cargo-deny treats a
+# publishable crate's version-less path deps as wildcards, so warn instead.
+wildcards = "warn"
 allow-wildcard-paths = true
 deny = [
     { crate = "openssl", use-instead = "rustls" },

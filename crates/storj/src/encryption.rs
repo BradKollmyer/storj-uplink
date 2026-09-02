@@ -11,17 +11,6 @@
 use crate::constants::ARGON2_PARALLELISM_DERIVE;
 use crate::error::{Error, ErrorKind, Result};
 
-pub use storj_encryption::{
-    AES_GCM_NONCE_SIZE, AES_GCM_TAG_SIZE, AesGcmDecrypter, AesGcmEncrypter, Base, CipherSuite,
-    DEFAULT_ENCRYPTED_BLOCK_SIZE, EncryptionParameters, Lookup, NONCE_SIZE, NoopTransformer,
-    PathIter, SECRETBOX_OVERHEAD, SecretboxDecrypter, SecretboxEncrypter, Store, Transformer,
-    UINT32_SIZE, calc_encompassing_blocks, calc_encrypted_size, calc_transformer_encrypted_size,
-    decrypt, decrypt_path, decrypt_path_with_cipher, derive_content_key, derive_key,
-    derive_path_key, derive_path_key_component, encrypt, encrypt_path, encrypt_path_with_cipher,
-    encrypt_prefix, increment, increment_bytes, make_padding, new_decrypter, new_encrypter, pad,
-    transform_blocks, transform_padded, transform_unpad, unpad, unpad_len,
-};
-
 /// 32-byte root/path key. Zeroized on drop.
 #[derive(Clone)]
 pub struct EncryptionKey(storj_encryption::Key);
@@ -41,17 +30,6 @@ impl EncryptionKey {
     /// Build from an already-derived 32-byte key.
     pub fn from_bytes(bytes: [u8; 32]) -> Self {
         Self(storj_encryption::Key::from_bytes(bytes))
-    }
-
-    /// Inner `storj-encryption` key.
-    pub fn inner(&self) -> &storj_encryption::Key {
-        &self.0
-    }
-}
-
-impl From<storj_encryption::Key> for EncryptionKey {
-    fn from(key: storj_encryption::Key) -> Self {
-        Self(key)
     }
 }
 
@@ -83,6 +61,7 @@ mod tests {
     use crate::constants::ARGON2_PARALLELISM_REQUEST;
     use hmac::{Hmac, Mac};
     use sha2::Sha512;
+    use storj_encryption::derive_path_key_component;
 
     type HmacSha512 = Hmac<Sha512>;
 

@@ -104,6 +104,28 @@ impl Transformer for SecretboxEncrypter {
             .encrypt(Nonce::from_slice(&nonce), input)
             .map_err(|e| Error::new(ErrorKind::Protocol, format!("secretbox encrypt: {e}")))
     }
+
+    fn transform_into(&self, input: &[u8], block_num: i64, out: &mut Vec<u8>) -> Result<()> {
+        use crypto_secretbox::aead::AeadInPlace;
+        let nonce = calc_nonce(&self.starting_nonce, block_num)?;
+        let start = out.len();
+        // NaCl layout is tag || ciphertext: reserve the tag slot first.
+        out.resize(start + SECRETBOX_OVERHEAD, 0);
+        out.extend_from_slice(input);
+        let tag = self
+            .cipher
+            .encrypt_in_place_detached(
+                Nonce::from_slice(&nonce),
+                b"",
+                &mut out[start + SECRETBOX_OVERHEAD..],
+            )
+            .map_err(|e| {
+                out.truncate(start);
+                Error::new(ErrorKind::Protocol, format!("secretbox encrypt: {e}"))
+            })?;
+        out[start..start + SECRETBOX_OVERHEAD].copy_from_slice(&tag);
+        Ok(())
+    }
 }
 
 impl SecretboxDecrypter {
@@ -135,6 +157,31 @@ impl Transformer for SecretboxDecrypter {
         self.cipher
             .decrypt(Nonce::from_slice(&nonce), input)
             .map_err(|_| Error::new(ErrorKind::DecryptionFailed, "secretbox decrypt"))
+    }
+
+    fn transform_into(&self, input: &[u8], block_num: i64, out: &mut Vec<u8>) -> Result<()> {
+        use crypto_secretbox::aead::AeadInPlace;
+        let nonce = calc_nonce(&self.starting_nonce, block_num)?;
+        if input.len() < SECRETBOX_OVERHEAD {
+            return Err(Error::new(ErrorKind::DecryptionFailed, "secretbox decrypt"));
+        }
+        let (tag, ct) = input.split_at(SECRETBOX_OVERHEAD);
+        let start = out.len();
+        out.extend_from_slice(ct);
+        let ok = self
+            .cipher
+            .decrypt_in_place_detached(
+                Nonce::from_slice(&nonce),
+                b"",
+                &mut out[start..],
+                crypto_secretbox::Tag::from_slice(tag),
+            )
+            .is_ok();
+        if !ok {
+            out.truncate(start);
+            return Err(Error::new(ErrorKind::DecryptionFailed, "secretbox decrypt"));
+        }
+        Ok(())
     }
 }
 

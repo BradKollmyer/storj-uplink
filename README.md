@@ -22,7 +22,7 @@ re-exported.
 
 ```toml
 [dependencies]
-storj = { git = "https://github.com/storj/storj-uplink" }
+storj = { git = "https://github.com/BradKollmyer/storj-uplink" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util"] }
 ```
 
@@ -81,6 +81,14 @@ cargo run -p storj --example walkthrough -- "$STORJ_ACCESS"
 ## MSRV
 
 Rust 1.85 (edition 2024).
+
+## Build notes
+
+On aarch64 (Apple Silicon, Graviton) the pinned `aes`/`polyval` crates only use
+the ARMv8 AES and PMULL instructions when built with
+`--cfg aes_armv8 --cfg polyval_armv8`; without them AES-GCM runs in software
+(~10x slower). This workspace sets them in `.cargo/config.toml`; downstream
+builds must set the same `rustflags` (x86_64 autodetects AES-NI).
 
 ## Tests
 

@@ -49,8 +49,8 @@ impl Default for Config {
 /// Piecestore client over one DRPC connection (one RPC at a time).
 pub struct Client<T> {
     conn: Conn<T>,
-    satellite_ca_der: Vec<u8>,
-    peer_ca_der: Vec<u8>,
+    satellite_cert_der: Vec<u8>,
+    peer_cert_der: Vec<u8>,
     hash_algo: PieceHashAlgo,
     config: Config,
 }
@@ -58,14 +58,14 @@ pub struct Client<T> {
 impl<T> Client<T> {
     /// Wrap an established SN connection.
     ///
-    /// `satellite_ca_der` verifies order limits. `peer_ca_der` is the storage
+    /// `satellite_cert_der` verifies order limits. `peer_cert_der` is the storage
     /// node's CA (from TLS) used to verify the signed piece hash it returns.
     #[must_use]
-    pub fn new(conn: Conn<T>, satellite_ca_der: Vec<u8>, peer_ca_der: Vec<u8>) -> Self {
+    pub fn new(conn: Conn<T>, satellite_cert_der: Vec<u8>, peer_cert_der: Vec<u8>) -> Self {
         Self {
             conn,
-            satellite_ca_der,
-            peer_ca_der,
+            satellite_cert_der,
+            peer_cert_der,
             hash_algo: PieceHashAlgo::Blake3,
             config: Config::default(),
         }
@@ -112,7 +112,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Client<T> {
         piece_key: &PiecePrivateKey,
         data: &[u8],
     ) -> Result<PieceHash> {
-        verify_order_limit(limit, &self.satellite_ca_der)?;
+        verify_order_limit(limit, &self.satellite_cert_der)?;
         if limit.action != PieceAction::Put as i32 && limit.action != PieceAction::PutRepair as i32
         {
             return Err(Error::protocol("order limit action is not PUT"));
@@ -216,7 +216,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Client<T> {
         let sn_hash = resp
             .done
             .ok_or_else(|| Error::protocol("expected piece hash"))?;
-        verify_sn_piece_hash(&sn_hash, limit, digest, self.hash_algo, &self.peer_ca_der)?;
+        verify_sn_piece_hash(&sn_hash, limit, digest, self.hash_algo, &self.peer_cert_der)?;
         Ok(sn_hash)
     }
 
@@ -229,7 +229,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Client<T> {
         offset: i64,
         size: i64,
     ) -> Result<Vec<u8>> {
-        verify_order_limit(limit, &self.satellite_ca_der)?;
+        verify_order_limit(limit, &self.satellite_cert_der)?;
         if limit.action != PieceAction::Get as i32
             && limit.action != PieceAction::GetAudit as i32
             && limit.action != PieceAction::GetRepair as i32
@@ -238,6 +238,15 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Client<T> {
         }
         if offset < 0 || size < 0 {
             return Err(Error::protocol("download offset/size must be >= 0"));
+        }
+        let end = offset
+            .checked_add(size)
+            .ok_or_else(|| Error::protocol("download offset+size overflows"))?;
+        if end > limit.limit {
+            return Err(Error::protocol(format!(
+                "download range {offset}+{size} exceeds order limit {}",
+                limit.limit
+            )));
         }
         if size == 0 {
             return Ok(Vec::new());
@@ -259,9 +268,15 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Client<T> {
         offset: i64,
         size: i64,
     ) -> Result<Vec<u8>> {
+        // Like Go `piecestore.Download`: allocate (sign orders for) the piece
+        // in growing steps as data arrives instead of ordering the whole
+        // range up front, so a piece that is cancelled by the long tail is
+        // only settled for what was actually read.
+        let mut step = self.config.initial_step.max(1);
+        let mut allocated = size.min(step);
         let req = PieceDownloadRequest {
             limit: Some(limit.clone()),
-            order: Some(signed_order(limit, piece_key, size)?),
+            order: Some(signed_order(limit, piece_key, allocated)?),
             chunk: Some(piece_download_request::Chunk {
                 offset,
                 chunk_size: size,
@@ -270,8 +285,20 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Client<T> {
         };
         self.conn.send_msg(stream, &req.encode_to_vec()).await?;
 
-        let mut out = Vec::new();
+        let mut out = Vec::with_capacity(usize::try_from(size).unwrap_or(0));
         while (out.len() as i64) < size {
+            // Top up before the node runs out of allocation (it stops sending
+            // at `allocated` and waits for a larger order).
+            let received = out.len() as i64;
+            if allocated < size && allocated - received <= step / 2 {
+                step = next_order_step(step, self.config.maximum_step);
+                allocated = allocated.saturating_add(step).min(size);
+                let more = PieceDownloadRequest {
+                    order: Some(signed_order(limit, piece_key, allocated)?),
+                    ..Default::default()
+                };
+                self.conn.send_msg(stream, &more.encode_to_vec()).await?;
+            }
             match self.conn.recv_msg_opt(stream).await? {
                 Some(bytes) => {
                     let resp = PieceDownloadResponse::decode(bytes.as_slice())?;
@@ -333,7 +360,7 @@ fn verify_sn_piece_hash(
     limit: &OrderLimit,
     expected: &[u8],
     algo: PieceHashAlgo,
-    peer_ca_der: &[u8],
+    peer_cert_der: &[u8],
 ) -> Result<()> {
     if hash.piece_id != limit.piece_id {
         return Err(Error::PieceIdMismatch);
@@ -344,7 +371,7 @@ fn verify_sn_piece_hash(
     if hash.hash != expected {
         return Err(Error::PieceHashMismatch);
     }
-    verify_piece_hash_node(hash, peer_ca_der)?;
+    verify_piece_hash_node(hash, peer_cert_der)?;
     if timestamp_too_old(hash.timestamp.as_ref()) {
         return Err(Error::PieceHashExpired);
     }
@@ -445,13 +472,13 @@ mod tests {
     async fn serve_mock<T: AsyncRead + AsyncWrite + Unpin>(
         conn: Conn<T>,
         sn: Identity,
-        satellite_ca: Vec<u8>,
+        satellite_cert: Vec<u8>,
         store: PieceStore,
     ) {
         serve_mock_with_fault(
             conn,
             sn,
-            satellite_ca,
+            satellite_cert,
             store,
             Arc::new(Mutex::new(UploadFault::None)),
         )
@@ -461,7 +488,7 @@ mod tests {
     async fn serve_mock_with_fault<T: AsyncRead + AsyncWrite + Unpin>(
         mut conn: Conn<T>,
         sn: Identity,
-        satellite_ca: Vec<u8>,
+        satellite_cert: Vec<u8>,
         store: PieceStore,
         fault: Arc<Mutex<UploadFault>>,
     ) {
@@ -478,10 +505,10 @@ mod tests {
                         *g = UploadFault::None;
                         f
                     };
-                    serve_upload(&mut conn, invoke.0, &sn, &satellite_ca, &store, f).await
+                    serve_upload(&mut conn, invoke.0, &sn, &satellite_cert, &store, f).await
                 }
                 PIECESTORE_DOWNLOAD => {
-                    serve_download(&mut conn, invoke.0, &satellite_ca, &store).await
+                    serve_download(&mut conn, invoke.0, &satellite_cert, &store).await
                 }
                 _ => Err(Error::protocol("unknown rpc")),
             };
@@ -509,7 +536,7 @@ mod tests {
         conn: &mut Conn<T>,
         stream_id: u64,
         sn: &Identity,
-        satellite_ca: &[u8],
+        satellite_cert: &[u8],
         store: &PieceStore,
         fault: UploadFault,
     ) -> Result<()> {
@@ -526,7 +553,7 @@ mod tests {
                 Kind::MESSAGE => {
                     let req = PieceUploadRequest::decode(pkt.data.as_slice())?;
                     if let Some(l) = req.limit {
-                        verify_order_limit(&l, satellite_ca)?;
+                        verify_order_limit(&l, satellite_cert)?;
                         algo = PieceHashAlgo::from_i32(req.hash_algorithm);
                         limit = Some(l);
                     }
@@ -618,7 +645,7 @@ mod tests {
     async fn serve_download<T: AsyncRead + AsyncWrite + Unpin>(
         conn: &mut Conn<T>,
         stream_id: u64,
-        satellite_ca: &[u8],
+        satellite_cert: &[u8],
         store: &PieceStore,
     ) -> Result<()> {
         let mut limit = None;
@@ -632,7 +659,7 @@ mod tests {
                 Kind::MESSAGE => {
                     let req = PieceDownloadRequest::decode(pkt.data.as_slice())?;
                     if let Some(l) = req.limit {
-                        verify_order_limit(&l, satellite_ca)?;
+                        verify_order_limit(&l, satellite_cert)?;
                         limit = Some(l);
                     }
                     if let Some(c) = req.chunk {
@@ -699,18 +726,18 @@ mod tests {
         let sn = Identity::generate().unwrap();
         let piece_key = PiecePrivateKey::generate();
         let piece_id = vec![0x11; 32];
-        let sat_ca = satellite.ca_der().as_ref().to_vec();
-        let sn_ca = sn.ca_der().as_ref().to_vec();
+        let sat_cert = satellite.leaf_der().as_ref().to_vec();
+        let sn_cert = sn.leaf_der().as_ref().to_vec();
         let store: PieceStore = Arc::new(Mutex::new(HashMap::new()));
         let (client_io, server_io) = tokio::io::duplex(256 * 1024);
         let server = tokio::spawn(serve_mock(
             Conn::new(server_io),
             sn,
-            sat_ca.clone(),
+            sat_cert.clone(),
             Arc::clone(&store),
         ));
 
-        let mut client = Client::new(Conn::new(client_io), sat_ca, sn_ca)
+        let mut client = Client::new(Conn::new(client_io), sat_cert, sn_cert)
             .with_hash_algo(algo)
             .with_config(Config {
                 upload_buffer_size: 32,
@@ -773,15 +800,15 @@ mod tests {
         let server = tokio::spawn(serve_mock(
             Conn::new(server_io),
             sn,
-            satellite.ca_der().as_ref().to_vec(),
+            satellite.leaf_der().as_ref().to_vec(),
             Arc::new(Mutex::new(HashMap::new())),
         ));
         // Client verifies against satellite CA; SN identity is a dummy CA.
         let dummy = Identity::generate().unwrap();
         let mut client = Client::new(
             Conn::new(client_io),
-            satellite.ca_der().as_ref().to_vec(),
-            dummy.ca_der().as_ref().to_vec(),
+            satellite.leaf_der().as_ref().to_vec(),
+            dummy.leaf_der().as_ref().to_vec(),
         );
         let mut limit = signed_limit(
             &satellite,
@@ -818,22 +845,26 @@ mod tests {
         let connector = TlsConnector::from(Arc::new(client_cfg));
         let name = rustls::pki_types::ServerName::try_from("us1.storj.io").unwrap();
 
-        let sat_ca = satellite.ca_der().as_ref().to_vec();
-        let sn_ca = sn.ca_der().as_ref().to_vec();
+        let sat_cert = satellite.leaf_der().as_ref().to_vec();
+        let sn_cert = sn.leaf_der().as_ref().to_vec();
         let server = tokio::spawn(async move {
             let tls = acceptor.accept(server_io).await.unwrap();
-            serve_mock(Conn::new(tls), sn, sat_ca, store).await;
+            serve_mock(Conn::new(tls), sn, sat_cert, store).await;
         });
 
         let tls = connector.connect(name, client_io).await.unwrap();
-        let mut client = Client::new(Conn::new(tls), satellite.ca_der().as_ref().to_vec(), sn_ca)
-            .with_hash_algo(PieceHashAlgo::Blake3)
-            .with_config(Config {
-                upload_buffer_size: 8,
-                initial_step: 16,
-                maximum_step: 32,
-                maximum_chunk_size: 8,
-            });
+        let mut client = Client::new(
+            Conn::new(tls),
+            satellite.leaf_der().as_ref().to_vec(),
+            sn_cert,
+        )
+        .with_hash_algo(PieceHashAlgo::Blake3)
+        .with_config(Config {
+            upload_buffer_size: 8,
+            initial_step: 16,
+            maximum_step: 32,
+            maximum_chunk_size: 8,
+        });
         let put = signed_limit(
             &satellite,
             &Identity::generate().unwrap(),
@@ -883,19 +914,19 @@ mod tests {
         let sn = Identity::generate().unwrap();
         let piece_key = PiecePrivateKey::generate();
         let piece_id = vec![0x44; 32];
-        let sat_ca = satellite.ca_der().as_ref().to_vec();
-        let sn_ca = sn.ca_der().as_ref().to_vec();
+        let sat_cert = satellite.leaf_der().as_ref().to_vec();
+        let sn_cert = sn.leaf_der().as_ref().to_vec();
         let store: PieceStore = Arc::new(Mutex::new(HashMap::new()));
         let faults = Arc::new(Mutex::new(fault));
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let server = tokio::spawn(serve_mock_with_fault(
             Conn::new(server_io),
             sn,
-            sat_ca.clone(),
+            sat_cert.clone(),
             Arc::clone(&store),
             Arc::clone(&faults),
         ));
-        let mut client = Client::new(Conn::new(client_io), sat_ca, sn_ca);
+        let mut client = Client::new(Conn::new(client_io), sat_cert, sn_cert);
         let dummy_sn = Identity::generate().unwrap();
         let put = signed_limit(
             &satellite,

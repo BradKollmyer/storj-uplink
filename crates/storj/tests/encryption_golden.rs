@@ -8,7 +8,7 @@ use storj::EncryptionKey;
 use storj::constants::{
     ARGON2_PARALLELISM_DERIVE, ARGON2_PARALLELISM_REQUEST, ENCRYPTION_BLOCK_SIZE,
 };
-use storj::encryption::{
+use storj_encryption::{
     CipherSuite, EncryptionParameters, Store, calc_encompassing_blocks, calc_encrypted_size,
     decrypt, decrypt_path, derive_path_key_component, derive_root_key, encrypt, encrypt_path,
     encrypt_prefix, increment_bytes, pad, unpad,
@@ -131,7 +131,7 @@ const GO_EXAMPLE_ENCRYPT_PATH_HEX: &str = "02387ce34e2054bcb9a0428b820102876eef8
 fn encrypt_path_matches_go_example() {
     let seed: [u8; 32] = std::array::from_fn(|i| u8::try_from(i).expect("i < 32"));
     let mut store = Store::new();
-    store.set_default_key(EncryptionKey::from_bytes(seed).inner().clone());
+    store.set_default_key(storj_encryption::Key::from_bytes(seed));
     store.set_default_path_cipher(CipherSuite::AES_GCM);
 
     let enc = encrypt_path("bucket", "fold1/fold2/fold3/file.txt", &store).unwrap();
@@ -144,7 +144,7 @@ fn encrypt_path_matches_go_example() {
 #[test]
 fn path_encrypt_decrypt_empty_unicode_prefixes() {
     let mut store = Store::new();
-    store.set_default_key(EncryptionKey::from_bytes([7u8; 32]).inner().clone());
+    store.set_default_key(storj_encryption::Key::from_bytes([7u8; 32]));
     store.set_default_path_cipher(CipherSuite::AES_GCM);
 
     for path in [
@@ -170,24 +170,26 @@ fn path_encrypt_decrypt_empty_unicode_prefixes() {
 /// Go `nacl/secretbox.Seal` + `crypto/aes` GCM, key `00..1f`, nonce zeros, pt `hello`.
 #[test]
 fn content_encrypt_matches_go_primitives() {
-    let key = EncryptionKey::from_bytes(std::array::from_fn(|i| u8::try_from(i).expect("i < 32")));
+    let key = storj_encryption::Key::from_bytes(std::array::from_fn(|i| {
+        u8::try_from(i).expect("i < 32")
+    }));
     let nonce = [0u8; 24];
-    let aes = encrypt(b"hello", CipherSuite::AES_GCM, key.inner(), &nonce).unwrap();
+    let aes = encrypt(b"hello", CipherSuite::AES_GCM, &key, &nonce).unwrap();
     assert_eq!(
         hex::encode(&aes),
         "66d9d9b2da0e0c4679f3a82524f5e0499271e16f30"
     );
-    let sb = encrypt(b"hello", CipherSuite::SECRET_BOX, key.inner(), &nonce).unwrap();
+    let sb = encrypt(b"hello", CipherSuite::SECRET_BOX, &key, &nonce).unwrap();
     assert_eq!(
         hex::encode(&sb),
         "9031d88e6447f0b8bf44357c58bf25f4226b9c2df7"
     );
     assert_eq!(
-        decrypt(&aes, CipherSuite::AES_GCM, key.inner(), &nonce).unwrap(),
+        decrypt(&aes, CipherSuite::AES_GCM, &key, &nonce).unwrap(),
         b"hello"
     );
     assert_eq!(
-        decrypt(&sb, CipherSuite::SECRET_BOX, key.inner(), &nonce).unwrap(),
+        decrypt(&sb, CipherSuite::SECRET_BOX, &key, &nonce).unwrap(),
         b"hello"
     );
 }

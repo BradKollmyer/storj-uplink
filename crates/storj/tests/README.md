@@ -15,6 +15,7 @@ env.
 | `grant_golden.rs` | Parse Go grants | yes |
 | `share_restrict.rs` | `share()` intersection | yes |
 | `ec_golden.rs` | infectious RS (Berlekamp-Welch still ignore) | yes |
+| `signing_golden.rs` | Go-signed order limits / piece hashes verify with the leaf cert, not the CA | yes |
 | `project_buckets.rs` | Bucket CRUD (mock) | yes |
 | `project_objects.rs` | List/stat/delete/copy/move/revoke (mock) | yes |
 | `upload_download.rs` | Pipeline including 64MiB+1 (mock) | yes |
@@ -39,4 +40,4 @@ cargo test -p storj --test encryption_golden --test grant_golden
 
 ## Interop matrix (v1.0 exit criterion)
 
-`{go,rust} writer × {go,rust} reader × {empty, 1B, inline-1, inline+1, 1seg, 64MiB+1}` plus ranged read, prefix list, and `Share` restriction. Defined in `storj-test::INTEROP_SIZES` / `INTEROP_SIDES`. PR CI `grant-roundtrip` runs grant parse/serialize/share on every PR (no satellite) and `--skip`s the object matrix. The object matrix, including `64MiB+1`, is opt-in (`STORJ_INTEROP=1` plus `STORJ_INTEROP_ACCESS` / `STORJ_SIM_ACCESS`).
+`{go,rust} writer × {go,rust} reader × {empty, 1B, inline-1, inline+1, 1seg, 64MiB+1}` (full upload/download round trips) plus grant parse/serialize/`Share` restriction. Ranged reads and prefix listing are covered against the mock satellite, not against Go. Defined in `storj-test::INTEROP_SIZES` / `INTEROP_SIDES`. PR CI `grant-roundtrip` runs grant parse/serialize/share on every PR (no satellite) and `--skip`s the object matrix. The object matrix, including `64MiB+1`, is opt-in (`STORJ_INTEROP=1` plus `STORJ_INTEROP_ACCESS` / `STORJ_SIM_ACCESS`); the nightly `interop` workflow runs it when the `STORJ_SIM_ACCESS` secret is configured.

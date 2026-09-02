@@ -98,14 +98,11 @@ fn build_tables() -> Tables {
 }
 
 /// `z[i] ^= y * x[i]` over GF(2^8). `x` must be at least as long as `z`.
+/// Vectorized on aarch64 (NEON) and x86_64 (SSSE3, runtime-detected); see
+/// [`crate::gf_simd`].
+#[inline]
 pub(crate) fn addmul(z: &mut [u8], x: &[u8], y: u8) {
-    if y == 0 {
-        return;
-    }
-    let mul_y = &gf().mul[y as usize];
-    for (zi, &xi) in z.iter_mut().zip(x.iter()) {
-        *zi ^= mul_y[xi as usize];
-    }
+    crate::gf_simd::addmul(z, x, y)
 }
 
 /// Inverted Vandermonde used to build the systematic encoding matrix.

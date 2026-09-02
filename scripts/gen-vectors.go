@@ -9,16 +9,21 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"storj.io/common/encryption"
 	"storj.io/common/grant"
+	"storj.io/common/identity"
 	"storj.io/common/macaroon"
 	"storj.io/common/paths"
+	"storj.io/common/pb"
+	"storj.io/common/signing"
 	"storj.io/common/storj"
 	"storj.io/infectious"
 )
@@ -122,6 +127,7 @@ func main() {
 	mustWrite(filepath.Join(root, "path_hmac.jsonl"), pathLines)
 
 	mustWrite(filepath.Join(root, "grant_go.txt"), encodeSyntheticGrant()+"\n")
+	writeSignedGoldens(root)
 	writeRSGoldens(root)
 
 	fmt.Println("KDF + path HMAC + infectious RS + synthetic grant goldens ready.")
@@ -176,4 +182,63 @@ func writeRSGoldens(root string) {
 	mustWrite(filepath.Join(root, "rs_shares.jsonl"), lines)
 	mustWrite(filepath.Join(root, "rs_stripe.bin"), string(prod))
 	fmt.Println("infectious RS goldens ready.")
+}
+
+// writeSignedGoldens emits an OrderLimit signed by a satellite identity, a
+// PieceHash signed by a storage-node identity, and an Order / PieceHash signed
+// by an uplink piece key, all produced by storj.io/common/signing, together
+// with the leaf and CA certificates. The Rust side must verify them with the
+// *leaf* certificate (Go SigneeFromPeerIdentity) and must reject the CA.
+//
+// Identities are random, so the file is generated once and kept; delete it to
+// regenerate.
+func writeSignedGoldens(root string) {
+	path := filepath.Join(root, "signed_go.jsonl")
+	if _, err := os.Stat(path); err == nil {
+		fmt.Println("keep", path, "(random identities; delete to regenerate)")
+		return
+	}
+	ctx := context.Background()
+	opts := identity.NewCAOptions{Difficulty: 0, Concurrency: 1}
+	sat := must(identity.NewFullIdentity(ctx, opts))
+	node := must(identity.NewFullIdentity(ctx, opts))
+	pub, priv, err := storj.NewPieceKey()
+	mustErr(err)
+
+	created := time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC)
+	var serial storj.SerialNumber
+	copy(serial[:], bytes.Repeat([]byte{0x11}, len(serial)))
+	var pieceID storj.PieceID
+	copy(pieceID[:], bytes.Repeat([]byte{0x22}, len(pieceID)))
+
+	limit := must(signing.SignOrderLimit(ctx, signing.SignerFromFullIdentity(sat), &pb.OrderLimit{
+		SerialNumber:    serial,
+		SatelliteId:     sat.ID,
+		UplinkPublicKey: pub,
+		StorageNodeId:   node.ID,
+		PieceId:         pieceID,
+		Limit:           4096,
+		Action:          pb.PieceAction_PUT,
+		PieceExpiration: created.Add(24 * time.Hour),
+		OrderExpiration: created.Add(time.Hour),
+		OrderCreation:   created,
+	}))
+	unsignedHash := &pb.PieceHash{
+		PieceId:       pieceID,
+		Hash:          bytes.Repeat([]byte{0x33}, 32),
+		PieceSize:     4096,
+		Timestamp:     created,
+		HashAlgorithm: pb.PieceHashAlgorithm_SHA256,
+	}
+	nodeHash := must(signing.SignPieceHash(ctx, signing.SignerFromFullIdentity(node), unsignedHash))
+	uplinkHash := must(signing.SignUplinkPieceHash(ctx, priv, unsignedHash))
+	order := must(signing.SignUplinkOrder(ctx, priv, &pb.Order{SerialNumber: serial, Amount: 4096}))
+
+	line := fmt.Sprintf(`{"satellite_leaf_der":"%x","satellite_ca_der":"%x","satellite_node_id":%q,`+
+		`"node_leaf_der":"%x","node_ca_der":"%x","node_node_id":%q,"piece_public_key":"%x",`+
+		`"order_limit":"%x","piece_hash_node":"%x","order_uplink":"%x","piece_hash_uplink":"%x"}`+"\n",
+		sat.Leaf.Raw, sat.CA.Raw, sat.ID.String(),
+		node.Leaf.Raw, node.CA.Raw, node.ID.String(), pub.Bytes(),
+		must(pb.Marshal(limit)), must(pb.Marshal(nodeHash)), must(pb.Marshal(order)), must(pb.Marshal(uplinkHash)))
+	mustWrite(path, line)
 }
