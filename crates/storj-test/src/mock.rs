@@ -1648,7 +1648,7 @@ fn signed_limit(
 
 fn check_key(header: &Option<RequestHeader>, state: &MockState) -> Result<(), (u64, String)> {
     let got = header.as_ref().map(|h| h.api_key.as_slice()).unwrap_or(&[]);
-    if state.revoked.iter().any(|k| k.as_slice() == got) {
+    if key_revoked(got, &state.revoked) {
         return Err((RPC_PERMISSION_DENIED, "permission denied".into()));
     }
     if same_macaroon_head(got, &state.api_key) {
@@ -1657,13 +1657,45 @@ fn check_key(header: &Option<RequestHeader>, state: &MockState) -> Result<(), (u
     Err((RPC_PERMISSION_DENIED, "permission denied".into()))
 }
 
+fn parse_api_key(raw: &[u8]) -> Option<storj_access::ApiKey> {
+    storj_access::ApiKey::parse_raw(raw).ok()
+}
+
 fn same_macaroon_head(left: &[u8], right: &[u8]) -> bool {
-    match (
-        storj_access::ApiKey::parse_raw(left),
-        storj_access::ApiKey::parse_raw(right),
-    ) {
-        (Ok(a), Ok(b)) => a.head() == b.head(),
+    match (parse_api_key(left), parse_api_key(right)) {
+        (Some(a), Some(b)) => a.head() == b.head(),
         _ => left == right,
+    }
+}
+
+/// `ancestor` is a caveat-chain prefix of `descendant` (same head, ancestor caveats first).
+fn caveat_prefix(ancestor: &storj_access::ApiKey, descendant: &storj_access::ApiKey) -> bool {
+    ancestor.head() == descendant.head()
+        && descendant
+            .macaroon()
+            .caveats()
+            .starts_with(ancestor.macaroon().caveats())
+}
+
+fn key_revoked(got: &[u8], revoked: &BTreeSet<Vec<u8>>) -> bool {
+    if revoked.iter().any(|k| k.as_slice() == got) {
+        return true;
+    }
+    let Some(presented) = parse_api_key(got) else {
+        return false;
+    };
+    revoked.iter().any(|k| {
+        parse_api_key(k).is_some_and(|revoked_key| caveat_prefix(&revoked_key, &presented))
+    })
+}
+
+/// Only an ancestor may revoke: header caveats must be a strict prefix of the target.
+fn can_revoke(header: &[u8], target: &[u8]) -> bool {
+    match (parse_api_key(header), parse_api_key(target)) {
+        (Some(h), Some(t)) => {
+            caveat_prefix(&h, &t) && h.macaroon().caveat_len() < t.macaroon().caveat_len()
+        }
+        _ => false,
     }
 }
 
@@ -1681,7 +1713,7 @@ fn revoke_api_key(
     if req.api_key == header_key {
         return Err((RPC_PERMISSION_DENIED, "API key cannot revoke itself".into()));
     }
-    if !same_macaroon_head(&req.api_key, header_key) {
+    if !can_revoke(header_key, &req.api_key) {
         return Err((RPC_PERMISSION_DENIED, "permission denied".into()));
     }
     st.revoked.insert(req.api_key);

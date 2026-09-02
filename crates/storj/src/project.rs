@@ -388,8 +388,11 @@ impl Project {
         match tokio::io::copy(&mut reader, &mut upload).await {
             Ok(_) => upload.commit().await,
             Err(e) => {
-                let _ = upload.abort().await;
-                Err(e.into())
+                let io_err = Error::from(e);
+                match upload.abort().await {
+                    Ok(()) => Err(io_err),
+                    Err(abort_err) => Err(io_err.with_source(abort_err)),
+                }
             }
         }
     }
@@ -976,51 +979,54 @@ impl Drop for AbortOnDrop {
 }
 
 async fn abort_pending(pending: PendingAbort) -> Result<()> {
-    abort_upload(UploadInner {
-        project: pending.project,
-        bucket: pending.bucket,
-        key: String::new(),
-        encrypted_object_key: pending.encrypted_object_key,
-        stream_id: pending.stream_id,
-        content_key: storj_encryption::Key::from_bytes([0u8; 32]),
-        cipher: storj_encryption::CipherSuite::AES_GCM,
-        block_size: 0,
-        custom: CustomMetadata::new(),
-        plaintext: Vec::new(),
-        next_segment: 0,
-        total_plain: 0,
-        last_segment_plain: 0,
-        pending_flush: None,
-    })
-    .await
+    delete_pending_upload(&pending).await
+}
+
+fn spawn_abort(pending: PendingAbort) {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(async move {
+            let _ = delete_pending_upload(&pending).await;
+        });
+    }
+}
+
+async fn delete_pending_upload(pending: &PendingAbort) -> Result<()> {
+    let _ = pending
+        .project
+        .metainfo
+        .begin_delete_object(
+            &pending.bucket,
+            pending.encrypted_object_key.clone(),
+            pending.stream_id.clone(),
+            storj_proto::metainfo::object::Status::Uploading as i32,
+        )
+        .await?;
+    pending
+        .project
+        .metainfo
+        .finish_delete_object(&pending.bucket, pending.stream_id.clone())
+        .await
 }
 
 pub(crate) async fn abort_upload(inner: UploadInner) -> Result<()> {
-    let UploadInner {
-        project,
-        bucket,
-        encrypted_object_key,
-        stream_id,
-        pending_flush,
-        ..
-    } = inner;
+    let pending = PendingAbort {
+        project: Arc::clone(&inner.project),
+        bucket: inner.bucket.clone(),
+        encrypted_object_key: inner.encrypted_object_key.clone(),
+        stream_id: inner.stream_id.clone(),
+    };
+    let UploadInner { pending_flush, .. } = inner;
     if let Some(handle) = pending_flush {
         handle.abort();
         let _ = handle.await;
     }
-    let _ = project
-        .metainfo
-        .begin_delete_object(
-            &bucket,
-            encrypted_object_key,
-            stream_id.clone(),
-            storj_proto::metainfo::object::Status::Uploading as i32,
-        )
-        .await?;
-    project
-        .metainfo
-        .finish_delete_object(&bucket, stream_id)
-        .await
+    match delete_pending_upload(&pending).await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            spawn_abort(pending);
+            Err(e)
+        }
+    }
 }
 
 #[cfg(test)]

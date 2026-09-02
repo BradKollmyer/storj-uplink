@@ -419,10 +419,17 @@ async fn revoke_access_child_parent_still_works() {
     let child_access = parent_access
         .share(Permission::full(), &[])
         .expect("share child");
+    let grandchild_access = child_access
+        .share(Permission::full(), &[])
+        .expect("share grandchild");
     let parent = Project::open(&parent_access).await.expect("open parent");
     let bucket = unique("rev");
     parent.ensure_bucket(&bucket).await.unwrap();
     upload(&parent, &bucket, "k", b"payload").await;
+
+    let child = Project::open(&child_access).await.expect("open child");
+    let deny = child.revoke_access(&parent_access).await.unwrap_err();
+    assert_eq!(deny.kind(), ErrorKind::PermissionDenied);
 
     parent
         .revoke_access(&child_access)
@@ -435,8 +442,13 @@ async fn revoke_access_child_parent_still_works() {
         .expect("parent still works");
     assert_eq!(st.key, "k");
 
-    let child = Project::open(&child_access).await.expect("open child");
     let err = child.stat_object(&bucket, "k").await.unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::PermissionDenied);
+
+    let grandchild = Project::open(&grandchild_access)
+        .await
+        .expect("open grandchild");
+    let err = grandchild.stat_object(&bucket, "k").await.unwrap_err();
     assert_eq!(err.kind(), ErrorKind::PermissionDenied);
 }
 
