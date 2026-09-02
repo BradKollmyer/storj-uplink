@@ -77,11 +77,15 @@ fn config_has_no_temp_dir() {
 }
 
 #[test]
-fn config_lives_in_config_module() {
-    // Design module layout: `config.rs` re-exports the type also available at crate root.
+fn config_is_one_type_on_all_paths() {
+    use std::any::TypeId;
     assert_eq!(
-        std::any::type_name::<storj::config::Config>(),
-        std::any::type_name::<Config>()
+        TypeId::of::<storj::Config>(),
+        TypeId::of::<storj::config::Config>()
+    );
+    assert_eq!(
+        TypeId::of::<storj::Config>(),
+        TypeId::of::<storj::types::Config>()
     );
 }
 

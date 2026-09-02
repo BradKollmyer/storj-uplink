@@ -59,6 +59,18 @@ async fn join_error_canceled_maps() {
     assert!(e.is_canceled());
 }
 
+#[tokio::test]
+async fn join_error_panic_resumes_unwind() {
+    let handle = tokio::spawn(async { panic!("worker boom") });
+    let join_err = handle.await.unwrap_err();
+    assert!(join_err.is_panic());
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| Error::from(join_err)));
+    assert!(
+        caught.is_err(),
+        "panicking worker must not become ErrorKind::Protocol"
+    );
+}
+
 #[test]
 fn system_metadata_content_length_is_i64() {
     let m = SystemMetadata {

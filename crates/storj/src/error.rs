@@ -125,7 +125,8 @@ impl From<tokio::task::JoinError> for Error {
         if e.is_cancelled() {
             Self::new(ErrorKind::Canceled, "task canceled").with_source(e)
         } else {
-            Self::new(ErrorKind::Protocol, e.to_string()).with_source(e)
+            // Panicking workers must not look like a retryable satellite RPC.
+            std::panic::resume_unwind(e.into_panic())
         }
     }
 }
