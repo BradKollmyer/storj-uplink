@@ -241,6 +241,11 @@ pub struct Config {
     /// Dial timeout. `None` or zero → 20s (Go default). Rust `Duration` cannot
     /// be negative; omit a timeout by using `Duration::MAX`.
     pub dial_timeout: Option<Duration>,
+    /// Deadline for each individual read/write on a satellite or storage-node
+    /// connection (Go `piecestore.Config.MessageTimeout`). `None` or zero →
+    /// 10 minutes. A slow-but-progressing transfer never trips it; a peer that
+    /// stops responding fails within this bound instead of hanging forever.
+    pub message_timeout: Option<Duration>,
 }
 
 impl Config {
@@ -250,6 +255,14 @@ impl Config {
             None | Some(Duration::ZERO) => {
                 Duration::from_secs(crate::constants::DEFAULT_DIAL_TIMEOUT_SECS)
             }
+            Some(d) => d,
+        }
+    }
+
+    /// Effective per-message timeout (`None`/zero → 10 minutes).
+    pub fn message_timeout_or_default(&self) -> Duration {
+        match self.message_timeout {
+            None | Some(Duration::ZERO) => storj_rpc::conn::DEFAULT_TIMEOUT,
             Some(d) => d,
         }
     }

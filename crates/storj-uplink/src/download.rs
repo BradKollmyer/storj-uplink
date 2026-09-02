@@ -291,6 +291,8 @@ pub struct LongTailDownload {
     pub size: i64,
     /// Dial timeout per storage node.
     pub dial_timeout: Duration,
+    /// Per-read/write deadline on storage-node connections.
+    pub message_timeout: Duration,
 }
 
 /// Extra pieces requested beyond `k` up front so one slow/failed node does
@@ -321,6 +323,7 @@ pub async fn download_pieces_long_tail(job: LongTailDownload) -> Result<Vec<(i32
         offset,
         size,
         dial_timeout,
+        message_timeout,
     } = job;
     let mut queue: std::collections::VecDeque<PieceAssignment> = assignments.into();
     let mut set = JoinSet::new();
@@ -337,7 +340,7 @@ pub async fn download_pieces_long_tail(job: LongTailDownload) -> Result<Vec<(i32
                 ident,
                 pool,
                 (offset, size),
-                dial_timeout,
+                (dial_timeout, message_timeout),
             )
             .await
         });
@@ -395,13 +398,13 @@ async fn download_one_piece(
     identity: Identity,
     pool: SnPool,
     range: (i64, i64),
-    dial_timeout: Duration,
+    (dial_timeout, message_timeout): (Duration, Duration),
 ) -> std::result::Result<(i32, Vec<u8>), (i32, Error)> {
     let (offset, size) = range;
     let node = asg.node_id;
     let pooled: Pooled<SnTransport> = pool
         .checkout(node, || async {
-            dial_sn(&identity, node, &asg.address, dial_timeout).await
+            dial_sn(&identity, node, &asg.address, dial_timeout, message_timeout).await
         })
         .await
         .map_err(|e| (asg.piece_num, e))?;

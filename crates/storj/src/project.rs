@@ -36,6 +36,7 @@ pub(crate) struct ProjectInner {
     pub(crate) pool: storj_uplink::upload::SnPool,
     pub(crate) satellite_cert: Vec<u8>,
     pub(crate) dial_timeout: std::time::Duration,
+    pub(crate) message_timeout: std::time::Duration,
 }
 
 /// Handle to a satellite project. `Clone` via `Arc`. `Send + Sync`.
@@ -59,6 +60,7 @@ impl Project {
         let identity = metainfo.identity().clone();
         let satellite_cert = metainfo.satellite_cert().await;
         let dial_timeout = config.dial_timeout_or_default();
+        let message_timeout = config.message_timeout_or_default();
         Ok(Self {
             inner: Arc::new(ProjectInner {
                 metainfo,
@@ -69,6 +71,7 @@ impl Project {
                 ),
                 satellite_cert,
                 dial_timeout,
+                message_timeout,
             }),
         })
     }
@@ -968,6 +971,7 @@ async fn decrypt_one_segment(
         offset: piece_off,
         size: piece_size,
         dial_timeout: project.dial_timeout,
+        message_timeout: project.message_timeout,
     })
     .await
     .map_err(map_uplink)?;
@@ -1211,6 +1215,7 @@ async fn commit_one_segment(job: SegmentCommit) -> Result<i64> {
             rs,
             cohort: begin.cohort_requirements.clone(),
             dial_timeout: project.dial_timeout,
+            message_timeout: project.message_timeout,
         },
         |seg_id, nums| {
             let bucket = bucket_c.clone();
@@ -1386,6 +1391,7 @@ mod tests {
                 ),
                 satellite_cert: Vec::new(),
                 dial_timeout: std::time::Duration::from_secs(1),
+                message_timeout: std::time::Duration::from_secs(1),
             }),
         }
     }

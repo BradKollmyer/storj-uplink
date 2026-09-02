@@ -107,6 +107,7 @@ pub(crate) struct MetainfoClient {
     user_agent: Vec<u8>,
     identity: Identity,
     dial_timeout: Duration,
+    message_timeout: Duration,
     satellite_cert: Mutex<Vec<u8>>,
     /// Idle connections. `std` mutex: never held across an await.
     idle: std::sync::Mutex<Vec<Conn<SatelliteStream>>>,
@@ -129,6 +130,7 @@ impl MetainfoClient {
                 .to_vec(),
             identity,
             dial_timeout: config.dial_timeout_or_default(),
+            message_timeout: config.message_timeout_or_default(),
             satellite_cert: Mutex::new(Vec::new()),
             idle: std::sync::Mutex::new(Vec::new()),
             slots: Arc::new(tokio::sync::Semaphore::new(MAX_SATELLITE_CONNS)),
@@ -156,6 +158,7 @@ impl MetainfoClient {
             user_agent: Vec::new(),
             identity: Identity::generate().expect("ephemeral identity"),
             dial_timeout: Duration::from_secs(1),
+            message_timeout: Duration::from_secs(1),
             satellite_cert: Mutex::new(Vec::new()),
             idle: std::sync::Mutex::new(Vec::new()),
             slots: Arc::new(tokio::sync::Semaphore::new(MAX_SATELLITE_CONNS)),
@@ -209,7 +212,7 @@ impl MetainfoClient {
             {
                 *self.satellite_cert.lock().await = leaf;
             }
-            Ok::<_, Error>(Conn::new(tls))
+            Ok::<_, Error>(Conn::new(tls).with_timeout(self.message_timeout))
         };
         tokio::time::timeout(self.dial_timeout, dial)
             .await

@@ -190,6 +190,7 @@ pub async fn dial_sn(
     node_id: NodeId,
     address: &str,
     timeout: Duration,
+    message_timeout: Duration,
 ) -> Result<SnTransport> {
     let dial = async {
         let mut tcp = TcpStream::connect(address).await?;
@@ -212,7 +213,7 @@ pub async fn dial_sn(
             .map(|c| c.as_ref().to_vec())
             .unwrap_or_default();
         Ok::<_, Error>(SnTransport {
-            conn: Some(Conn::new(tls)),
+            conn: Some(Conn::new(tls).with_timeout(message_timeout)),
             peer_cert,
         })
     };
@@ -259,6 +260,8 @@ pub struct LongTailUpload {
     pub cohort: Option<CohortRequirements>,
     /// Dial timeout per storage node.
     pub dial_timeout: Duration,
+    /// Per-read/write deadline on storage-node connections.
+    pub message_timeout: Duration,
 }
 
 /// Upload `pieces` with long-tail cancellation and limit retry.
@@ -382,8 +385,19 @@ async fn upload_round(
         let ident = job.identity.clone();
         let pool = job.pool.clone();
         let dial_timeout = job.dial_timeout;
+        let message_timeout = job.message_timeout;
         set.spawn(async move {
-            upload_one_piece(asg, key, pieces, idx, sat_cert, ident, pool, dial_timeout).await
+            upload_one_piece(
+                asg,
+                key,
+                pieces,
+                idx,
+                sat_cert,
+                ident,
+                pool,
+                (dial_timeout, message_timeout),
+            )
+            .await
         });
     }
 
@@ -435,12 +449,12 @@ async fn upload_one_piece(
     satellite_cert: Vec<u8>,
     identity: Identity,
     pool: SnPool,
-    dial_timeout: Duration,
+    (dial_timeout, message_timeout): (Duration, Duration),
 ) -> std::result::Result<PieceResult, (i32, Error)> {
     let node = asg.node_id;
     let pooled: Pooled<SnTransport> = pool
         .checkout(node, || async {
-            dial_sn(&identity, node, &asg.address, dial_timeout).await
+            dial_sn(&identity, node, &asg.address, dial_timeout, message_timeout).await
         })
         .await
         .map_err(|e| (asg.piece_num, e))?;
