@@ -1,12 +1,13 @@
 //! Grant parse/serialize goldens vs Go `uplink.ParseAccess` / `Serialize`.
 //!
-//! Fixtures are produced by `go run ./scripts/gen-vectors.go` and must not
-//! contain production secrets.
+//! `grant_go.txt` is a synthetic Scope from `go run ./scripts/gen-vectors.go`
+//! (deterministic test macaroon + keys). CI regenerates it and fails on drift.
+//! Must not contain production secrets.
 
 use storj::{Access, ErrorKind};
 
 fn load_grant(name: &str) -> String {
-    let path = storj_test::fixture(name);
+    let path = storj_test::require_fixture(name);
     std::fs::read_to_string(&path).unwrap_or_else(|e| {
         panic!("missing {name} ({e}). Run: go run ./scripts/gen-vectors.go (from repo root)")
     })
@@ -20,9 +21,14 @@ fn parse_go_serialized_grant() {
         access.satellite_address(),
         "12edKaxTestSatelliteId@127.0.0.1:7777"
     );
+    assert!(
+        access.satellite_address().contains("127.0.0.1"),
+        "fixture must be a local synthetic grant, not production"
+    );
     let round = access.serialize().expect("serialize");
     let reparsed = Access::parse(&round).expect("reparse own serialize");
     assert_eq!(reparsed.satellite_address(), access.satellite_address());
+    assert_eq!(round, serialized.trim());
 }
 
 #[test]

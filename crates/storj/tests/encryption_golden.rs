@@ -5,7 +5,7 @@
 use std::fs;
 
 use storj::EncryptionKey;
-use storj::constants::ARGON2_PARALLELISM_REQUEST;
+use storj::constants::{ARGON2_PARALLELISM_DERIVE, ARGON2_PARALLELISM_REQUEST};
 use storj::encryption::{
     CipherSuite, Store, decrypt_path, derive_path_key_component, derive_root_key, encrypt_path,
     encrypt_prefix,
@@ -58,6 +58,22 @@ fn parse_json_lines(path: &str) -> Vec<DeriveVector> {
 fn derive_root_key_matches_go() {
     let vectors = parse_json_lines("derive_root_key.jsonl");
     assert!(!vectors.is_empty(), "fixture has no vectors");
+    let p1 = vectors
+        .iter()
+        .filter(|v| v.parallelism == ARGON2_PARALLELISM_DERIVE)
+        .count();
+    let p8 = vectors
+        .iter()
+        .filter(|v| v.parallelism == ARGON2_PARALLELISM_REQUEST)
+        .count();
+    assert!(
+        p1 >= 1,
+        "fixture must include Argon2 p=1 (DeriveEncryptionKey) vectors"
+    );
+    assert!(
+        p8 >= 1,
+        "fixture must include Argon2 p=8 (request_with_passphrase) vectors"
+    );
     for v in vectors {
         let salt = hex::decode(&v.salt_hex).expect("salt hex");
         let got = derive_root_key(
