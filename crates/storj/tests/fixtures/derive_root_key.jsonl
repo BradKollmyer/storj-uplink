@@ -1,0 +1,4 @@
+{"passphrase":"correct horse battery staple","salt_hex":"30313233343536373839616263646566","path":"","parallelism":1,"key_hex":"b8cf6690304c95e6420e35c6a0c29f30e32505137f8795ea4f4f4d4f886847ec"}
+{"passphrase":"correct horse battery staple","salt_hex":"30313233343536373839616263646566","path":"logs","parallelism":1,"key_hex":"ed1156d29e20f0425fabfe2529cb90a613debc63461ab096926ad8c52a53c544"}
+{"passphrase":"correct horse battery staple","salt_hex":"30313233343536373839616263646566","path":"","parallelism":8,"key_hex":"ba6ae767afbf7face4342d1c310fbccf674fd28e3e1c30c964d222f3f8b5e4dd"}
+{"passphrase":"correct horse battery staple","salt_hex":"30313233343536373839616263646566","path":"logs","parallelism":8,"key_hex":"0f8c644daffc53799b454fc432333be7839693c76fa0bee00f3ec1cbf4265006"}

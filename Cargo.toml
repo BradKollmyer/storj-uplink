@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+version = "0.1.0"
+repository = "https://github.com/storj/storj-rust"
+
+[workspace.dependencies]
+storj = { path = "crates/storj" }
+storj-test = { path = "crates/storj-test" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "time"] }
+bytes = "1"
+thiserror = "2"
+zeroize = { version = "1", features = ["derive"] }
+argon2 = "0.5"
+hmac = "0.12"
+sha2 = "0.10"
+futures-core = "0.3"
+futures-util = "0.3"
+hex = "0.4"
+
+[workspace.lints.rust]
+missing_docs = "allow"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
