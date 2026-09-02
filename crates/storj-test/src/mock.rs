@@ -6,14 +6,27 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use prost::Message;
 use storj_proto::metainfo::{
-    Bucket as ProtoBucket, BucketListItem, CreateBucketRequest, CreateBucketResponse,
-    DeleteBucketRequest, DeleteBucketResponse, GetBucketRequest, GetBucketResponse,
-    ListBucketsRequest, ListBucketsResponse, ListDirection, ProjectInfoRequest,
-    ProjectInfoResponse, RequestHeader,
+    AddressedOrderLimit, BeginDeleteObjectRequest, BeginDeleteObjectResponse, BeginObjectRequest,
+    BeginObjectResponse, BeginSegmentRequest, BeginSegmentResponse, Bucket as ProtoBucket,
+    BucketListItem, CohortRequirements, CommitObjectRequest, CommitObjectResponse,
+    CommitSegmentRequest, CommitSegmentResponse, CompressedBatchRequest, CreateBucketRequest,
+    CreateBucketResponse, DeleteBucketRequest, DeleteBucketResponse, FinishDeleteObjectRequest,
+    FinishDeleteObjectResponse, GetBucketRequest, GetBucketResponse, ListBucketsRequest,
+    ListBucketsResponse, ListDirection, MakeInlineSegmentRequest, MakeInlineSegmentResponse,
+    Object as ProtoObject, ProjectInfoRequest, ProjectInfoResponse, RequestHeader,
+    RetryBeginSegmentPiecesRequest, RetryBeginSegmentPiecesResponse, batch_request_item,
+    batch_response_item, cohort_requirements,
 };
+use storj_proto::node::NodeAddress;
+use storj_proto::orders::{OrderLimit, PieceAction};
+use storj_proto::pointerdb::RedundancyScheme;
 use storj_proto::rpc;
+use storj_proto::{decode_batch_request, encode_batch_response};
 use storj_rpc::tls::server_config;
 use storj_rpc::{Conn, Identity, Kind, Packet, marshal_error, read_tls_mux_prefix};
+use storj_uplink::orders::{PiecePrivateKey, sign_order_limit};
+
+use crate::mock_sn::MockStorageNode;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
@@ -33,20 +46,35 @@ struct BucketRec {
     objects: usize,
 }
 
+struct PendingObject {
+    bucket: String,
+    enc_key: Vec<u8>,
+    stream_id: Vec<u8>,
+}
+
 struct MockState {
     api_key: Vec<u8>,
     project_salt: Vec<u8>,
     buckets: BTreeMap<String, BucketRec>,
     get_bucket_denied: BTreeSet<String>,
+    pending: BTreeMap<Vec<u8>, PendingObject>,
+    committed: BTreeMap<(String, Vec<u8>), ProtoObject>,
+    aborted: BTreeSet<Vec<u8>>,
+    inline_segments: usize,
+    remote_segments: usize,
+    retry_begin: usize,
+    next_id: u64,
+    piece_key: Vec<u8>,
 }
 
-/// Loopback TLS satellite that speaks `ProjectInfo` and bucket RPCs.
+/// Loopback TLS satellite that speaks `ProjectInfo`, buckets, and upload RPCs.
 pub struct MockSatellite {
     node_url: String,
     api_key: String,
     api_key_raw: Vec<u8>,
     project_salt: Vec<u8>,
     state: Arc<Mutex<MockState>>,
+    sns: Vec<Arc<MockStorageNode>>,
     join: JoinHandle<()>,
 }
 
@@ -64,17 +92,34 @@ impl MockSatellite {
         let api_key = api.serialize();
         let api_key_raw = api.serialize_raw();
         let project_salt = PROJECT_SALT.to_vec();
+        let sat_ca = identity.ca_der().as_ref().to_vec();
+        let piece_key = PiecePrivateKey::generate().to_bytes().to_vec();
+
+        let mut sns = Vec::new();
+        for _ in 0..6 {
+            sns.push(Arc::new(MockStorageNode::start(sat_ca.clone()).await));
+        }
 
         let state = Arc::new(Mutex::new(MockState {
             api_key: api_key_raw.clone(),
             project_salt: project_salt.clone(),
             buckets: BTreeMap::new(),
             get_bucket_denied: BTreeSet::new(),
+            pending: BTreeMap::new(),
+            committed: BTreeMap::new(),
+            aborted: BTreeSet::new(),
+            inline_segments: 0,
+            remote_segments: 0,
+            retry_begin: 0,
+            next_id: 1,
+            piece_key,
         }));
 
         let server_cfg = server_config(&identity).expect("mock server tls");
         let acceptor = TlsAcceptor::from(Arc::new(server_cfg));
         let join_state = Arc::clone(&state);
+        let join_sns = sns.clone();
+        let join_ident = identity.clone();
         let join = tokio::spawn(async move {
             loop {
                 let (tcp, _) = match listener.accept().await {
@@ -83,8 +128,10 @@ impl MockSatellite {
                 };
                 let acceptor = acceptor.clone();
                 let state = Arc::clone(&join_state);
+                let sns = join_sns.clone();
+                let ident = join_ident.clone();
                 tokio::spawn(async move {
-                    let _ = serve_conn(tcp, acceptor, state).await;
+                    let _ = serve_conn(tcp, acceptor, state, sns, ident).await;
                 });
             }
         });
@@ -95,6 +142,7 @@ impl MockSatellite {
             api_key_raw,
             project_salt,
             state,
+            sns,
             join,
         }
     }
@@ -139,6 +187,43 @@ impl MockSatellite {
             .insert(bucket.to_owned());
     }
 
+    /// Storage nodes started with this satellite (long-tail / piece upload).
+    pub fn storage_nodes(&self) -> &[Arc<MockStorageNode>] {
+        &self.sns
+    }
+
+    /// Delay Upload on storage node `idx` (long-tail tests).
+    pub async fn set_sn_delay(&self, idx: usize, d: std::time::Duration) {
+        if let Some(sn) = self.sns.get(idx) {
+            sn.set_delay(d).await;
+        }
+    }
+
+    /// Number of MakeInlineSegment calls.
+    pub fn inline_segment_count(&self) -> usize {
+        self.state.lock().expect("mock state").inline_segments
+    }
+
+    /// Number of BeginSegment (remote) calls.
+    pub fn remote_segment_count(&self) -> usize {
+        self.state.lock().expect("mock state").remote_segments
+    }
+
+    /// Number of RetryBeginSegmentPieces calls.
+    pub fn retry_begin_count(&self) -> usize {
+        self.state.lock().expect("mock state").retry_begin
+    }
+
+    /// Committed objects (encrypted key).
+    pub fn committed_count(&self) -> usize {
+        self.state.lock().expect("mock state").committed.len()
+    }
+
+    /// Aborted stream ids.
+    pub fn aborted_count(&self) -> usize {
+        self.state.lock().expect("mock state").aborted.len()
+    }
+
     /// Mark `bucket` as containing an object (for `BucketNotEmpty` tests).
     pub fn put_object(&self, bucket: &str) {
         let mut state = self.state.lock().expect("mock state");
@@ -163,12 +248,14 @@ async fn serve_conn(
     mut tcp: TcpStream,
     acceptor: TlsAcceptor,
     state: Arc<Mutex<MockState>>,
+    sns: Vec<Arc<MockStorageNode>>,
+    identity: Identity,
 ) -> Result<(), storj_rpc::Error> {
     read_tls_mux_prefix(&mut tcp).await?;
     let tls = acceptor.accept(tcp).await.map_err(storj_rpc::Error::Io)?;
     let mut conn = Conn::new(tls);
     loop {
-        match serve_one(&mut conn, &state).await {
+        match serve_one(&mut conn, &state, &sns, &identity).await {
             Ok(()) => {}
             Err(storj_rpc::Error::Closed | storj_rpc::Error::Truncated) => return Ok(()),
             Err(e) => return Err(e),
@@ -179,6 +266,8 @@ async fn serve_conn(
 async fn serve_one(
     conn: &mut Conn<tokio_rustls::server::TlsStream<TcpStream>>,
     state: &Mutex<MockState>,
+    sns: &[Arc<MockStorageNode>],
+    identity: &Identity,
 ) -> Result<(), storj_rpc::Error> {
     let invoke = loop {
         let pkt = conn.read_packet().await?;
@@ -202,7 +291,7 @@ async fn serve_one(
         }
     }
 
-    match handle_rpc(&rpc, &request, state) {
+    match handle_rpc(&rpc, &request, state, sns, identity) {
         Ok(body) => {
             conn.write_packet(&Packet {
                 stream_id,
@@ -227,7 +316,13 @@ async fn serve_one(
     Ok(())
 }
 
-fn handle_rpc(rpc: &str, body: &[u8], state: &Mutex<MockState>) -> Result<Vec<u8>, (u64, String)> {
+fn handle_rpc(
+    rpc: &str,
+    body: &[u8],
+    state: &Mutex<MockState>,
+    sns: &[Arc<MockStorageNode>],
+    identity: &Identity,
+) -> Result<Vec<u8>, (u64, String)> {
     match rpc {
         rpc::PROJECT_INFO => {
             let req = ProjectInfoRequest::decode(body).map_err(decode_err)?;
@@ -335,8 +430,334 @@ fn handle_rpc(rpc: &str, body: &[u8], state: &Mutex<MockState>) -> Result<Vec<u8
                 .collect();
             Ok(ListBucketsResponse { items, more }.encode_to_vec())
         }
+        rpc::COMPRESSED_BATCH => {
+            let req = CompressedBatchRequest::decode(body).map_err(decode_err)?;
+            let batch = decode_batch_request(&req)
+                .map_err(|e| (RPC_INVALID_ARGUMENT, format!("compressed batch: {e}")))?;
+            {
+                let st = state.lock().expect("mock state");
+                check_key(&batch.header, &st)?;
+            }
+            let mut responses = Vec::new();
+            for item in batch.requests {
+                let resp = handle_batch_item(item.request, state, sns, identity)?;
+                responses.push(resp);
+            }
+            let inner = storj_proto::metainfo::BatchResponse { responses };
+            let wrapped = encode_batch_response(&inner, false)
+                .map_err(|e| (RPC_INVALID_ARGUMENT, format!("encode batch: {e}")))?;
+            Ok(wrapped.encode_to_vec())
+        }
         _ => Err((RPC_UNIMPLEMENTED, format!("unknown rpc {rpc}"))),
     }
+}
+
+fn handle_batch_item(
+    item: Option<batch_request_item::Request>,
+    state: &Mutex<MockState>,
+    sns: &[Arc<MockStorageNode>],
+    identity: &Identity,
+) -> Result<storj_proto::metainfo::BatchResponseItem, (u64, String)> {
+    use batch_request_item::Request;
+    let response = match item {
+        Some(Request::ObjectBegin(req)) => {
+            batch_response_item::Response::ObjectBegin(begin_object(req, state)?)
+        }
+        Some(Request::ObjectCommit(req)) => {
+            batch_response_item::Response::ObjectCommit(commit_object(req, state)?)
+        }
+        Some(Request::ObjectBeginDelete(req)) => {
+            batch_response_item::Response::ObjectBeginDelete(begin_delete(req, state)?)
+        }
+        Some(Request::ObjectFinishDelete(req)) => {
+            batch_response_item::Response::ObjectFinishDelete(finish_delete(req, state)?)
+        }
+        Some(Request::SegmentBegin(req)) => {
+            batch_response_item::Response::SegmentBegin(begin_segment(req, state, sns, identity)?)
+        }
+        Some(Request::SegmentCommit(req)) => {
+            batch_response_item::Response::SegmentCommit(commit_segment(req, state)?)
+        }
+        Some(Request::SegmentMakeInline(req)) => {
+            batch_response_item::Response::SegmentMakeInline(make_inline(req, state)?)
+        }
+        Some(Request::SegmentBeginRetryPieces(req)) => {
+            batch_response_item::Response::SegmentBeginRetryPieces(retry_pieces(
+                req, state, sns, identity,
+            )?)
+        }
+        Some(Request::BucketCreate(req)) => {
+            let body = handle_rpc(
+                rpc::CREATE_BUCKET,
+                &req.encode_to_vec(),
+                state,
+                sns,
+                identity,
+            )?;
+            batch_response_item::Response::BucketCreate(
+                CreateBucketResponse::decode(body.as_slice()).map_err(decode_err)?,
+            )
+        }
+        Some(Request::BucketGet(req)) => {
+            let body = handle_rpc(rpc::GET_BUCKET, &req.encode_to_vec(), state, sns, identity)?;
+            batch_response_item::Response::BucketGet(
+                GetBucketResponse::decode(body.as_slice()).map_err(decode_err)?,
+            )
+        }
+        None => return Err((RPC_INVALID_ARGUMENT, "empty batch item".into())),
+        _ => return Err((RPC_UNIMPLEMENTED, "unimplemented batch item".into())),
+    };
+    Ok(storj_proto::metainfo::BatchResponseItem {
+        response: Some(response),
+    })
+}
+
+fn begin_object(
+    req: BeginObjectRequest,
+    state: &Mutex<MockState>,
+) -> Result<BeginObjectResponse, (u64, String)> {
+    let mut st = state.lock().expect("mock state");
+    check_key(&req.header, &st)?;
+    let name = utf8_name(&req.bucket)?;
+    if !st.buckets.contains_key(&name) {
+        return Err((RPC_NOT_FOUND, format!("bucket not found: {name}")));
+    }
+    st.next_id += 1;
+    let stream_id = st.next_id.to_be_bytes().to_vec();
+    st.pending.insert(
+        stream_id.clone(),
+        PendingObject {
+            bucket: name,
+            enc_key: req.encrypted_object_key.clone(),
+            stream_id: stream_id.clone(),
+        },
+    );
+    Ok(BeginObjectResponse {
+        bucket: req.bucket,
+        encrypted_object_key: req.encrypted_object_key,
+        stream_id,
+        encryption_parameters: req.encryption_parameters.or(Some(
+            storj_proto::encryption::EncryptionParameters {
+                cipher_suite: storj_proto::encryption::CipherSuite::EncAesgcm as i32,
+                block_size: 7424,
+            },
+        )),
+        ..Default::default()
+    })
+}
+
+fn commit_object(
+    req: CommitObjectRequest,
+    state: &Mutex<MockState>,
+) -> Result<CommitObjectResponse, (u64, String)> {
+    let mut st = state.lock().expect("mock state");
+    check_key(&req.header, &st)?;
+    let pending = st
+        .pending
+        .remove(&req.stream_id)
+        .ok_or_else(|| (RPC_NOT_FOUND, "object not found".into()))?;
+    let obj = ProtoObject {
+        bucket: pending.bucket.as_bytes().to_vec(),
+        encrypted_object_key: pending.enc_key.clone(),
+        stream_id: pending.stream_id.clone(),
+        status: storj_proto::metainfo::object::Status::CommittedUnversioned as i32,
+        created_at: Some(timestamp(SystemTime::now())),
+        encrypted_metadata: req.encrypted_metadata,
+        encrypted_metadata_nonce: req.encrypted_metadata_nonce,
+        encrypted_metadata_encrypted_key: req.encrypted_metadata_encrypted_key,
+        ..Default::default()
+    };
+    if let Some(rec) = st.buckets.get_mut(&pending.bucket) {
+        rec.objects += 1;
+    }
+    st.committed
+        .insert((pending.bucket, pending.enc_key), obj.clone());
+    Ok(CommitObjectResponse { object: Some(obj) })
+}
+
+fn begin_delete(
+    req: BeginDeleteObjectRequest,
+    state: &Mutex<MockState>,
+) -> Result<BeginDeleteObjectResponse, (u64, String)> {
+    let mut st = state.lock().expect("mock state");
+    check_key(&req.header, &st)?;
+    st.pending.remove(&req.stream_id);
+    st.aborted.insert(req.stream_id.clone());
+    Ok(BeginDeleteObjectResponse {
+        stream_id: req.stream_id,
+        object: None,
+    })
+}
+
+fn finish_delete(
+    req: FinishDeleteObjectRequest,
+    state: &Mutex<MockState>,
+) -> Result<FinishDeleteObjectResponse, (u64, String)> {
+    let st = state.lock().expect("mock state");
+    check_key(&req.header, &st)?;
+    Ok(FinishDeleteObjectResponse {})
+}
+
+fn begin_segment(
+    req: BeginSegmentRequest,
+    state: &Mutex<MockState>,
+    sns: &[Arc<MockStorageNode>],
+    identity: &Identity,
+) -> Result<BeginSegmentResponse, (u64, String)> {
+    let mut st = state.lock().expect("mock state");
+    check_key(&req.header, &st)?;
+    if !st.pending.contains_key(&req.stream_id) {
+        return Err((RPC_NOT_FOUND, "object not found".into()));
+    }
+    st.remote_segments += 1;
+    st.next_id += 1;
+    let segment_id = st.next_id.to_be_bytes().to_vec();
+    let piece_key = st.piece_key.clone();
+    drop(st);
+    let pk = PiecePrivateKey::from_bytes(&piece_key)
+        .map_err(|e| (RPC_INVALID_ARGUMENT, e.to_string()))?;
+    let n = sns.len().min(4);
+    let mut addressed_limits = Vec::new();
+    for (i, sn) in sns.iter().take(n).enumerate() {
+        addressed_limits.push(signed_limit(
+            identity,
+            sn,
+            &pk,
+            i as i32,
+            &segment_id,
+            req.max_order_limit.max(64 * 1024),
+        )?);
+    }
+    Ok(BeginSegmentResponse {
+        segment_id,
+        addressed_limits,
+        private_key: piece_key,
+        redundancy_scheme: Some(test_scheme()),
+        cohort_requirements: Some(CohortRequirements {
+            requirement: Some(cohort_requirements::Requirement::Literal(
+                cohort_requirements::Literal { value: 3 },
+            )),
+        }),
+    })
+}
+
+fn retry_pieces(
+    req: RetryBeginSegmentPiecesRequest,
+    state: &Mutex<MockState>,
+    sns: &[Arc<MockStorageNode>],
+    identity: &Identity,
+) -> Result<RetryBeginSegmentPiecesResponse, (u64, String)> {
+    let mut st = state.lock().expect("mock state");
+    check_key(&req.header, &st)?;
+    st.retry_begin += 1;
+    let piece_key = st.piece_key.clone();
+    drop(st);
+    let pk = PiecePrivateKey::from_bytes(&piece_key)
+        .map_err(|e| (RPC_INVALID_ARGUMENT, e.to_string()))?;
+    let mut addressed_limits = Vec::new();
+    for (i, num) in req.retry_piece_numbers.iter().enumerate() {
+        let sn = sns
+            .get((4 + i) % sns.len())
+            .or_else(|| sns.first())
+            .ok_or_else(|| (RPC_INVALID_ARGUMENT, "no storage nodes".into()))?;
+        addressed_limits.push(signed_limit(
+            identity,
+            sn,
+            &pk,
+            *num,
+            &req.segment_id,
+            64 * 1024,
+        )?);
+    }
+    Ok(RetryBeginSegmentPiecesResponse {
+        segment_id: req.segment_id,
+        addressed_limits,
+    })
+}
+
+fn commit_segment(
+    req: CommitSegmentRequest,
+    state: &Mutex<MockState>,
+) -> Result<CommitSegmentResponse, (u64, String)> {
+    let st = state.lock().expect("mock state");
+    check_key(&req.header, &st)?;
+    Ok(CommitSegmentResponse {
+        successful_pieces: req.upload_result.len() as i32,
+    })
+}
+
+fn make_inline(
+    req: MakeInlineSegmentRequest,
+    state: &Mutex<MockState>,
+) -> Result<MakeInlineSegmentResponse, (u64, String)> {
+    let mut st = state.lock().expect("mock state");
+    check_key(&req.header, &st)?;
+    if req.encrypted_inline_data.len() > 4 * 1024 + 16 {
+        return Err((
+            RPC_INVALID_ARGUMENT,
+            "inline segment size cannot be larger than 4.0 KB".into(),
+        ));
+    }
+    st.inline_segments += 1;
+    Ok(MakeInlineSegmentResponse {})
+}
+
+fn test_scheme() -> RedundancyScheme {
+    RedundancyScheme {
+        r#type: 1,
+        min_req: 2,
+        total: 4,
+        repair_threshold: 3,
+        success_threshold: 3,
+        erasure_share_size: 32,
+    }
+}
+
+fn signed_limit(
+    satellite: &Identity,
+    sn: &MockStorageNode,
+    piece_key: &PiecePrivateKey,
+    piece_num: i32,
+    segment_id: &[u8],
+    limit: i64,
+) -> Result<AddressedOrderLimit, (u64, String)> {
+    let now = timestamp(SystemTime::now());
+    let mut piece_id = [0u8; 32];
+    piece_id[0] = piece_num as u8;
+    if segment_id.len() >= 8 {
+        piece_id[1..9].copy_from_slice(&segment_id[..8.min(segment_id.len())]);
+    }
+    let mut ol = OrderLimit {
+        serial_number: {
+            let mut s = vec![piece_num as u8];
+            s.extend_from_slice(segment_id);
+            s.resize(16, 0);
+            s
+        },
+        satellite_id: satellite.node_id().as_bytes().to_vec(),
+        deprecated_uplink_id: Vec::new(),
+        uplink_public_key: piece_key.public().to_bytes().to_vec(),
+        storage_node_id: sn.identity().node_id().as_bytes().to_vec(),
+        piece_id: piece_id.to_vec(),
+        limit: limit.max(1),
+        action: PieceAction::Put as i32,
+        piece_expiration: Some(now),
+        order_expiration: Some(now),
+        order_creation: Some(now),
+        encrypted_metadata_key_id: Vec::new(),
+        encrypted_metadata: Vec::new(),
+        satellite_signature: Vec::new(),
+        deprecated_satellite_address: None,
+    };
+    sign_order_limit(&mut ol, satellite).map_err(|e| (RPC_INVALID_ARGUMENT, e.to_string()))?;
+    Ok(AddressedOrderLimit {
+        limit: Some(ol),
+        storage_node_address: Some(NodeAddress {
+            address: sn.address().to_string(),
+            ..Default::default()
+        }),
+        tags: Default::default(),
+    })
 }
 
 fn check_key(header: &Option<RequestHeader>, state: &MockState) -> Result<(), (u64, String)> {

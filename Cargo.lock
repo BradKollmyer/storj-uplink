@@ -1259,6 +1259,7 @@ dependencies = [
  "hmac",
  "prost",
  "prost-types",
+ "rand",
  "rustls",
  "sha2",
  "storj-access",
@@ -1267,6 +1268,7 @@ dependencies = [
  "storj-proto",
  "storj-rpc",
  "storj-test",
+ "storj-uplink",
  "tokio",
  "tokio-rustls",
 ]
@@ -1343,6 +1345,7 @@ dependencies = [
  "storj-access",
  "storj-proto",
  "storj-rpc",
+ "storj-uplink",
  "tokio",
  "tokio-rustls",
 ]
@@ -1358,6 +1361,8 @@ dependencies = [
  "rand",
  "rustls",
  "sha2",
+ "storj-ec",
+ "storj-encryption",
  "storj-proto",
  "storj-rpc",
  "thiserror 2.0.20",

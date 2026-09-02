@@ -9,9 +9,13 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+storj-ec.workspace = true
+storj-encryption.workspace = true
 storj-proto.workspace = true
 storj-rpc.workspace = true
 tokio.workspace = true
+tokio-rustls.workspace = true
+rustls.workspace = true
 thiserror.workspace = true
 prost.workspace = true
 prost-types.workspace = true

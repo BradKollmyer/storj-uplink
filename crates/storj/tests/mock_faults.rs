@@ -71,10 +71,33 @@ async fn open_rejects_wrong_node_id_pin() {
     );
 }
 
-#[test]
-#[ignore = "PR 13: long-tail cancels slow pieces after o successes"]
-fn long_tail_cancels_slow_pieces() {
-    panic!("inject delayed piecestore Upload");
+#[tokio::test]
+async fn long_tail_cancels_slow_pieces() {
+    use tokio::io::AsyncWriteExt;
+    let mock = storj_test::MockSatellite::start().await;
+    mock.set_sn_delay(3, std::time::Duration::from_secs(30))
+        .await;
+    let access = mock.access();
+    let project = storj::Project::open(&access).await.expect("open");
+    let name = format!(
+        "lt-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    project.ensure_bucket(&name).await.unwrap();
+    let mut upload = project
+        .upload_object(&name, "slow", Default::default())
+        .await
+        .unwrap();
+    upload.write_all(&vec![7u8; 5000]).await.unwrap();
+    let obj = tokio::time::timeout(std::time::Duration::from_secs(15), upload.commit())
+        .await
+        .expect("long-tail should not wait for the delayed node")
+        .expect("commit");
+    assert_eq!(obj.system.content_length, 5000);
+    assert!(mock.remote_segment_count() >= 1);
 }
 
 #[test]

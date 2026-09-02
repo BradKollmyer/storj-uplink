@@ -20,6 +20,8 @@ storj-access.workspace = true
 storj-encryption.workspace = true
 storj-proto.workspace = true
 storj-rpc.workspace = true
+storj-uplink.workspace = true
+rand.workspace = true
 
 [dev-dependencies]
 hex.workspace = true

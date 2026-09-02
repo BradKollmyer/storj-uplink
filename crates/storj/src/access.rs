@@ -167,6 +167,10 @@ impl Access {
         self.inner.api_key()
     }
 
+    pub(crate) fn grant(&self) -> &storj_access::Grant {
+        &self.inner
+    }
+
     #[cfg(test)]
     pub(crate) fn placeholder(satellite_address: impl Into<String>) -> Self {
         Self {

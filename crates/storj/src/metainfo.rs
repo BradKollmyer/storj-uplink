@@ -12,8 +12,12 @@ use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
 
 use storj_proto::metainfo::{
-    self, CreateBucketRequest, DeleteBucketRequest, GetBucketRequest, ListBucketsRequest,
-    ProjectInfoRequest, ProjectInfoResponse, RequestHeader,
+    self, BatchRequest, BatchRequestItem, BeginDeleteObjectRequest, BeginObjectRequest,
+    BeginSegmentRequest, CommitObjectRequest, CommitSegmentRequest, CompressedBatchResponse,
+    CreateBucketRequest, DeleteBucketRequest, FinishDeleteObjectRequest, GetBucketRequest,
+    ListBucketsRequest, MakeInlineSegmentRequest, ProjectInfoRequest, ProjectInfoResponse,
+    RequestHeader, RetryBeginSegmentPiecesRequest, SegmentPosition, batch_request_item,
+    batch_response_item,
 };
 use storj_proto::rpc;
 use storj_rpc::tls::client_config;
@@ -21,7 +25,9 @@ use storj_rpc::{Conn, Identity, NodeUrl, parse_node_url, write_tls_mux_prefix};
 
 use crate::bucket::{bucket_from_list_item, bucket_from_proto, proto_timestamp};
 use crate::error::{Error, ErrorKind, Result};
-use crate::types::{Bucket, Config};
+use crate::types::{Bucket, Config, CustomMetadata, Object, SystemMetadata};
+
+use storj_proto::{decode_batch_response, encode_batch_request};
 
 /// gRPC / `rpcstatus` codes as encoded in DRPC `Kind::ERROR` payloads.
 pub(crate) const RPC_CANCELED: u64 = 1;
@@ -45,6 +51,7 @@ pub(crate) struct MetainfoClient {
     user_agent: Vec<u8>,
     identity: Identity,
     dial_timeout: Duration,
+    satellite_ca: Mutex<Vec<u8>>,
     conn: Mutex<Option<Conn<SatelliteStream>>>,
 }
 
@@ -63,6 +70,7 @@ impl MetainfoClient {
                 .to_vec(),
             identity,
             dial_timeout: config.dial_timeout_or_default(),
+            satellite_ca: Mutex::new(Vec::new()),
             conn: Mutex::new(None),
         };
         client.ensure_connected().await?;
@@ -84,8 +92,17 @@ impl MetainfoClient {
             user_agent: Vec::new(),
             identity: Identity::generate().expect("ephemeral identity"),
             dial_timeout: Duration::from_secs(1),
+            satellite_ca: Mutex::new(Vec::new()),
             conn: Mutex::new(None),
         }
+    }
+
+    pub(crate) fn identity(&self) -> &Identity {
+        &self.identity
+    }
+
+    pub(crate) async fn satellite_ca(&self) -> Vec<u8> {
+        self.satellite_ca.lock().await.clone()
     }
 
     fn header(&self) -> RequestHeader {
@@ -110,6 +127,15 @@ impl MetainfoClient {
             let connector = TlsConnector::from(Arc::new(tls_cfg));
             let server_name = server_name_from_address(&self.node.address)?;
             let tls = connector.connect(server_name, tcp).await?;
+            if let Some(ca) = tls
+                .get_ref()
+                .1
+                .peer_certificates()
+                .and_then(|c| c.last())
+                .map(|c| c.as_ref().to_vec())
+            {
+                *self.satellite_ca.lock().await = ca;
+            }
             Ok::<_, Error>(Conn::new(tls))
         };
         tokio::time::timeout(self.dial_timeout, dial)
@@ -247,6 +273,318 @@ impl MetainfoClient {
             .collect::<Result<Vec<_>>>()?;
         Ok((items, resp.more))
     }
+
+    async fn compressed_batch(
+        &self,
+        requests: Vec<BatchRequestItem>,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Vec<batch_response_item::Response>> {
+        let batch = BatchRequest {
+            header: Some(self.header()),
+            requests,
+        };
+        let wrapped = encode_batch_request(&batch);
+        let body = self
+            .invoke(rpc::COMPRESSED_BATCH, &wrapped.encode_to_vec(), bucket, key)
+            .await?;
+        let resp = CompressedBatchResponse::decode(body.as_slice()).map_err(map_decode)?;
+        let decoded = decode_batch_response(&resp)
+            .map_err(|e| Error::new(ErrorKind::Protocol, format!("CompressedBatch: {e}")))?;
+        decoded
+            .responses
+            .into_iter()
+            .map(|item| {
+                item.response.ok_or_else(|| {
+                    Error::new(ErrorKind::Protocol, "empty CompressedBatch response item")
+                })
+            })
+            .collect()
+    }
+
+    fn expect_one(
+        mut items: Vec<batch_response_item::Response>,
+        what: &str,
+    ) -> Result<batch_response_item::Response> {
+        if items.len() != 1 {
+            return Err(Error::new(
+                ErrorKind::Protocol,
+                format!("{what}: expected 1 batch response, got {}", items.len()),
+            ));
+        }
+        Ok(items.remove(0))
+    }
+
+    pub(crate) async fn begin_object(
+        &self,
+        bucket: &str,
+        encrypted_object_key: Vec<u8>,
+        expires: Option<std::time::SystemTime>,
+        encryption_parameters: Option<storj_proto::encryption::EncryptionParameters>,
+    ) -> Result<metainfo::BeginObjectResponse> {
+        let req = BeginObjectRequest {
+            header: Some(self.header()),
+            bucket: bucket.as_bytes().to_vec(),
+            encrypted_object_key,
+            expires_at: expires.map(system_time_to_proto),
+            encryption_parameters,
+            ..Default::default()
+        };
+        let items = self
+            .compressed_batch(
+                vec![BatchRequestItem {
+                    request: Some(batch_request_item::Request::ObjectBegin(req)),
+                }],
+                bucket,
+                "",
+            )
+            .await?;
+        match Self::expect_one(items, "BeginObject")? {
+            batch_response_item::Response::ObjectBegin(r) => Ok(r),
+            _ => Err(Error::new(
+                ErrorKind::Protocol,
+                "unexpected BeginObject response",
+            )),
+        }
+    }
+
+    pub(crate) async fn commit_object(
+        &self,
+        bucket: &str,
+        key: &str,
+        stream_id: Vec<u8>,
+        user: storj_uplink::upload::EncryptedUserData,
+    ) -> Result<metainfo::CommitObjectResponse> {
+        let req = CommitObjectRequest {
+            header: Some(self.header()),
+            stream_id,
+            encrypted_metadata: user.encrypted_metadata,
+            encrypted_metadata_nonce: user.encrypted_metadata_nonce.to_vec(),
+            encrypted_metadata_encrypted_key: user.encrypted_metadata_encrypted_key,
+            encrypted_etag: user.encrypted_etag,
+            skip_override_encrypted_metadata: false,
+            ..Default::default()
+        };
+        let items = self
+            .compressed_batch(
+                vec![BatchRequestItem {
+                    request: Some(batch_request_item::Request::ObjectCommit(req)),
+                }],
+                bucket,
+                key,
+            )
+            .await?;
+        match Self::expect_one(items, "CommitObject")? {
+            batch_response_item::Response::ObjectCommit(r) => Ok(r),
+            _ => Err(Error::new(
+                ErrorKind::Protocol,
+                "unexpected CommitObject response",
+            )),
+        }
+    }
+
+    pub(crate) async fn begin_segment(
+        &self,
+        bucket: &str,
+        key: &str,
+        stream_id: Vec<u8>,
+        position: SegmentPosition,
+        max_order_limit: i64,
+    ) -> Result<metainfo::BeginSegmentResponse> {
+        let req = BeginSegmentRequest {
+            header: Some(self.header()),
+            stream_id,
+            position: Some(position),
+            max_order_limit,
+            lite_request: false,
+        };
+        let items = self
+            .compressed_batch(
+                vec![BatchRequestItem {
+                    request: Some(batch_request_item::Request::SegmentBegin(req)),
+                }],
+                bucket,
+                key,
+            )
+            .await?;
+        match Self::expect_one(items, "BeginSegment")? {
+            batch_response_item::Response::SegmentBegin(r) => Ok(r),
+            _ => Err(Error::new(
+                ErrorKind::Protocol,
+                "unexpected BeginSegment response",
+            )),
+        }
+    }
+
+    pub(crate) async fn retry_begin_segment_pieces(
+        &self,
+        bucket: &str,
+        key: &str,
+        segment_id: Vec<u8>,
+        retry_piece_numbers: Vec<i32>,
+    ) -> Result<metainfo::RetryBeginSegmentPiecesResponse> {
+        let req = RetryBeginSegmentPiecesRequest {
+            header: Some(self.header()),
+            segment_id,
+            retry_piece_numbers,
+        };
+        let items = self
+            .compressed_batch(
+                vec![BatchRequestItem {
+                    request: Some(batch_request_item::Request::SegmentBeginRetryPieces(req)),
+                }],
+                bucket,
+                key,
+            )
+            .await?;
+        match Self::expect_one(items, "RetryBeginSegmentPieces")? {
+            batch_response_item::Response::SegmentBeginRetryPieces(r) => Ok(r),
+            _ => Err(Error::new(
+                ErrorKind::Protocol,
+                "unexpected RetryBeginSegmentPieces response",
+            )),
+        }
+    }
+
+    pub(crate) async fn commit_segment(
+        &self,
+        bucket: &str,
+        key: &str,
+        req: CommitSegmentRequest,
+    ) -> Result<metainfo::CommitSegmentResponse> {
+        let mut req = req;
+        req.header = Some(self.header());
+        let items = self
+            .compressed_batch(
+                vec![BatchRequestItem {
+                    request: Some(batch_request_item::Request::SegmentCommit(req)),
+                }],
+                bucket,
+                key,
+            )
+            .await?;
+        match Self::expect_one(items, "CommitSegment")? {
+            batch_response_item::Response::SegmentCommit(r) => Ok(r),
+            _ => Err(Error::new(
+                ErrorKind::Protocol,
+                "unexpected CommitSegment response",
+            )),
+        }
+    }
+
+    pub(crate) async fn make_inline_segment(
+        &self,
+        bucket: &str,
+        key: &str,
+        req: MakeInlineSegmentRequest,
+    ) -> Result<()> {
+        let mut req = req;
+        req.header = Some(self.header());
+        let items = self
+            .compressed_batch(
+                vec![BatchRequestItem {
+                    request: Some(batch_request_item::Request::SegmentMakeInline(req)),
+                }],
+                bucket,
+                key,
+            )
+            .await?;
+        match Self::expect_one(items, "MakeInlineSegment")? {
+            batch_response_item::Response::SegmentMakeInline(_) => Ok(()),
+            _ => Err(Error::new(
+                ErrorKind::Protocol,
+                "unexpected MakeInlineSegment response",
+            )),
+        }
+    }
+
+    pub(crate) async fn begin_delete_object(
+        &self,
+        bucket: &str,
+        encrypted_object_key: Vec<u8>,
+        stream_id: Vec<u8>,
+    ) -> Result<metainfo::BeginDeleteObjectResponse> {
+        let req = BeginDeleteObjectRequest {
+            header: Some(self.header()),
+            bucket: bucket.as_bytes().to_vec(),
+            encrypted_object_key,
+            stream_id,
+            status: metainfo::object::Status::Uploading as i32,
+            ..Default::default()
+        };
+        let items = self
+            .compressed_batch(
+                vec![BatchRequestItem {
+                    request: Some(batch_request_item::Request::ObjectBeginDelete(req)),
+                }],
+                bucket,
+                "",
+            )
+            .await?;
+        match Self::expect_one(items, "BeginDeleteObject")? {
+            batch_response_item::Response::ObjectBeginDelete(r) => Ok(r),
+            _ => Err(Error::new(
+                ErrorKind::Protocol,
+                "unexpected BeginDeleteObject response",
+            )),
+        }
+    }
+
+    pub(crate) async fn finish_delete_object(
+        &self,
+        bucket: &str,
+        stream_id: Vec<u8>,
+    ) -> Result<()> {
+        let req = FinishDeleteObjectRequest {
+            header: Some(self.header()),
+            stream_id,
+        };
+        let items = self
+            .compressed_batch(
+                vec![BatchRequestItem {
+                    request: Some(batch_request_item::Request::ObjectFinishDelete(req)),
+                }],
+                bucket,
+                "",
+            )
+            .await?;
+        match Self::expect_one(items, "FinishDeleteObject")? {
+            batch_response_item::Response::ObjectFinishDelete(_) => Ok(()),
+            _ => Err(Error::new(
+                ErrorKind::Protocol,
+                "unexpected FinishDeleteObject response",
+            )),
+        }
+    }
+}
+
+fn system_time_to_proto(t: std::time::SystemTime) -> prost_types::Timestamp {
+    let d = t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    prost_types::Timestamp {
+        seconds: d.as_secs() as i64,
+        nanos: d.subsec_nanos() as i32,
+    }
+}
+
+pub(crate) fn object_from_proto(pb: Option<metainfo::Object>, plaintext_key: &str) -> Object {
+    let (created, expires, content_length) = match &pb {
+        Some(o) => (
+            Some(proto_timestamp(o.created_at)),
+            o.expires_at.map(|t| proto_timestamp(Some(t))),
+            o.plain_size,
+        ),
+        None => (None, None, 0),
+    };
+    Object {
+        key: plaintext_key.to_owned(),
+        is_prefix: false,
+        system: SystemMetadata {
+            created,
+            expires,
+            content_length,
+        },
+        custom: CustomMetadata::new(),
+    }
 }
 
 fn server_name_from_address(address: &str) -> Result<ServerName<'static>> {
@@ -329,6 +667,10 @@ pub(crate) fn map_rpc_error(err: storj_rpc::Error, bucket: &str, key: &str) -> E
 fn map_remote(code: u64, message: &str, bucket: &str, key: &str) -> Error {
     match code {
         RPC_CANCELED => Error::new(ErrorKind::Canceled, message),
+        RPC_INVALID_ARGUMENT if !key.is_empty() => Error::new(
+            ErrorKind::ObjectKeyInvalid,
+            format!("object key invalid ({key:?})"),
+        ),
         RPC_INVALID_ARGUMENT => Error::new(
             ErrorKind::BucketNameInvalid,
             format!("bucket name invalid ({bucket:?})"),

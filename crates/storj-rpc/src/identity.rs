@@ -128,6 +128,7 @@ impl fmt::Display for NodeUrl {
 }
 
 /// CA + leaf chain and leaf private key. NodeID is taken from the CA public key.
+#[derive(Clone)]
 pub struct Identity {
     id: NodeId,
     leaf: CertificateDer<'static>,

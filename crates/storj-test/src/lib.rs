@@ -11,7 +11,9 @@ use std::path::{Path, PathBuf};
 use storj::constants::{MAX_INLINE_SEGMENT_SIZE, MAX_SEGMENT_SIZE};
 
 pub mod mock;
+pub mod mock_sn;
 pub use mock::MockSatellite;
+pub use mock_sn::MockStorageNode;
 
 /// Object sizes for the Go↔Rust interop matrix (design v1.0 exit criterion).
 ///

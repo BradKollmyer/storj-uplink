@@ -1,13 +1,13 @@
-//! Piecestore client, order-limit verify, and SN connection pool.
-//!
-//! Workspace-internal (`publish = false`) until 1.0. Full object upload
-//! pipeline is a later PR.
+//! Piecestore client, order-limit verify, SN pool, and single-segment upload.
 
 #![deny(clippy::undocumented_unsafe_blocks)]
 
 pub mod orders;
 pub mod piecestore;
+pub mod pipeline;
 pub mod pool;
+pub mod segment;
+pub mod upload;
 
 pub use orders::{
     PieceHashAlgo, PieceHasher, PiecePrivateKey, PiecePublicKey, encode_order, encode_order_limit,
@@ -56,10 +56,17 @@ pub enum Error {
     /// Underlying I/O.
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    /// Reed-Solomon encode/decode.
+    #[error(transparent)]
+    Ec(#[from] storj_ec::Error),
+    /// Content encryption.
+    #[error(transparent)]
+    Encryption(#[from] storj_encryption::Error),
 }
 
 impl Error {
-    pub(crate) fn protocol(msg: impl Into<String>) -> Self {
+    /// Protocol / sequence failure.
+    pub fn protocol(msg: impl Into<String>) -> Self {
         Self::Protocol(msg.into())
     }
 }

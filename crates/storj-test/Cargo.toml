@@ -15,6 +15,7 @@ storj.workspace = true
 storj-access.workspace = true
 storj-proto.workspace = true
 storj-rpc.workspace = true
+storj-uplink.workspace = true
 tokio.workspace = true
 tokio-rustls.workspace = true
 

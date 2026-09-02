@@ -95,6 +95,12 @@ impl<T> Client<T> {
     pub fn conn_mut(&mut self) -> &mut Conn<T> {
         &mut self.conn
     }
+
+    /// Recover the transport after a piece RPC.
+    #[must_use]
+    pub fn into_conn(self) -> Conn<T> {
+        self.conn
+    }
 }
 
 impl<T: AsyncRead + AsyncWrite + Unpin> Client<T> {
