@@ -116,8 +116,50 @@ impl Access {
         api_key: &str,
         passphrase: &str,
     ) -> Result<Self> {
-        let _ = (config, satellite_address, api_key, passphrase);
-        Err(Error::not_implemented("Access::request_with_passphrase"))
+        let parsed = storj_access::ApiKey::parse(api_key).map_err(|e| {
+            Error::new(ErrorKind::InvalidGrant, e.message().to_owned()).with_source(e)
+        })?;
+        let node = crate::metainfo::parse_satellite_url(satellite_address)?;
+        let client =
+            crate::metainfo::MetainfoClient::connect(node.clone(), parsed.serialize_raw(), config)
+                .await?;
+        let info = client.project_info().await?;
+        client.close().await;
+
+        let passphrase = passphrase.to_owned();
+        let salt = info.project_salt;
+        let key = tokio::task::spawn_blocking(move || {
+            crate::encryption::derive_root_key(
+                passphrase.as_bytes(),
+                &salt,
+                b"",
+                crate::constants::ARGON2_PARALLELISM_REQUEST,
+            )
+        })
+        .await??;
+
+        let mut default_key = [0u8; 32];
+        default_key.copy_from_slice(key.as_bytes());
+        Ok(Self::from_grant(storj_access::Grant::from_parts(
+            node.to_string(),
+            parsed.serialize_raw(),
+            storj_access::EncryptionAccess {
+                default_key: Some(default_key),
+                default_path_cipher: storj_access::CipherSuite::AES_GCM,
+                store_entries: Vec::new(),
+                default_encryption_parameters: None,
+            },
+        )))
+    }
+
+    pub(crate) fn from_grant(grant: storj_access::Grant) -> Self {
+        Self {
+            inner: Arc::new(grant),
+        }
+    }
+
+    pub(crate) fn api_key_raw(&self) -> &[u8] {
+        self.inner.api_key()
     }
 
     #[cfg(test)]
@@ -341,5 +383,44 @@ mod tests {
         let a = Access::placeholder("sat");
         let s = format!("{a:?}");
         assert!(s.contains("REDACTED"));
+    }
+
+    #[tokio::test]
+    async fn request_host_only_unknown_needs_node_id() {
+        let e = Access::request_with_passphrase("us1.storj.io:7777", "not-a-key", "pw")
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::InvalidGrant);
+        // API key is parsed first; this still fails before dial.
+        assert!(
+            e.to_string().contains("invalid api key")
+                || e.to_string().contains("node id is required")
+        );
+    }
+
+    #[tokio::test]
+    async fn request_invalid_api_key() {
+        let e = Access::request_with_passphrase(
+            "12EayRS2V1kEsWESU9QMRseFhdxYxKicsiFmxrsLZHeLUtdps3S@127.0.0.1:1",
+            "not-a-key",
+            "pw",
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::InvalidGrant);
+        assert!(e.to_string().contains("invalid api key"));
+    }
+
+    #[tokio::test]
+    async fn request_unknown_host_reports_node_id_required() {
+        let key = storj_access::ApiKey::from_parts(b"head".to_vec(), &[0x11; 32]).serialize();
+        let e = Access::request_with_passphrase("us1.storj.io:7777", &key, "pw")
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::InvalidGrant);
+        assert!(
+            e.to_string()
+                .contains("node id is required in satelliteNodeURL")
+        );
     }
 }

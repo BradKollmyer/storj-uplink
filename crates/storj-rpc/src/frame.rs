@@ -376,6 +376,15 @@ pub(crate) fn unmarshal_error(data: &[u8]) -> (u64, String) {
     (code, message)
 }
 
+/// Encode a remote `Kind::ERROR` payload (8-byte BE code + message).
+#[must_use]
+pub fn marshal_error(code: u64, message: &str) -> Vec<u8> {
+    let mut data = Vec::with_capacity(8 + message.len());
+    data.extend_from_slice(&code.to_be_bytes());
+    data.extend_from_slice(message.as_bytes());
+    data
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -550,5 +559,13 @@ mod tests {
     fn mux_prefix_bytes() {
         assert_eq!(DRPC_TLS_MUX_PREFIX, b"DRPC!!!1");
         assert_eq!(DRPC_TLS_MUX_PREFIX.len(), 8);
+    }
+
+    #[test]
+    fn marshal_error_roundtrip() {
+        let data = marshal_error(6, "bucket already exists");
+        let (code, message) = unmarshal_error(&data);
+        assert_eq!(code, 6);
+        assert_eq!(message, "bucket already exists");
     }
 }

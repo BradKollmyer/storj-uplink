@@ -7,10 +7,12 @@
 #![deny(clippy::undocumented_unsafe_blocks)]
 
 pub mod access;
+mod bucket;
 pub mod config;
 pub mod constants;
 pub mod encryption;
 pub mod error;
+pub(crate) mod metainfo;
 pub mod project;
 pub mod types;
 pub mod upload;

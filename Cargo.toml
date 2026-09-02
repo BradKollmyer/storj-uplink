@@ -16,7 +16,7 @@ storj-encryption = { path = "crates/storj-encryption" }
 storj-proto = { path = "crates/storj-proto" }
 storj-rpc = { path = "crates/storj-rpc" }
 storj-test = { path = "crates/storj-test" }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "time", "net", "sync"] }
 bytes = "1"
 prost = "0.13"
 prost-types = "0.13"

@@ -104,8 +104,13 @@ async fn project_open_returns_result() {
     match Project::open(&access).await {
         Ok(_) => panic!("Project::open must return Result (native dial can fail)"),
         Err(err) => {
-            assert_eq!(err.kind(), ErrorKind::Protocol);
-            assert!(err.to_string().contains("not implemented"));
+            assert!(
+                matches!(
+                    err.kind(),
+                    ErrorKind::Protocol | ErrorKind::Io | ErrorKind::InvalidGrant
+                ),
+                "open failed with unexpected kind: {err}"
+            );
         }
     }
 }

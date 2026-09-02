@@ -10,6 +10,9 @@ use std::path::{Path, PathBuf};
 
 use storj::constants::{MAX_INLINE_SEGMENT_SIZE, MAX_SEGMENT_SIZE};
 
+pub mod mock;
+pub use mock::MockSatellite;
+
 /// Object sizes for the Go↔Rust interop matrix (design v1.0 exit criterion).
 ///
 /// `0`, `1`, inline-1, inline+1, one-segment, multi-segment (`64MiB+1`).
@@ -119,9 +122,9 @@ pub fn size_label(n: u64) -> String {
     }
 }
 
-/// Placeholder until a mock satellite exists (PR 11).
+/// True once the in-process mock satellite can be started (PR 11).
 pub fn mock_satellite_available() -> bool {
-    env_flag("STORJ_MOCK")
+    true
 }
 
 /// Check that a path looks like a fixture directory the tests expect.

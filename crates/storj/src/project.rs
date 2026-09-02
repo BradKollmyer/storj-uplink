@@ -1,4 +1,4 @@
-//! `Project` — bucket and object operations. Network RPCs land in later PRs.
+//! `Project` — bucket and object operations.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -10,10 +10,11 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::access::Access;
 use crate::error::{Error, Result};
+use crate::metainfo::{MetainfoClient, parse_satellite_url};
 use crate::types::{
     Bucket, BucketObjectLockConfiguration, CommitUploadOptions, Config, CustomMetadata,
-    DownloadOptions, ListBucketsOptions, ListObjectsOptions, ListUploadPartsOptions,
-    ListUploadsOptions, Object, Retention, SetObjectRetentionOptions, UploadInfo, UploadOptions,
+    DownloadOptions, ListObjectsOptions, ListUploadPartsOptions, ListUploadsOptions, Object,
+    Retention, SetObjectRetentionOptions, UploadInfo, UploadOptions,
 };
 use crate::upload::{Download, PartUpload, Upload};
 
@@ -26,10 +27,14 @@ pub type UploadStream = Pin<Box<dyn Stream<Item = Result<UploadInfo>> + Send>>;
 /// Stream of multipart parts.
 pub type PartStream = Pin<Box<dyn Stream<Item = Result<crate::types::Part>> + Send>>;
 
+pub(crate) struct ProjectInner {
+    pub(crate) metainfo: MetainfoClient,
+}
+
 /// Handle to a satellite project. `Clone` via `Arc`. `Send + Sync`.
 #[derive(Clone)]
 pub struct Project {
-    _inner: Arc<()>,
+    pub(crate) inner: Arc<ProjectInner>,
 }
 
 impl Project {
@@ -38,55 +43,20 @@ impl Project {
         Self::open_with_config(access, Config::default()).await
     }
 
-    /// Open with an explicit config.
+    /// Open with an explicit config. Dials the satellite and pins NodeID.
     pub async fn open_with_config(access: &Access, config: Config) -> Result<Self> {
-        let _ = (access, config);
-        Err(Error::not_implemented("Project::open"))
+        let node = parse_satellite_url(access.satellite_address())?;
+        let metainfo =
+            MetainfoClient::connect(node, access.api_key_raw().to_vec(), &config).await?;
+        Ok(Self {
+            inner: Arc::new(ProjectInner { metainfo }),
+        })
     }
 
     /// Close pooled connections. Also called on Drop (best-effort).
     pub async fn close(self) -> Result<()> {
+        self.inner.metainfo.close().await;
         Ok(())
-    }
-
-    /// Create a bucket. Already-exists → `BucketAlreadyExists` with `Error::bucket()`.
-    pub async fn create_bucket(&self, name: &str) -> Result<Bucket> {
-        let _ = name;
-        Err(Error::not_implemented("Project::create_bucket"))
-    }
-
-    /// Create the bucket if missing; return it either way.
-    pub async fn ensure_bucket(&self, name: &str) -> Result<Bucket> {
-        let _ = name;
-        Err(Error::not_implemented("Project::ensure_bucket"))
-    }
-
-    /// Bucket metadata.
-    pub async fn stat_bucket(&self, name: &str) -> Result<Bucket> {
-        let _ = name;
-        Err(Error::not_implemented("Project::stat_bucket"))
-    }
-
-    /// Delete an empty bucket.
-    pub async fn delete_bucket(&self, name: &str) -> Result<Bucket> {
-        let _ = name;
-        Err(Error::not_implemented("Project::delete_bucket"))
-    }
-
-    /// Delete a bucket and all of its objects.
-    pub async fn delete_bucket_with_objects(&self, name: &str) -> Result<Bucket> {
-        let _ = name;
-        Err(Error::not_implemented(
-            "Project::delete_bucket_with_objects",
-        ))
-    }
-
-    /// List buckets.
-    pub fn list_buckets(&self, opts: ListBucketsOptions) -> BucketStream {
-        let _ = opts;
-        Box::pin(stream::once(async {
-            Err(Error::not_implemented("Project::list_buckets"))
-        }))
     }
 
     /// Start an object upload.
@@ -350,9 +320,16 @@ mod tests {
     use tokio::io::{empty, sink};
 
     fn placeholder() -> Project {
+        // Object helpers are still stubs; they must not dial.
         Project {
-            _inner: Arc::new(()),
+            inner: Arc::new(ProjectInner {
+                metainfo: placeholder_metainfo(),
+            }),
         }
+    }
+
+    fn placeholder_metainfo() -> MetainfoClient {
+        MetainfoClient::disconnected_placeholder()
     }
 
     #[tokio::test]

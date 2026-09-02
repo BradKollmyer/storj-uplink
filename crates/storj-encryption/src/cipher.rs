@@ -96,14 +96,18 @@ fn aes_gcm_nonce(nonce: &[u8]) -> Result<[u8; AES_GCM_NONCE_SIZE]> {
 fn encrypt_aes_gcm(data: &[u8], key: &Key, nonce: &[u8]) -> Result<Vec<u8>> {
     let gcm = Aes256Gcm::new_from_slice(key.as_bytes()).expect("AES-256-GCM accepts 32-byte keys");
     let nonce = aes_gcm_nonce(nonce)?;
-    gcm.encrypt(Nonce::from_slice(&nonce), data)
+    #[allow(deprecated)]
+    let nonce = Nonce::from_slice(&nonce);
+    gcm.encrypt(nonce, data)
         .map_err(|e| Error::new(ErrorKind::Protocol, format!("aes-gcm encrypt: {e}")))
 }
 
 fn decrypt_aes_gcm(cipher_data: &[u8], key: &Key, nonce: &[u8]) -> Result<Vec<u8>> {
     let gcm = Aes256Gcm::new_from_slice(key.as_bytes()).expect("AES-256-GCM accepts 32-byte keys");
     let nonce = aes_gcm_nonce(nonce)?;
-    gcm.decrypt(Nonce::from_slice(&nonce), cipher_data)
+    #[allow(deprecated)]
+    let nonce = Nonce::from_slice(&nonce);
+    gcm.decrypt(nonce, cipher_data)
         .map_err(|_| Error::new(ErrorKind::DecryptionFailed, "aes-gcm decrypt"))
 }
 
