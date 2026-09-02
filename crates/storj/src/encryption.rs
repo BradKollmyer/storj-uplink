@@ -12,9 +12,14 @@ use crate::constants::ARGON2_PARALLELISM_DERIVE;
 use crate::error::{Error, ErrorKind, Result};
 
 pub use storj_encryption::{
-    Base, CipherSuite, Lookup, PathIter, Store, decrypt_path, decrypt_path_with_cipher,
-    derive_content_key, derive_key, derive_path_key, derive_path_key_component, encrypt_path,
-    encrypt_path_with_cipher, encrypt_prefix,
+    AES_GCM_NONCE_SIZE, AES_GCM_TAG_SIZE, AesGcmDecrypter, AesGcmEncrypter, Base, CipherSuite,
+    DEFAULT_ENCRYPTED_BLOCK_SIZE, EncryptionParameters, Lookup, NONCE_SIZE, NoopTransformer,
+    PathIter, SECRETBOX_OVERHEAD, SecretboxDecrypter, SecretboxEncrypter, Store, Transformer,
+    UINT32_SIZE, calc_encompassing_blocks, calc_encrypted_size, calc_transformer_encrypted_size,
+    decrypt, decrypt_path, decrypt_path_with_cipher, derive_content_key, derive_key,
+    derive_path_key, derive_path_key_component, encrypt, encrypt_path, encrypt_path_with_cipher,
+    encrypt_prefix, increment, increment_bytes, make_padding, new_decrypter, new_encrypter, pad,
+    transform_blocks, transform_padded, transform_unpad, unpad, unpad_len,
 };
 
 /// 32-byte root/path key. Zeroized on drop.

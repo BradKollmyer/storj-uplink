@@ -306,7 +306,9 @@ pub(crate) fn map_identity_err(e: storj_rpc::IdentityError) -> Error {
         | storj_rpc::IdentityError::NodeUrl(_) => {
             Error::new(ErrorKind::InvalidGrant, e.to_string()).with_source(e)
         }
-        storj_rpc::IdentityError::Certificate(_) => {
+        storj_rpc::IdentityError::Certificate(_)
+        | storj_rpc::IdentityError::NoCaKey
+        | storj_rpc::IdentityError::Signature => {
             Error::new(ErrorKind::Protocol, e.to_string()).with_source(e)
         }
     }

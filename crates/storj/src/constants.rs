@@ -70,6 +70,10 @@ mod tests {
         assert_eq!(ENCRYPTION_BLOCK_SIZE, TEST_RS_K * DEFAULT_SHARE_SIZE);
         // The comment in Go says “twice the stripe”; the code is one stripe.
         assert_ne!(ENCRYPTION_BLOCK_SIZE, 2 * TEST_RS_K * DEFAULT_SHARE_SIZE);
+        assert_eq!(
+            ENCRYPTION_BLOCK_SIZE,
+            storj_encryption::DEFAULT_ENCRYPTED_BLOCK_SIZE
+        );
     }
 
     #[test]
