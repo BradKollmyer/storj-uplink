@@ -2,7 +2,7 @@
 
 Native Rust [Uplink](https://pkg.go.dev/storj.io/uplink) client for [Storj](https://storj.io).
 
-The published crate is [`storj`](https://crates.io/crates/storj). It implements the Storj client protocol in Rust (Tokio + rustls): access grants, satellite metainfo, storage-node piecestore, and client-side encryption. Design: [`docs/design-native-uplink.md`](docs/design-native-uplink.md).
+The published crate is [`storj`](https://crates.io/crates/storj). It implements the Storj client protocol in Rust (Tokio + rustls): access grants, satellite metainfo, storage-node piecestore, and client-side encryption. Design: [docs/design-native-uplink.md](https://github.com/storj/storj-rust/blob/main/docs/design-native-uplink.md).
 
 ## Non-goals
 
@@ -16,7 +16,7 @@ Go is **not** required to build or use the crate. It is only used to generate go
 
 ## License
 
-Dual-licensed MIT OR Apache-2.0. See [`LICENSE-MIT`](LICENSE-MIT) and [`LICENSE-APACHE`](LICENSE-APACHE).
+Dual-licensed MIT OR Apache-2.0. See [LICENSE-MIT](https://github.com/storj/storj-rust/blob/main/LICENSE-MIT) and [LICENSE-APACHE](https://github.com/storj/storj-rust/blob/main/LICENSE-APACHE).
 
 ## Tests
 
@@ -26,4 +26,4 @@ cargo test -p storj -- --ignored    # protocol/interop (expected fail until impl
 go run -C scripts .                 # Argon2 / path-HMAC goldens
 ```
 
-See [`crates/storj/tests/README.md`](crates/storj/tests/README.md).
+See [crates/storj/tests/README.md](https://github.com/storj/storj-rust/blob/main/crates/storj/tests/README.md).
