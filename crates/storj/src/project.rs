@@ -951,7 +951,7 @@ mod tests {
     use tokio::io::{empty, sink};
 
     fn placeholder() -> Project {
-        // Object helpers are still stubs; they must not dial.
+        // Disconnected client for methods that must fail without dialing.
         Project {
             inner: Arc::new(ProjectInner {
                 metainfo: placeholder_metainfo(),

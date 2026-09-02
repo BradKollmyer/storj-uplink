@@ -251,8 +251,6 @@ fn prepare_list(
         .prefix
         .strip_suffix('/')
         .unwrap_or(opts.prefix.as_str());
-    let encrypted_prefix =
-        encrypt_path(bucket, parent_plain, &project.inner.store).map_err(map_enc)?;
     let parent_key =
         derive_path_key(bucket, parent_plain.as_bytes(), &project.inner.store).map_err(map_enc)?;
     let path_cipher = project
@@ -268,6 +266,14 @@ fn prepare_list(
             }
         })
         .unwrap_or(CipherSuite::AES_GCM);
+    // EncNull: satellite does a raw byte-prefix match of the original prefix
+    // (including trailing `/`). AES-GCM uses GetPrefixInfo.ParentEnc (no slash).
+    let arbitrary_prefix = path_cipher == CipherSuite::NULL;
+    let encrypted_prefix = if arbitrary_prefix {
+        opts.prefix.as_bytes().to_vec()
+    } else {
+        encrypt_path(bucket, parent_plain, &project.inner.store).map_err(map_enc)?
+    };
     let encrypted_cursor = if opts.cursor.is_empty() {
         Vec::new()
     } else {
@@ -289,7 +295,7 @@ fn prepare_list(
         recursive: opts.recursive,
         system: opts.system,
         custom: opts.custom,
-        arbitrary_prefix: path_cipher == CipherSuite::NULL,
+        arbitrary_prefix,
         pending: VecDeque::new(),
         done: false,
     })
@@ -300,7 +306,7 @@ fn convert_list_page(st: &ObjectListState, items: Vec<ObjectListItem>) -> Result
     for item in items {
         match convert_list_item(st, item) {
             Ok(obj) => out.push(obj),
-            Err(e) if e.kind() == ErrorKind::DecryptionFailed => continue,
+            Err(e) if skippable_list_decrypt(&e) => continue,
             Err(e) => return Err(e),
         }
     }
@@ -371,6 +377,10 @@ fn object_from_info(
         obj.custom = CustomMetadata::new();
     }
     Ok(obj)
+}
+
+fn skippable_list_decrypt(e: &Error) -> bool {
+    matches!(e.kind(), ErrorKind::DecryptionFailed | ErrorKind::Protocol)
 }
 
 fn decrypt_custom(

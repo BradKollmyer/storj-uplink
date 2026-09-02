@@ -218,12 +218,17 @@ impl MockSatellite {
 
     /// Access grant pointing at this mock (dummy root key, no Argon2).
     pub fn access(&self) -> storj::Access {
+        self.access_with_path_cipher(storj_access::CipherSuite::AES_GCM)
+    }
+
+    /// Access grant with an explicit default path cipher (e.g. EncNull listing).
+    pub fn access_with_path_cipher(&self, path_cipher: storj_access::CipherSuite) -> storj::Access {
         let grant = storj_access::Grant::from_parts(
             self.node_url.clone(),
             self.api_key_raw.clone(),
             storj_access::EncryptionAccess {
                 default_key: Some([1u8; 32]),
-                default_path_cipher: storj_access::CipherSuite::AES_GCM,
+                default_path_cipher: path_cipher,
                 store_entries: Vec::new(),
                 default_encryption_parameters: None,
             },
@@ -332,6 +337,37 @@ impl MockSatellite {
                 objects: 0,
             })
             .objects += 1;
+    }
+
+    /// Insert a committed object at `enc_key` (undecryptable-sibling tests).
+    pub fn put_encrypted_object(&self, bucket: &str, enc_key: Vec<u8>) {
+        let mut st = self.state.lock().expect("mock state");
+        st.next_id += 1;
+        let stream_id = st.next_id.to_be_bytes().to_vec();
+        st.buckets
+            .entry(bucket.to_owned())
+            .or_insert_with(|| BucketRec {
+                created: SystemTime::now(),
+                objects: 0,
+            })
+            .objects += 1;
+        st.committed.insert(
+            (bucket.to_owned(), enc_key.clone()),
+            CommittedObject {
+                object: ProtoObject {
+                    bucket: bucket.as_bytes().to_vec(),
+                    encrypted_object_key: enc_key,
+                    stream_id,
+                    status: storj_proto::metainfo::object::Status::CommittedUnversioned as i32,
+                    created_at: Some(timestamp(SystemTime::now())),
+                    encrypted_metadata: vec![0xFF; 8],
+                    encrypted_metadata_nonce: vec![1, 2, 3],
+                    encrypted_metadata_encrypted_key: vec![0xAA; 8],
+                    ..Default::default()
+                },
+                segments: Vec::new(),
+            },
+        );
     }
 }
 
@@ -815,7 +851,9 @@ fn list_objects(
         if bucket != &name {
             continue;
         }
-        let Some(remainder) = strip_list_prefix(enc_key, &req.encrypted_prefix) else {
+        let Some(remainder) =
+            strip_list_prefix(enc_key, &req.encrypted_prefix, req.arbitrary_prefix)
+        else {
             continue;
         };
         if !req.encrypted_cursor.is_empty()
@@ -882,7 +920,7 @@ fn list_objects(
     Ok(ListObjectsResponse { items, more })
 }
 
-fn strip_list_prefix(enc_key: &[u8], prefix: &[u8]) -> Option<Vec<u8>> {
+fn strip_list_prefix(enc_key: &[u8], prefix: &[u8], arbitrary: bool) -> Option<Vec<u8>> {
     if prefix.is_empty() {
         return Some(enc_key.to_vec());
     }
@@ -890,6 +928,9 @@ fn strip_list_prefix(enc_key: &[u8], prefix: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
     let rest = &enc_key[prefix.len()..];
+    if arbitrary {
+        return Some(rest.to_vec());
+    }
     if rest.is_empty() {
         return None;
     }

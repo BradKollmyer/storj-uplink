@@ -871,7 +871,7 @@ fn system_time_to_proto(t: std::time::SystemTime) -> prost_types::Timestamp {
 pub(crate) fn object_from_proto(pb: Option<metainfo::Object>, plaintext_key: &str) -> Object {
     let (created, expires, content_length) = match &pb {
         Some(o) => (
-            Some(proto_timestamp(o.created_at)),
+            o.created_at.map(|t| proto_timestamp(Some(t))),
             o.expires_at.map(|t| proto_timestamp(Some(t))),
             o.plain_size,
         ),

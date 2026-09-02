@@ -308,6 +308,11 @@ pub fn decrypt_user_data(
     derived_content_key: &Key,
 ) -> Result<(StreamMeta, SerializableMeta)> {
     let meta = StreamMeta::decode(encrypted_metadata)?;
+    let cipher = if meta.encryption_type != 0 {
+        CipherSuite(meta.encryption_type)
+    } else {
+        cipher
+    };
     let nonce = nonce_from_slice(encrypted_metadata_nonce)?;
     let metadata_key = decrypt_key(
         encrypted_metadata_encrypted_key,
@@ -467,6 +472,16 @@ mod tests {
             &key,
         )
         .unwrap();
+        assert_eq!(meta.encryption_type, CipherSuite::AES_GCM.0);
+        let (_, custom) = decrypt_user_data(
+            &user.encrypted_metadata,
+            &user.encrypted_metadata_encrypted_key,
+            &user.encrypted_metadata_nonce,
+            CipherSuite::NULL,
+            &key,
+        )
+        .unwrap();
+        assert!(custom.user_defined.is_empty());
         assert_eq!(meta.number_of_segments, 2);
     }
 
