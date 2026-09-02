@@ -16,19 +16,10 @@ fi
 echo "pin storj/common=$COMMON_SHA"
 echo "pin storj/uplink=$UPLINK_SHA"
 
-FILES=(
-  metainfo.proto
-  piecestore2.proto
-  orders.proto
-  encryption.proto
-  node.proto
-  noise.proto
-  pointerdb.proto
-  gogo.proto
-)
-
 fail=0
-for f in "${FILES[@]}"; do
+shopt -s nullglob
+for path in "$ROOT"/proto/*.proto; do
+  f="$(basename "$path")"
   url="https://raw.githubusercontent.com/storj/common/${COMMON_SHA}/pb/${f}"
   tmp="$(mktemp)"
   if ! curl -fsSL "$url" -o "$tmp"; then
@@ -37,7 +28,7 @@ for f in "${FILES[@]}"; do
     fail=1
     continue
   fi
-  if ! cmp -s "$tmp" "$ROOT/proto/$f"; then
+  if ! cmp -s "$tmp" "$path"; then
     echo "DRIFT: proto/$f does not match storj/common@${COMMON_SHA} pb/$f" >&2
     fail=1
   else

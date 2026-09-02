@@ -23,7 +23,7 @@ Dual-licensed MIT OR Apache-2.0. See [LICENSE-MIT](https://github.com/storj/stor
 ```bash
 cargo test -p storj                 # contract suite (no network)
 cargo test -p storj -- --ignored    # protocol/interop (expected fail until implemented)
-go run -C scripts .                 # Argon2 / path-HMAC goldens
+go run -C scripts .                 # Argon2 / path-HMAC / grant goldens
 ```
 
 See [crates/storj/tests/README.md](https://github.com/storj/storj-rust/blob/main/crates/storj/tests/README.md).

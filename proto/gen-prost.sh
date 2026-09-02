@@ -28,16 +28,22 @@ fn main() {
     std::fs::create_dir_all(&out).unwrap();
     let mut cfg = prost_build::Config::new();
     cfg.out_dir(&out);
-    let protos = [
-        "metainfo.proto",
-        "piecestore2.proto",
-        "orders.proto",
-        "encryption.proto",
-        "node.proto",
-        "noise.proto",
-        "pointerdb.proto",
-    ];
-    let paths: Vec<String> = protos.iter().map(|p| format!("{proto_dir}/{p}")).collect();
+    let mut paths: Vec<String> = std::fs::read_dir(&proto_dir)
+        .unwrap()
+        .filter_map(|e| {
+            let p = e.ok()?.path();
+            if p.extension()?.to_str()? != "proto" {
+                return None;
+            }
+            let name = p.file_name()?.to_string_lossy();
+            // gogo.proto is options only; not generated to Rust.
+            if name == "gogo.proto" {
+                return None;
+            }
+            Some(p.to_string_lossy().into_owned())
+        })
+        .collect();
+    paths.sort();
     cfg.compile_protos(&paths, &[&proto_dir]).expect("compile protos");
 }
 EOF

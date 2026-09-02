@@ -71,6 +71,16 @@ pub fn sim_access() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Live satellite grant for object-level Go↔Rust interop.
+///
+/// `STORJ_INTEROP_ACCESS` wins; otherwise `STORJ_SIM_ACCESS`.
+pub fn interop_access() -> Option<String> {
+    std::env::var("STORJ_INTEROP_ACCESS")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(sim_access)
+}
+
 /// Directory containing checked-in golden fixtures.
 pub fn fixtures_dir() -> PathBuf {
     // crates/storj-test/src/lib.rs → workspace tests/fixtures
@@ -150,5 +160,7 @@ mod tests {
         // Unset in unit tests.
         let _ = interop_enabled();
         let _ = sim_enabled();
+        let _ = interop_access();
+        let _ = sim_access();
     }
 }
