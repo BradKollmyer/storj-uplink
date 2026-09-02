@@ -28,4 +28,7 @@ not a drop-in for crates.io `uplink` 0.11.0 (blocking FFI, `!Send`).
 
 - MSRV is 1.85 (edition 2024)
 - Dual-licensed MIT OR Apache-2.0
-- Edge / GatewayMT remains an optional 1.x feature and is not required for 1.0
+- Consume via git or path: internal crates are `publish = false`, so
+  `cargo publish -p storj` is not possible yet
+- Edge / GatewayMT (`storj::edge`) is specified for 1.x and is not in this
+  release

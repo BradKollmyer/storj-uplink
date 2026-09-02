@@ -1,17 +1,22 @@
 //! Native Rust Uplink client for the Storj decentralized object store.
 //!
 //! **1.0.0** freezes the public `storj::*` API: access grants, buckets,
-//! objects, multi-segment upload/download, listing, copy/move, multipart,
-//! revoke, and Object Lock. Edge / GatewayMT is an optional 1.x feature and is
-//! not required for this freeze.
+//! objects (multi-segment upload/download), listing, copy/move, multipart,
+//! revoke, and Object Lock. `storj::edge` (GatewayMT / linksharing) is 1.x
+//! and is not in this crate yet.
 //!
-//! This crate is **not** a wrapper around `uplink-c`. It is also **not** a
-//! drop-in replacement for crates.io `uplink` 0.11.0 (May 2025): that crate is
-//! blocking FFI and `!Send`. See `docs/design-native-uplink.md`.
+//! Not a wrapper around `uplink-c`, and not a drop-in for crates.io `uplink`
+//! 0.11.0 (blocking FFI, `!Send`). Spec: `docs/design-native-uplink.md`.
 //!
-//! MSRV is 1.85 (edition 2024). Dual-licensed MIT OR Apache-2.0.
+//! Internal crates are unpublished; depend on this crate via git or path.
+//! Callers need their own Tokio runtime (`tokio` is not re-exported).
+//!
+//! MSRV 1.85, edition 2024. Dual-licensed MIT OR Apache-2.0.
 //!
 //! # Walkthrough
+//!
+//! `commit()` publishes the object. Dropping [`Upload`] without `commit`
+//! aborts. `poll_shutdown` does not commit.
 //!
 //! ```no_run
 //! use storj::{Access, Project};
@@ -23,10 +28,18 @@
 //! project.ensure_bucket("logs").await?;
 //!
 //! let mut upload = project
-//!     .upload_object("logs", "2026-09-01/app.log", Default::default())
+//!     .upload_object("logs", "hello.txt", Default::default())
 //!     .await?;
 //! upload.write_all(b"hello storj").await?;
 //! let _obj = upload.commit().await?;
+//!
+//! let mut download = project
+//!     .download_object("logs", "hello.txt", Default::default())
+//!     .await?;
+//! let mut buf = Vec::new();
+//! tokio::io::copy(&mut download, &mut buf).await?;
+//! download.close().await?;
+//! project.close().await?;
 //! # Ok(())
 //! # }
 //! ```

@@ -4,10 +4,10 @@
 |---|---|
 | **Title** | Native Rust Uplink API for Storj |
 | **Author** | TBD |
-| **Date** | 2026-09-01 |
-| **Status** | Draft |
-| **Audience** | Senior engineers implementing `storj-rust` |
-| **Repo** | `/Users/bradk/repos/storj-rust` (greenfield) |
+| **Date** | 2026-09-01 (1.0.0 on `main` 2026-09-02) |
+| **Status** | Implemented |
+| **Audience** | Engineers using or changing `storj-rust` |
+| **Repo** | `storj-rust` (`main` is 1.0.0) |
 | **Analog** | Go [`storj.io/uplink`](https://pkg.go.dev/storj.io/uplink) v1.14.5; prior Rust [`uplink` 0.11.0](https://docs.rs/uplink/0.11.0/uplink/) (FFI, May 2025) |
 
 ---

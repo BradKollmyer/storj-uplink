@@ -1,13 +1,13 @@
-# Fuzz targets (later PRs)
+# Fuzz targets
 
-Design targets:
+Parsers that must not panic (design Testing Strategy):
 
-| Target | PR |
+| Target | Crate |
 |---|---|
-| `Access::parse` | 3 |
-| macaroon parser | 4 |
-| RS encode/decode round-trip (crate tests in `storj-ec`) | 8 |
-| DRPC frame parser | 9a |
-| path decrypt (must not panic) | 5–7 |
+| `Access::parse` / grant Base58Check | `storj-access` |
+| Macaroon parser | `storj-access` |
+| RS encode/decode | `storj-ec` (crate tests cover infectious goldens) |
+| DRPC frame parser | `storj-rpc` |
+| Path decrypt | `storj-encryption` |
 
-Use `cargo fuzz` once those parsers exist. Do not fuzz production grants into CI logs.
+Use `cargo fuzz` against those entry points. Do not fuzz production grants into CI logs.

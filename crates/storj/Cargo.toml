@@ -34,5 +34,9 @@ storj-test.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util"] }
 futures-util.workspace = true
 
+[[example]]
+name = "walkthrough"
+path = "examples/walkthrough.rs"
+
 [lints]
 workspace = true
