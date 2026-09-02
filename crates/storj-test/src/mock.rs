@@ -652,7 +652,7 @@ fn handle_rpc(
                 &req.encrypted_object_key,
                 &req.object_version,
             )?;
-            let retention = rec.retention.ok_or_else(|| {
+            let retention = rec.and_then(|r| r.retention).ok_or_else(|| {
                 (
                     RPC_OBJECT_LOCK_OBJECT_RETENTION_MISSING,
                     "object has no retention configuration".into(),
@@ -687,7 +687,7 @@ fn handle_rpc(
                 &req.object_version,
             )?;
             Ok(GetObjectLegalHoldResponse {
-                enabled: rec.legal_hold,
+                enabled: rec.map(|r| r.legal_hold).unwrap_or(false),
             }
             .encode_to_vec())
         }
@@ -1898,20 +1898,42 @@ fn signed_limit(
     })
 }
 
+fn require_committed_object(
+    state: &MockState,
+    bucket: &[u8],
+    encrypted_key: &[u8],
+    version: &[u8],
+) -> Result<String, (u64, String)> {
+    let name = utf8_name(bucket)?;
+    if !state.buckets.contains_key(&name) {
+        return Err((RPC_NOT_FOUND, format!("bucket not found: {name}")));
+    }
+    let rec = state
+        .committed
+        .get(&(name.clone(), encrypted_key.to_vec()))
+        .ok_or_else(|| (RPC_NOT_FOUND, "object not found".into()))?;
+    if !version.is_empty() {
+        let matches = (!rec.object.object_version.is_empty()
+            && rec.object.object_version == version)
+            || rec.object.stream_id == version;
+        if !matches {
+            return Err((RPC_NOT_FOUND, "object not found".into()));
+        }
+    }
+    Ok(name)
+}
+
 fn object_lock_rec<'a>(
     state: &'a MockState,
     bucket: &[u8],
     encrypted_key: &[u8],
     version: &[u8],
-) -> Result<&'a ObjectLockRec, (u64, String)> {
-    let name = utf8_name(bucket)?;
-    let rec = state
-        .buckets
-        .get(&name)
-        .ok_or_else(|| (RPC_NOT_FOUND, format!("bucket not found: {name}")))?;
-    rec.object_locks
-        .get(&(encrypted_key.to_vec(), version.to_vec()))
-        .ok_or_else(|| (RPC_NOT_FOUND, "object not found".into()))
+) -> Result<Option<&'a ObjectLockRec>, (u64, String)> {
+    let name = require_committed_object(state, bucket, encrypted_key, version)?;
+    Ok(state.buckets.get(&name).and_then(|rec| {
+        rec.object_locks
+            .get(&(encrypted_key.to_vec(), version.to_vec()))
+    }))
 }
 
 fn object_lock_rec_mut<'a>(
@@ -1920,7 +1942,7 @@ fn object_lock_rec_mut<'a>(
     encrypted_key: &[u8],
     version: &[u8],
 ) -> Result<&'a mut ObjectLockRec, (u64, String)> {
-    let name = utf8_name(bucket)?;
+    let name = require_committed_object(state, bucket, encrypted_key, version)?;
     let rec = state
         .buckets
         .get_mut(&name)

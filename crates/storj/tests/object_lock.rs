@@ -6,6 +6,7 @@ use storj::{
     RetentionMode, SetObjectRetentionOptions,
 };
 use storj_test::MockSatellite;
+use tokio::io::AsyncWriteExt;
 
 #[test]
 fn permission_full_includes_lock_bits_for_share() {
@@ -56,6 +57,19 @@ async fn put_get_retention_and_legal_hold() {
         .expect("enable lock");
 
     let key = "dir/obj";
+    put_object(&project, &bucket, key).await;
+    let none = project
+        .get_object_retention(&bucket, key, None)
+        .await
+        .expect("unlocked object has no retention");
+    assert_eq!(none, None);
+    assert!(
+        !project
+            .get_object_legal_hold(&bucket, key, None)
+            .await
+            .expect("unlocked object has no legal hold")
+    );
+
     let until = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
     let retention = Retention {
         mode: RetentionMode::Compliance,
@@ -115,7 +129,7 @@ async fn put_get_retention_and_legal_hold() {
             .get_object_retention(&bucket, key, None)
             .await
             .expect("get governance"),
-        Some(gov)
+        Some(gov.clone())
     );
 
     let missing = project
@@ -123,6 +137,24 @@ async fn put_get_retention_and_legal_hold() {
         .await
         .unwrap_err();
     assert_eq!(missing.kind(), ErrorKind::ObjectNotFound);
+
+    let set_missing = project
+        .set_object_retention(
+            &bucket,
+            "no-such",
+            None,
+            gov.clone(),
+            SetObjectRetentionOptions::default(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(set_missing.kind(), ErrorKind::ObjectNotFound);
+
+    let hold_missing = project
+        .set_object_legal_hold(&bucket, "no-such", None, true)
+        .await
+        .unwrap_err();
+    assert_eq!(hold_missing.kind(), ErrorKind::ObjectNotFound);
 
     let no_bucket = project
         .get_object_retention("does-not-exist-zzzz", key, None)
@@ -228,6 +260,7 @@ async fn get_retention_none_when_only_legal_hold_set() {
     let project = open_test_project(&mock).await;
     let bucket = unique_bucket();
     project.create_bucket(&bucket).await.unwrap();
+    put_object(&project, &bucket, "k").await;
     project
         .set_object_legal_hold(&bucket, "k", None, true)
         .await
@@ -284,6 +317,15 @@ async fn open_test_project(mock: &MockSatellite) -> Project {
     Project::open(&mock.access())
         .await
         .expect("open mock project")
+}
+
+async fn put_object(project: &Project, bucket: &str, key: &str) {
+    let mut upload = project
+        .upload_object(bucket, key, Default::default())
+        .await
+        .expect("upload_object");
+    upload.write_all(b"lock").await.expect("write");
+    upload.commit().await.expect("commit");
 }
 
 fn unique_bucket() -> String {

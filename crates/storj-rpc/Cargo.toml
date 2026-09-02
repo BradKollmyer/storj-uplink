@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "DRPC client frame codec and unary invoke (workspace-internal until 1.0)"
+description = "DRPC client frame codec and unary invoke (workspace-internal, unpublished)"
 repository.workspace = true
 publish = false
 

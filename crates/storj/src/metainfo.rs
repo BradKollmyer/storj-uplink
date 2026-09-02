@@ -66,6 +66,14 @@ pub(crate) const RPC_OBJECT_LOCK_OBJECT_PROTECTED: u64 = 10005;
 pub(crate) const RPC_OBJECT_LOCK_INVALID_OBJECT_STATE: u64 = 10006;
 /// `rpcstatus.ObjectLockInvalidBucketRetentionConfiguration`.
 pub(crate) const RPC_OBJECT_LOCK_INVALID_BUCKET_CONFIG: u64 = 10007;
+/// `rpcstatus.ObjectLockUploadWithTTL`.
+pub(crate) const RPC_OBJECT_LOCK_UPLOAD_WITH_TTL: u64 = 10008;
+/// `rpcstatus.ObjectLockUploadWithTTLAPIKey`.
+pub(crate) const RPC_OBJECT_LOCK_UPLOAD_WITH_TTL_API_KEY: u64 = 10009;
+/// `rpcstatus.ObjectLockUploadWithTTLAndDefaultRetention`.
+pub(crate) const RPC_OBJECT_LOCK_UPLOAD_WITH_TTL_AND_DEFAULT_RETENTION: u64 = 10010;
+/// `rpcstatus.ObjectLockUploadWithTTLAPIKeyAndDefaultRetention`.
+pub(crate) const RPC_OBJECT_LOCK_UPLOAD_WITH_TTL_API_KEY_AND_DEFAULT_RETENTION: u64 = 10011;
 
 const RETENTION_NOT_FOUND_MSG: &str = "object has no retention configuration";
 
@@ -1352,6 +1360,22 @@ fn map_remote(code: u64, message: &str, bucket: &str, key: &str) -> Error {
             ErrorKind::Protocol,
             "bucket object lock configuration is invalid",
         ),
+        RPC_OBJECT_LOCK_UPLOAD_WITH_TTL => Error::new(
+            ErrorKind::Protocol,
+            "cannot specify an object expiration time when uploading into an Object Lock enabled bucket",
+        ),
+        RPC_OBJECT_LOCK_UPLOAD_WITH_TTL_API_KEY => Error::new(
+            ErrorKind::Protocol,
+            "cannot upload into an Object Lock enabled bucket using an API key that enforces an object expiration time",
+        ),
+        RPC_OBJECT_LOCK_UPLOAD_WITH_TTL_AND_DEFAULT_RETENTION => Error::new(
+            ErrorKind::Protocol,
+            "cannot specify an object expiration time when uploading into a bucket with default retention settings",
+        ),
+        RPC_OBJECT_LOCK_UPLOAD_WITH_TTL_API_KEY_AND_DEFAULT_RETENTION => Error::new(
+            ErrorKind::Protocol,
+            "cannot upload into a bucket with default retention settings using an API key that enforces an object expiration time",
+        ),
         _ => Error::new(
             ErrorKind::Protocol,
             format!("DRPC remote error (code {code}): {message}"),
@@ -1472,6 +1496,34 @@ mod tests {
         assert_eq!(
             map_remote(RPC_OBJECT_LOCK_OBJECT_PROTECTED, "", "b", "k").kind(),
             ErrorKind::Protocol
+        );
+        assert_eq!(
+            map_remote(RPC_OBJECT_LOCK_UPLOAD_WITH_TTL, "", "b", "k").to_string(),
+            "protocol: cannot specify an object expiration time when uploading into an Object Lock enabled bucket"
+        );
+        assert_eq!(
+            map_remote(RPC_OBJECT_LOCK_UPLOAD_WITH_TTL_API_KEY, "", "b", "k").to_string(),
+            "protocol: cannot upload into an Object Lock enabled bucket using an API key that enforces an object expiration time"
+        );
+        assert_eq!(
+            map_remote(
+                RPC_OBJECT_LOCK_UPLOAD_WITH_TTL_AND_DEFAULT_RETENTION,
+                "",
+                "b",
+                "k"
+            )
+            .to_string(),
+            "protocol: cannot specify an object expiration time when uploading into a bucket with default retention settings"
+        );
+        assert_eq!(
+            map_remote(
+                RPC_OBJECT_LOCK_UPLOAD_WITH_TTL_API_KEY_AND_DEFAULT_RETENTION,
+                "",
+                "b",
+                "k"
+            )
+            .to_string(),
+            "protocol: cannot upload into a bucket with default retention settings using an API key that enforces an object expiration time"
         );
     }
 }

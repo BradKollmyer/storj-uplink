@@ -1,6 +1,6 @@
 //! Client-only DRPC codec for Storj (not gRPC).
 //!
-//! Workspace-internal (`publish = false`) until 1.0. Identity is ephemeral
+//! Workspace-internal (`publish = false`). Identity is ephemeral
 //! ECDSA P-256; rustls pins the peer NodeID (no WebPKI).
 
 #![deny(clippy::undocumented_unsafe_blocks)]

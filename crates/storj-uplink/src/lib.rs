@@ -1,4 +1,6 @@
 //! Piecestore client, order-limit verify, SN pool, and segment upload/download.
+//!
+//! Workspace-internal (`publish = false`).
 
 #![deny(clippy::undocumented_unsafe_blocks)]
 
