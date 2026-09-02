@@ -12,12 +12,9 @@ repository = "https://github.com/storj/storj-rust"
 [workspace.dependencies]
 storj = { path = "crates/storj" }
 storj-access = { path = "crates/storj-access" }
-<<<<<<< HEAD
 storj-encryption = { path = "crates/storj-encryption" }
-=======
 storj-proto = { path = "crates/storj-proto" }
 storj-rpc = { path = "crates/storj-rpc" }
->>>>>>> dcb628915a554b37bf9ab98c6d36d6e8be3567b2
 storj-test = { path = "crates/storj-test" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "time"] }
 bytes = "1"
@@ -34,7 +31,6 @@ sha2 = "0.10"
 futures-core = "0.3"
 futures-util = "0.3"
 hex = "0.4"
-prost = "0.13"
 bs58 = { version = "0.5", default-features = false, features = ["std"] }
 
 [workspace.lints.rust]
