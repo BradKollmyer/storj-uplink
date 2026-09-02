@@ -273,6 +273,14 @@ impl MockSatellite {
         }
     }
 
+    /// Replace the metadata key ciphertext so user-data decrypt fails.
+    pub fn corrupt_encrypted_metadata(&self) {
+        let mut st = self.state.lock().expect("mock state");
+        for rec in st.committed.values_mut() {
+            rec.object.encrypted_metadata_encrypted_key = vec![0xAA; 48];
+        }
+    }
+
     /// Segment id last sent on `CommitSegment`.
     pub fn last_commit_segment_id(&self) -> Option<Vec<u8>> {
         self.state

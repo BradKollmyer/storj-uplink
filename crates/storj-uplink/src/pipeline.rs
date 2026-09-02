@@ -444,6 +444,16 @@ mod tests {
             custom.user_defined.get("app:title").map(String::as_str),
             Some("hi")
         );
+        assert!(
+            decrypt_user_data(
+                &user.encrypted_metadata,
+                &[0xAAu8; 48],
+                &user.encrypted_metadata_nonce,
+                CipherSuite::AES_GCM,
+                &key,
+            )
+            .is_err()
+        );
     }
 
     #[test]

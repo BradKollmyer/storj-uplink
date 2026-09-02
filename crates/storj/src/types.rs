@@ -80,8 +80,8 @@ pub struct UploadOptions {
 
 /// Options for `Project::download_object`.
 ///
-/// Negative `offset` reads a suffix. Combining negative offset and positive
-/// length is not supported (Go rule).
+/// Negative `offset` reads a suffix. Combining negative offset and
+/// non-negative length is not supported (Go `NewStreamRange`).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DownloadOptions {
     /// Byte offset. Negative → suffix of the object.
@@ -100,12 +100,12 @@ impl Default for DownloadOptions {
 }
 
 impl DownloadOptions {
-    /// Reject the unsupported Go combination: negative offset + positive length.
+    /// Reject the unsupported Go combination: negative offset + non-negative length.
     pub fn validate(&self) -> Result<()> {
-        if self.offset < 0 && self.length > 0 {
+        if self.offset < 0 && self.length >= 0 {
             return Err(Error::new(
                 ErrorKind::ObjectKeyInvalid,
-                "combining negative offset and positive length is not supported",
+                "suffix requires length to be negative",
             ));
         }
         Ok(())
@@ -291,6 +291,14 @@ mod tests {
         };
         let e = d.validate().unwrap_err();
         assert_eq!(e.kind(), ErrorKind::ObjectKeyInvalid);
+        let zero = DownloadOptions {
+            offset: -10,
+            length: 0,
+        };
+        assert_eq!(
+            zero.validate().unwrap_err().kind(),
+            ErrorKind::ObjectKeyInvalid
+        );
     }
 
     #[test]

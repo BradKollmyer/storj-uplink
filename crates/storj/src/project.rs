@@ -487,15 +487,12 @@ async fn download_single_segment(
             "multi-segment objects are not supported",
         ));
     }
-    let seg = resp
-        .segment_download
-        .into_iter()
-        .next()
-        .ok_or_else(|| Error::new(ErrorKind::Protocol, "DownloadObject missing segment"))?;
-
     let mut info = object_from_proto(resp.object.clone(), key);
-    if seg.plain_size > 0 {
-        info.system.content_length = seg.plain_size;
+    let seg = resp.segment_download.into_iter().next();
+    if let Some(s) = seg.as_ref() {
+        if s.plain_size > 0 {
+            info.system.content_length = s.plain_size;
+        }
     }
     let (mut cipher, mut block_size) = encryption_from_params(
         resp.object
@@ -504,29 +501,29 @@ async fn download_single_segment(
     );
     if let Some(obj) = &resp.object {
         if !obj.encrypted_metadata.is_empty() {
-            if let Ok((meta, custom)) = decrypt_user_data(
+            let (meta, custom) = decrypt_user_data(
                 &obj.encrypted_metadata,
                 &obj.encrypted_metadata_encrypted_key,
                 &obj.encrypted_metadata_nonce,
                 cipher,
                 &content_key,
-            ) {
-                if meta.number_of_segments > 1 {
-                    return Err(Error::new(
-                        ErrorKind::Protocol,
-                        "multi-segment objects are not supported",
-                    ));
-                }
-                if meta.encryption_type != 0 {
-                    cipher = storj_encryption::CipherSuite(meta.encryption_type);
-                }
-                if meta.encryption_block_size > 0 {
-                    if let Ok(b) = usize::try_from(meta.encryption_block_size) {
-                        block_size = b;
-                    }
-                }
-                info.custom = custom.user_defined.into_iter().collect();
+            )
+            .map_err(map_uplink)?;
+            if meta.number_of_segments > 1 {
+                return Err(Error::new(
+                    ErrorKind::Protocol,
+                    "multi-segment objects are not supported",
+                ));
             }
+            if meta.encryption_type != 0 {
+                cipher = storj_encryption::CipherSuite(meta.encryption_type);
+            }
+            if meta.encryption_block_size > 0 {
+                if let Ok(b) = usize::try_from(meta.encryption_block_size) {
+                    block_size = b;
+                }
+            }
+            info.custom = custom.user_defined.into_iter().collect();
         }
     }
 
@@ -536,6 +533,8 @@ async fn download_single_segment(
     if plain_len == 0 {
         return Ok(Download::new(info, Vec::new()));
     }
+    let seg =
+        seg.ok_or_else(|| Error::new(ErrorKind::Protocol, "DownloadObject missing segment"))?;
     let position = seg.position.unwrap_or_default();
     let nonce = content_nonce(position.part_number, position.index);
     let enc_nonce = nonce_from_slice(&seg.encrypted_key_nonce).map_err(map_uplink)?;
@@ -886,6 +885,19 @@ mod tests {
                 DownloadOptions {
                     offset: -10,
                     length: 100,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::ObjectKeyInvalid);
+        let e = placeholder()
+            .download_to(
+                "b",
+                "k",
+                sink(),
+                DownloadOptions {
+                    offset: -10,
+                    length: 0,
                 },
             )
             .await

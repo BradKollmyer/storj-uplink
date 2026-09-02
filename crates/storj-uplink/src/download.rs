@@ -22,13 +22,12 @@ use crate::{Error, Result};
 /// Resolve Go `DownloadOptions` against `object_size` → `(plain_start, plain_len)`.
 ///
 /// Negative `offset` is a suffix (`-n` = last n bytes). Negative `length` means
-/// until EOF. Negative offset with positive length is rejected (Go rule).
-/// Offset at or past EOF fails, except the empty-object `(0, *)` case.
+/// until EOF. Negative offset with non-negative length is rejected (Go
+/// `NewStreamRange`: suffix requires length to be negative). Offset at or past
+/// EOF is an empty range (Go `Normalize` / `NewDownloadRange` clamp).
 pub fn resolve_range(offset: i64, length: i64, object_size: i64) -> Result<(i64, i64)> {
-    if offset < 0 && length > 0 {
-        return Err(Error::protocol(
-            "combining negative offset and positive length is not supported",
-        ));
+    if offset < 0 && length >= 0 {
+        return Err(Error::protocol("suffix requires length to be negative"));
     }
     if object_size < 0 {
         return Err(Error::protocol("object size is negative"));
@@ -42,31 +41,23 @@ pub fn resolve_range(offset: i64, length: i64, object_size: i64) -> Result<(i64,
         };
         return Ok((start, object_size - start));
     }
-    if object_size == 0 {
-        if offset != 0 {
-            return Err(Error::protocol(
-                "download offset is beyond the end of the object",
-            ));
-        }
-        return Ok((0, 0));
-    }
-    if offset >= object_size {
-        return Err(Error::protocol(
-            "download offset is beyond the end of the object",
-        ));
-    }
+    // Go: if start > size { start = size }; shrink length to remaining.
+    let start = offset.min(object_size);
     let end = if length < 0 {
         object_size
     } else {
-        offset.saturating_add(length).min(object_size)
+        start.saturating_add(length).min(object_size)
     };
-    Ok((offset, end.saturating_sub(offset)))
+    Ok((start, end.saturating_sub(start)))
 }
 
 /// Protobuf `Range` for `DownloadObjectRequest` (None = whole object).
 #[must_use]
 pub fn proto_range(offset: i64, length: i64) -> Option<Range> {
     if offset < 0 {
+        if length >= 0 {
+            return None;
+        }
         return Some(Range {
             range: Some(range::Range::Suffix(RangeSuffix {
                 plain_suffix: offset.saturating_neg(),
@@ -408,9 +399,11 @@ mod tests {
         assert_eq!(resolve_range(-100, -1, 11).unwrap(), (0, 11));
         assert_eq!(resolve_range(0, 0, 11).unwrap(), (0, 0));
         assert_eq!(resolve_range(0, -1, 0).unwrap(), (0, 0));
-        assert!(resolve_range(11, -1, 11).is_err());
-        assert!(resolve_range(1, -1, 0).is_err());
+        assert_eq!(resolve_range(11, -1, 11).unwrap(), (11, 0));
+        assert_eq!(resolve_range(100, 5, 11).unwrap(), (11, 0));
+        assert_eq!(resolve_range(1, -1, 0).unwrap(), (0, 0));
         assert!(resolve_range(-4, 2, 11).is_err());
+        assert!(resolve_range(-4, 0, 11).is_err());
     }
 
     #[test]
@@ -428,6 +421,8 @@ mod tests {
             proto_range(-7, -1).unwrap().range,
             Some(range::Range::Suffix(_))
         ));
+        assert!(proto_range(-7, 0).is_none());
+        assert!(proto_range(-7, 3).is_none());
     }
 
     #[test]

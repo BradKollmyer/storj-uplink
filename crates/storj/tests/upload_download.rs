@@ -124,6 +124,37 @@ async fn ranged_download() {
     let mut tail = Vec::new();
     suffix.read_to_end(&mut tail).await.unwrap();
     assert_eq!(tail, &payload[payload.len() - 8..]);
+
+    let mut at_eof = project
+        .download_object(
+            &bucket,
+            "bytes.bin",
+            DownloadOptions {
+                offset: payload.len() as i64,
+                length: -1,
+            },
+        )
+        .await
+        .expect("offset at EOF is empty, not an error");
+    assert_eq!(at_eof.info().system.content_length, payload.len() as i64);
+    let mut empty = Vec::new();
+    at_eof.read_to_end(&mut empty).await.unwrap();
+    assert!(empty.is_empty());
+
+    let mut past_eof = project
+        .download_object(
+            &bucket,
+            "bytes.bin",
+            DownloadOptions {
+                offset: payload.len() as i64 + 50,
+                length: 10,
+            },
+        )
+        .await
+        .expect("offset past EOF is empty, not an error");
+    empty.clear();
+    past_eof.read_to_end(&mut empty).await.unwrap();
+    assert!(empty.is_empty());
 }
 
 #[tokio::test]
@@ -191,6 +222,14 @@ async fn ranged_download_rejects_go_unsupported_combo() {
     };
     assert_eq!(
         opts.validate().unwrap_err().kind(),
+        ErrorKind::ObjectKeyInvalid
+    );
+    let zero = DownloadOptions {
+        offset: -10,
+        length: 0,
+    };
+    assert_eq!(
+        zero.validate().unwrap_err().kind(),
         ErrorKind::ObjectKeyInvalid
     );
 }
@@ -309,6 +348,29 @@ async fn set_custom_metadata_at_commit() {
         download.info().custom.get("app:title").map(String::as_str),
         Some("hi")
     );
+}
+
+#[tokio::test]
+async fn corrupt_metadata_fails_download() {
+    let mock = MockSatellite::start().await;
+    let project = open_project(&mock).await;
+    let bucket = unique("badmeta");
+    project.ensure_bucket(&bucket).await.unwrap();
+    let mut upload = project
+        .upload_object(&bucket, "m", Default::default())
+        .await
+        .unwrap();
+    upload.write_all(b"x").await.unwrap();
+    upload.commit().await.unwrap();
+    mock.corrupt_encrypted_metadata();
+    let err = match project
+        .download_object(&bucket, "m", Default::default())
+        .await
+    {
+        Ok(_) => panic!("corrupt metadata must fail the download"),
+        Err(e) => e,
+    };
+    assert_eq!(err.kind(), ErrorKind::DecryptionFailed);
 }
 
 #[tokio::test]
