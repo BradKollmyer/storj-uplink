@@ -15,9 +15,9 @@ use storj_proto::metainfo::{
     FinishDeleteObjectRequest, FinishDeleteObjectResponse, GetBucketRequest, GetBucketResponse,
     ListBucketsRequest, ListBucketsResponse, ListDirection, ListSegmentsRequest,
     ListSegmentsResponse, MakeInlineSegmentRequest, MakeInlineSegmentResponse,
-    Object as ProtoObject, ProjectInfoRequest, ProjectInfoResponse, RequestHeader,
+    Object as ProtoObject, ProjectInfoRequest, ProjectInfoResponse, Range, RequestHeader,
     RetryBeginSegmentPiecesRequest, RetryBeginSegmentPiecesResponse, SegmentListItem,
-    SegmentPosition, batch_request_item, batch_response_item, cohort_requirements,
+    SegmentPosition, batch_request_item, batch_response_item, cohort_requirements, range,
 };
 use storj_proto::node::NodeAddress;
 use storj_proto::orders::{OrderLimit, PieceAction};
@@ -26,6 +26,7 @@ use storj_proto::rpc;
 use storj_proto::{decode_batch_request, encode_batch_response};
 use storj_rpc::tls::server_config;
 use storj_rpc::{Conn, Identity, Kind, Packet, marshal_error, read_tls_mux_prefix};
+use storj_uplink::download::{resolve_range, segment_plain_range};
 use storj_uplink::orders::{PiecePrivateKey, sign_order_limit};
 
 use crate::mock_sn::MockStorageNode;
@@ -942,7 +943,17 @@ fn download_object(
     let piece_key = st.piece_key.clone();
     drop(st);
 
-    let (items, downloads) = build_segment_views(&obj, &segments, sns, identity, &piece_key)?;
+    let total: i64 = segments.iter().map(|s| s.plain_size).sum();
+    let window = resolve_mock_range(req.range.as_ref(), total)?;
+    let (items, downloads) = build_segment_views(
+        &obj,
+        &segments,
+        sns,
+        identity,
+        &piece_key,
+        Some(window),
+        true,
+    )?;
     Ok(DownloadObjectResponse {
         object: Some(obj.clone()),
         segment_list: Some(ListSegmentsResponse {
@@ -977,7 +988,8 @@ fn download_segment(
         .iter()
         .position(|s| s.position.part_number == want.part_number && s.position.index == want.index)
         .ok_or_else(|| (RPC_NOT_FOUND, "segment not found".into()))?;
-    let (_, downloads) = build_segment_views(&obj, &segments, sns, identity, &piece_key)?;
+    let (_, downloads) =
+        build_segment_views(&obj, &segments, sns, identity, &piece_key, None, false)?;
     downloads
         .into_iter()
         .nth(idx)
@@ -999,14 +1011,21 @@ fn list_segments(
     let segments = committed.segments.clone();
     drop(st);
 
-    let cursor = req.cursor_position.unwrap_or_default();
+    let total: i64 = segments.iter().map(|s| s.plain_size).sum();
+    let window = resolve_mock_range(req.range.as_ref(), total)?;
     let mut offset = 0i64;
     let mut items = Vec::new();
     for seg in &segments {
-        let after_cursor = seg.position.part_number > cursor.part_number
-            || (seg.position.part_number == cursor.part_number
-                && seg.position.index >= cursor.index);
-        if after_cursor {
+        let after_cursor = match req.cursor_position {
+            None => true,
+            Some(cursor) => {
+                seg.position.part_number > cursor.part_number
+                    || (seg.position.part_number == cursor.part_number
+                        && seg.position.index > cursor.index)
+            }
+        };
+        let (_, overlap) = segment_plain_range(window.0, window.1, offset, seg.plain_size);
+        if after_cursor && overlap > 0 {
             items.push(SegmentListItem {
                 position: Some(seg.position),
                 plain_size: seg.plain_size,
@@ -1025,12 +1044,29 @@ fn list_segments(
     })
 }
 
+fn resolve_mock_range(
+    range: Option<&Range>,
+    object_size: i64,
+) -> Result<(i64, i64), (u64, String)> {
+    let (offset, length) = match range.and_then(|r| r.range.as_ref()) {
+        None => return Ok((0, object_size)),
+        Some(range::Range::Start(s)) => (s.plain_start, -1),
+        Some(range::Range::StartLimit(s)) => {
+            (s.plain_start, s.plain_limit.saturating_sub(s.plain_start))
+        }
+        Some(range::Range::Suffix(s)) => (-s.plain_suffix, -1),
+    };
+    resolve_range(offset, length, object_size).map_err(|e| (RPC_INVALID_ARGUMENT, e.to_string()))
+}
+
 fn build_segment_views(
     obj: &ProtoObject,
     segments: &[StoredSegment],
     sns: &[Arc<MockStorageNode>],
     identity: &Identity,
     piece_key: &[u8],
+    window: Option<(i64, i64)>,
+    first_download_only: bool,
 ) -> Result<(Vec<SegmentListItem>, Vec<DownloadSegmentResponse>), (u64, String)> {
     let pk = PiecePrivateKey::from_bytes(piece_key)
         .map_err(|e| (RPC_INVALID_ARGUMENT, e.to_string()))?;
@@ -1039,17 +1075,25 @@ fn build_segment_views(
     let mut offset = 0i64;
     for (i, seg) in segments.iter().enumerate() {
         let next = segments.get(i + 1).map(|s| s.position);
-        items.push(SegmentListItem {
-            position: Some(seg.position),
-            plain_size: seg.plain_size,
-            plain_offset: offset,
-            encrypted_key_nonce: seg.encrypted_key_nonce.clone(),
-            encrypted_key: seg.encrypted_key.clone(),
-            ..Default::default()
-        });
-        downloads.push(segment_download(
-            obj, seg, offset, next, sns, identity, piece_key, &pk,
-        )?);
+        let in_window = match window {
+            None => true,
+            Some((start, len)) => segment_plain_range(start, len, offset, seg.plain_size).1 > 0,
+        };
+        if in_window {
+            items.push(SegmentListItem {
+                position: Some(seg.position),
+                plain_size: seg.plain_size,
+                plain_offset: offset,
+                encrypted_key_nonce: seg.encrypted_key_nonce.clone(),
+                encrypted_key: seg.encrypted_key.clone(),
+                ..Default::default()
+            });
+            if !first_download_only || downloads.is_empty() {
+                downloads.push(segment_download(
+                    obj, seg, offset, next, sns, identity, piece_key, &pk,
+                )?);
+            }
+        }
         offset += seg.plain_size;
     }
     Ok((items, downloads))

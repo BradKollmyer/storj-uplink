@@ -568,13 +568,14 @@ impl MetainfoClient {
         key: &str,
         stream_id: Vec<u8>,
         cursor: Option<SegmentPosition>,
+        range: Option<Range>,
     ) -> Result<metainfo::ListSegmentsResponse> {
         let req = ListSegmentsRequest {
             header: Some(self.header()),
             stream_id,
             cursor_position: cursor,
             limit: 0,
-            range: None,
+            range,
         };
         let items = self
             .compressed_batch(

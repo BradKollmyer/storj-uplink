@@ -476,8 +476,7 @@ async fn download_segments(
     opts: DownloadOptions,
     resp: storj_proto::metainfo::DownloadObjectResponse,
 ) -> Result<Download> {
-    use storj_proto::metainfo::SegmentPosition;
-    use storj_uplink::download::{resolve_range, segment_plain_range};
+    use storj_uplink::download::{proto_range, resolve_range, segment_plain_range};
     use storj_uplink::pipeline::decrypt_user_data;
 
     let stream_id = resp
@@ -515,18 +514,12 @@ async fn download_segments(
 
     let mut list = resp.segment_list.unwrap_or_default();
     let mut downloaded = resp.segment_download;
+    let list_range = proto_range(opts.offset, opts.length);
     while list.more {
-        let cursor = list
-            .items
-            .last()
-            .and_then(|i| i.position)
-            .map(|p| SegmentPosition {
-                part_number: p.part_number,
-                index: p.index + 1,
-            });
+        let cursor = list.items.last().and_then(|i| i.position);
         let page = project
             .metainfo
-            .list_segments(bucket, key, stream_id.clone(), cursor)
+            .list_segments(bucket, key, stream_id.clone(), cursor, list_range)
             .await?;
         if page.items.is_empty() {
             break;
@@ -594,6 +587,13 @@ async fn download_segments(
             )
             .await?,
         );
+    }
+    let want = usize::try_from(plain_len).unwrap_or(usize::MAX);
+    if plaintext.len() != want {
+        return Err(Error::new(
+            ErrorKind::Protocol,
+            "download missing segment data",
+        ));
     }
     Ok(Download::new(info, plaintext))
 }
@@ -969,19 +969,25 @@ async fn abort_pending(pending: PendingAbort) -> Result<()> {
 }
 
 pub(crate) async fn abort_upload(inner: UploadInner) -> Result<()> {
-    let _ = inner
-        .project
+    let UploadInner {
+        project,
+        bucket,
+        encrypted_object_key,
+        stream_id,
+        pending_flush,
+        ..
+    } = inner;
+    if let Some(handle) = pending_flush {
+        handle.abort();
+        let _ = handle.await;
+    }
+    let _ = project
         .metainfo
-        .begin_delete_object(
-            &inner.bucket,
-            inner.encrypted_object_key,
-            inner.stream_id.clone(),
-        )
+        .begin_delete_object(&bucket, encrypted_object_key, stream_id.clone())
         .await?;
-    inner
-        .project
+    project
         .metainfo
-        .finish_delete_object(&inner.bucket, inner.stream_id)
+        .finish_delete_object(&bucket, stream_id)
         .await
 }
 
