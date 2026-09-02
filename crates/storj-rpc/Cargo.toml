@@ -11,6 +11,13 @@ publish = false
 [dependencies]
 thiserror.workspace = true
 tokio.workspace = true
+sha2.workspace = true
+bs58.workspace = true
+p256.workspace = true
+rcgen.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true
+x509-parser.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util"] }

@@ -1,7 +1,8 @@
 //! Unary DRPC invoke over generic `AsyncRead + AsyncWrite`.
 //!
-//! No TLS here (PR 9b). One in-flight RPC per connection is a **pool**
-//! invariant, not a wire rule: frames still carry `stream_id`.
+//! TLS/NodeID pinning lives in [`crate::tls`]. One in-flight RPC per
+//! connection is a **pool** invariant, not a wire rule: frames still carry
+//! `stream_id`.
 
 use std::io;
 
