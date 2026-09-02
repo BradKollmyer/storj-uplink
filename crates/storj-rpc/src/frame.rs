@@ -359,6 +359,11 @@ impl PacketAssembler {
         }
         Ok(None)
     }
+
+    /// True while a not-done packet is buffered. EOF in that state is truncated.
+    pub(crate) fn in_progress(&self) -> bool {
+        self.current.is_some()
+    }
 }
 
 /// Decode a remote `Kind::ERROR` payload (8-byte BE code + message).

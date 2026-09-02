@@ -35,6 +35,14 @@ pub enum Error {
     /// Packet kind was not a message, error, or close.
     #[error("unexpected DRPC packet kind {0}")]
     UnexpectedKind(Kind),
+    /// Packet arrived for a stream other than the in-flight RPC.
+    #[error("unexpected DRPC stream id {got} (expected {expected})")]
+    UnexpectedStream {
+        /// Stream id on the packet.
+        got: u64,
+        /// Stream id of the in-flight invoke.
+        expected: u64,
+    },
     /// First 8 bytes were not [`DRPC_TLS_MUX_PREFIX`].
     #[error("DRPC mux prefix mismatch (want DRPC!!!1, got {got:?})")]
     MuxPrefix {
@@ -46,9 +54,10 @@ pub enum Error {
     Io(#[from] io::Error),
 }
 
-/// Write `DRPC!!!1` (`drpcmigrate.DRPCHeader`) to `w`.
+/// Write `DRPC!!!1` (`drpcmigrate.DRPCHeader`) to `w` and flush.
 pub async fn write_tls_mux_prefix<W: AsyncWrite + Unpin>(w: &mut W) -> io::Result<()> {
-    w.write_all(DRPC_TLS_MUX_PREFIX).await
+    w.write_all(DRPC_TLS_MUX_PREFIX).await?;
+    w.flush().await
 }
 
 /// Read 8 bytes and require them to equal [`DRPC_TLS_MUX_PREFIX`].
@@ -106,7 +115,13 @@ impl<T: AsyncWrite + Unpin> Conn<T> {
             packet.control,
             &packet.data,
         )
-        .await
+        .await?;
+        self.flush().await
+    }
+
+    async fn flush(&mut self) -> Result<(), Error> {
+        self.io.flush().await?;
+        Ok(())
     }
 
     async fn write_packet_data(
@@ -177,7 +192,8 @@ impl<T: AsyncRead + Unpin> Conn<T> {
         let mut tmp = [0u8; 4096];
         let n = self.io.read(&mut tmp).await?;
         if n == 0 {
-            if self.buf.is_empty() {
+            // Partial frame bytes, or a not-done packet still in the assembler.
+            if self.buf.is_empty() && !self.assembler.in_progress() {
                 return Err(Error::Closed);
             }
             return Err(Error::Truncated);
@@ -206,6 +222,9 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Conn<T> {
         message_id += 1;
         self.write_packet_data(stream_id, message_id, Kind::CLOSE_SEND, false, &[])
             .await?;
+        // One flush for the corked Invoke+Message+CloseSend burst (Go flushes on
+        // CloseSend / MsgRecv; TlsStream will not emit records without this).
+        self.flush().await?;
 
         loop {
             let pkt = self.read_packet().await?;
@@ -213,10 +232,20 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Conn<T> {
                 if pkt.stream_id < stream_id {
                     continue;
                 }
-                return Err(Error::UnexpectedKind(pkt.kind));
+                return Err(Error::UnexpectedStream {
+                    got: pkt.stream_id,
+                    expected: stream_id,
+                });
             }
             match pkt.kind {
-                Kind::MESSAGE => return Ok(pkt.data),
+                Kind::MESSAGE => {
+                    // Go `defer stream.Close()` after MsgRecv.
+                    message_id += 1;
+                    self.write_packet_data(stream_id, message_id, Kind::CLOSE, false, &[])
+                        .await?;
+                    self.flush().await?;
+                    return Ok(pkt.data);
+                }
                 Kind::ERROR => {
                     let (code, message) = unmarshal_error(&pkt.data);
                     return Err(Error::Remote { code, message });
@@ -247,30 +276,16 @@ mod tests {
         }
     }
 
-    async fn echo_unary<T: AsyncRead + AsyncWrite + Unpin>(
-        mut server: Conn<T>,
+    async fn echo_one<T: AsyncRead + AsyncWrite + Unpin>(
+        server: &mut Conn<T>,
     ) -> Result<(), Error> {
-        let mut request = None;
-        let mut stream_id = 1;
-        loop {
+        let (stream_id, body) = loop {
             let pkt = server.read_packet().await?;
-            if pkt.kind == Kind::INVOKE {
-                stream_id = pkt.stream_id;
-                continue;
-            }
             if pkt.kind == Kind::MESSAGE {
-                request = Some(pkt.data);
-                stream_id = pkt.stream_id;
-                break;
+                break (pkt.stream_id, pkt.data);
             }
-            if pkt.kind == Kind::CLOSE_SEND {
-                break;
-            }
-            if pkt.control {
-                continue;
-            }
-        }
-        let body = request.ok_or(Error::Closed)?;
+            // Skip Invoke and leftover Close/CloseSend from a previous stream.
+        };
         server
             .write_packet(&Packet {
                 stream_id,
@@ -290,6 +305,89 @@ mod tests {
             })
             .await?;
         Ok(())
+    }
+
+    async fn drain_until_closed<T: AsyncRead + Unpin>(server: &mut Conn<T>) -> Result<(), Error> {
+        loop {
+            match server.read_packet().await {
+                Ok(_) => {}
+                Err(Error::Closed | Error::Truncated) => return Ok(()),
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    async fn echo_unary<T: AsyncRead + AsyncWrite + Unpin>(
+        mut server: Conn<T>,
+    ) -> Result<(), Error> {
+        echo_one(&mut server).await?;
+        // Stay up so the client can write Kind::CLOSE (Go defer stream.Close).
+        drain_until_closed(&mut server).await
+    }
+
+    #[tokio::test]
+    async fn invoke_writes_invoke_message_closesend() {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let client = tokio::spawn(async move {
+            let mut client = Conn::new(client_io);
+            client.invoke("/echo.Echo/Ping", b"hello").await
+        });
+
+        let mut server = Conn::new(server_io);
+        let invoke = server.read_packet().await.unwrap();
+        assert_eq!(invoke.kind, Kind::INVOKE);
+        assert_eq!(invoke.stream_id, 1);
+        assert_eq!(invoke.message_id, 1);
+        assert_eq!(invoke.data, b"/echo.Echo/Ping");
+
+        let msg = server.read_packet().await.unwrap();
+        assert_eq!(msg.kind, Kind::MESSAGE);
+        assert_eq!(msg.stream_id, 1);
+        assert_eq!(msg.message_id, 2);
+        assert_eq!(msg.data, b"hello");
+
+        let close_send = server.read_packet().await.unwrap();
+        assert_eq!(close_send.kind, Kind::CLOSE_SEND);
+        assert_eq!(close_send.stream_id, 1);
+        assert_eq!(close_send.message_id, 3);
+        assert!(close_send.data.is_empty());
+
+        server
+            .write_packet(&Packet {
+                stream_id: 1,
+                message_id: 1,
+                kind: Kind::MESSAGE,
+                control: false,
+                data: b"hello".to_vec(),
+            })
+            .await
+            .unwrap();
+
+        let out = client.await.unwrap().unwrap();
+        assert_eq!(out, b"hello");
+
+        let close = server.read_packet().await.unwrap();
+        assert_eq!(close.kind, Kind::CLOSE);
+        assert_eq!(close.stream_id, 1);
+        assert_eq!(close.message_id, 4);
+        assert!(close.data.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sequential_invoke_skips_previous_stream_close() {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(async move {
+            let mut server = Conn::new(server_io);
+            echo_one(&mut server).await?;
+            echo_one(&mut server).await?;
+            drain_until_closed(&mut server).await
+        });
+
+        let mut client = Conn::new(client_io);
+        assert_eq!(client.invoke("/echo/A", b"one").await.unwrap(), b"one");
+        assert_eq!(client.invoke("/echo/B", b"two").await.unwrap(), b"two");
+        drop(client);
+        server.await.unwrap().unwrap();
     }
 
     #[tokio::test]
@@ -377,6 +475,58 @@ mod tests {
         drop(a);
         let err = Conn::new(b).read_packet().await.unwrap_err();
         assert!(matches!(err, Error::Closed));
+    }
+
+    #[tokio::test]
+    async fn truncated_mid_packet_is_error() {
+        let (mut a, b) = tokio::io::duplex(1024);
+        let mut wire = Vec::new();
+        append_frame(
+            &mut wire,
+            &Frame {
+                stream_id: 1,
+                message_id: 1,
+                kind: Kind::MESSAGE,
+                done: false,
+                control: false,
+                data: b"ab".to_vec(),
+            },
+        );
+        a.write_all(&wire).await.unwrap();
+        drop(a);
+        let err = Conn::new(b).read_packet().await.unwrap_err();
+        assert!(matches!(err, Error::Truncated));
+    }
+
+    #[tokio::test]
+    async fn unexpected_stream_id_is_not_unexpected_kind() {
+        let (mut a, b) = tokio::io::duplex(1024);
+        let mut wire = Vec::new();
+        append_frame(
+            &mut wire,
+            &Frame {
+                stream_id: 9,
+                message_id: 1,
+                kind: Kind::MESSAGE,
+                done: true,
+                control: false,
+                data: b"x".to_vec(),
+            },
+        );
+        a.write_all(&wire).await.unwrap();
+
+        let client = tokio::spawn(async move {
+            let mut client = Conn::new(b);
+            client.invoke("/x/Y", b"").await
+        });
+        let err = client.await.unwrap().unwrap_err();
+        match err {
+            Error::UnexpectedStream { got, expected } => {
+                assert_eq!(got, 9);
+                assert_eq!(expected, 1);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
     }
 
     #[tokio::test]
