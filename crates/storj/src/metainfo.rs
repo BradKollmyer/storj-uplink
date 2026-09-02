@@ -15,9 +15,10 @@ use storj_proto::metainfo::{
     self, BatchRequest, BatchRequestItem, BeginDeleteObjectRequest, BeginObjectRequest,
     BeginSegmentRequest, CommitObjectRequest, CommitSegmentRequest, CompressedBatchResponse,
     CreateBucketRequest, DeleteBucketRequest, DownloadObjectRequest, DownloadSegmentRequest,
-    FinishDeleteObjectRequest, GetBucketRequest, ListBucketsRequest, ListSegmentsRequest,
-    MakeInlineSegmentRequest, ProjectInfoRequest, ProjectInfoResponse, Range, RequestHeader,
-    RetryBeginSegmentPiecesRequest, SegmentPosition, batch_request_item, batch_response_item,
+    FinishDeleteObjectRequest, GetBucketRequest, ListBucketsRequest, ListObjectsRequest,
+    ListSegmentsRequest, MakeInlineSegmentRequest, ProjectInfoRequest, ProjectInfoResponse, Range,
+    RequestHeader, RetryBeginSegmentPiecesRequest, SegmentPosition, batch_request_item,
+    batch_response_item,
 };
 use storj_proto::rpc;
 use storj_rpc::tls::client_config;
@@ -591,6 +592,78 @@ impl MetainfoClient {
             _ => Err(Error::new(
                 ErrorKind::Protocol,
                 "unexpected ListSegments response",
+            )),
+        }
+    }
+
+    pub(crate) async fn list_all_segments(
+        &self,
+        bucket: &str,
+        key: &str,
+        stream_id: Vec<u8>,
+    ) -> Result<metainfo::ListSegmentsResponse> {
+        let mut out = self
+            .list_segments(bucket, key, stream_id.clone(), None, None)
+            .await?;
+        while out.more {
+            let cursor = out.items.last().and_then(|i| i.position);
+            let page = self
+                .list_segments(bucket, key, stream_id.clone(), cursor, None)
+                .await?;
+            if page.items.is_empty() {
+                break;
+            }
+            out.more = page.more;
+            if out.encryption_parameters.is_none() {
+                out.encryption_parameters = page.encryption_parameters;
+            }
+            out.items.extend(page.items);
+        }
+        Ok(out)
+    }
+
+    pub(crate) async fn list_pending_uploads(
+        &self,
+        bucket: &str,
+        encrypted_prefix: Vec<u8>,
+        encrypted_cursor: Vec<u8>,
+        opts: &crate::types::ListUploadsOptions,
+    ) -> Result<metainfo::ListObjectsResponse> {
+        let req = ListObjectsRequest {
+            header: Some(self.header()),
+            bucket: bucket.as_bytes().to_vec(),
+            delimiter: if opts.recursive {
+                Vec::new()
+            } else {
+                b"/".to_vec()
+            },
+            encrypted_prefix,
+            encrypted_cursor,
+            recursive: opts.recursive,
+            limit: 0,
+            status: metainfo::object::Status::Uploading as i32,
+            object_includes: Some(metainfo::ObjectListItemIncludes {
+                metadata: opts.custom,
+                exclude_system_metadata: !opts.system,
+                ..Default::default()
+            }),
+            use_object_includes: true,
+            ..Default::default()
+        };
+        let items = self
+            .compressed_batch(
+                vec![BatchRequestItem {
+                    request: Some(batch_request_item::Request::ObjectList(req)),
+                }],
+                bucket,
+                "",
+            )
+            .await?;
+        match Self::expect_one(items, "ListObjects")? {
+            batch_response_item::Response::ObjectList(r) => Ok(r),
+            _ => Err(Error::new(
+                ErrorKind::Protocol,
+                "unexpected ListObjects response",
             )),
         }
     }

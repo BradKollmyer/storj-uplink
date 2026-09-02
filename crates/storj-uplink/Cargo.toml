@@ -9,6 +9,7 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+storj-access.workspace = true
 storj-ec.workspace = true
 storj-encryption.workspace = true
 storj-proto.workspace = true
