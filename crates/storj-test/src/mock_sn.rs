@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use prost::Message;
+use storj_proto::orders::OrderLimit;
 use storj_proto::piecestore::{
     PieceDownloadRequest, PieceDownloadResponse, PieceUploadRequest, PieceUploadResponse,
     piece_download_response,
@@ -13,7 +14,8 @@ use storj_proto::rpc::{PIECESTORE_DOWNLOAD, PIECESTORE_UPLOAD};
 use storj_rpc::tls::server_config;
 use storj_rpc::{Conn, Identity, Kind, Packet, read_tls_mux_prefix};
 use storj_uplink::orders::{
-    PieceHashAlgo, PieceHasher, PiecePublicKey, sign_piece_hash_node, verify_order_limit,
+    PieceHashAlgo, PieceHasher, PiecePublicKey, sign_piece_hash_node, verify_order,
+    verify_order_limit, verify_piece_hash_uplink,
 };
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
@@ -34,7 +36,7 @@ pub struct MockStorageNode {
 
 impl MockStorageNode {
     /// Bind `127.0.0.1:0` and serve piecestore over TLS.
-    pub async fn start(satellite_ca: Vec<u8>) -> Self {
+    pub async fn start(satellite_cert: Vec<u8>) -> Self {
         let identity = Identity::generate().expect("mock SN identity");
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -60,7 +62,7 @@ impl MockStorageNode {
                 };
                 let acceptor = acceptor.clone();
                 let sn = sn.clone();
-                let sat_ca = satellite_ca.clone();
+                let sat_cert = satellite_cert.clone();
                 let delay = Arc::clone(&delay_c);
                 let fail_next = Arc::clone(&fail_c);
                 let fail_next_download = Arc::clone(&fail_dl_c);
@@ -70,7 +72,7 @@ impl MockStorageNode {
                         tcp,
                         acceptor,
                         sn,
-                        sat_ca,
+                        sat_cert,
                         delay,
                         fail_next,
                         fail_next_download,
@@ -128,7 +130,7 @@ async fn serve_conn(
     mut tcp: TcpStream,
     acceptor: TlsAcceptor,
     sn: Identity,
-    satellite_ca: Vec<u8>,
+    satellite_cert: Vec<u8>,
     delay: Arc<Mutex<Duration>>,
     fail_next: Arc<Mutex<bool>>,
     fail_next_download: Arc<Mutex<bool>>,
@@ -153,7 +155,7 @@ async fn serve_conn(
                     &mut conn,
                     invoke.stream_id,
                     &sn,
-                    &satellite_ca,
+                    &satellite_cert,
                     &delay,
                     &fail_next,
                     &store,
@@ -164,7 +166,7 @@ async fn serve_conn(
                 serve_download(
                     &mut conn,
                     invoke.stream_id,
-                    &satellite_ca,
+                    &satellite_cert,
                     &fail_next_download,
                     &store,
                 )
@@ -182,15 +184,18 @@ async fn serve_upload(
     conn: &mut Conn<tokio_rustls::server::TlsStream<TcpStream>>,
     stream_id: u64,
     sn: &Identity,
-    satellite_ca: &[u8],
+    satellite_cert: &[u8],
     delay: &Mutex<Duration>,
     fail_next: &Mutex<bool>,
     store: &Mutex<HashMap<Vec<u8>, Vec<u8>>>,
 ) -> Result<(), storj_uplink::Error> {
-    let mut limit = None;
+    let mut limit: Option<OrderLimit> = None;
     let mut algo = PieceHashAlgo::Blake3;
     let mut data = Vec::new();
     let mut done = None;
+    // Largest signed order amount so far; every chunk must be covered by it
+    // (Go storagenode rejects data beyond the ordered amount).
+    let mut ordered: i64 = 0;
     loop {
         let pkt = conn.read_packet().await?;
         if pkt.stream_id != stream_id {
@@ -200,11 +205,34 @@ async fn serve_upload(
             Kind::MESSAGE => {
                 let req = PieceUploadRequest::decode(pkt.data.as_slice())?;
                 if let Some(l) = req.limit {
-                    verify_order_limit(&l, satellite_ca)?;
+                    verify_order_limit(&l, satellite_cert)?;
                     algo = PieceHashAlgo::from_i32(req.hash_algorithm);
                     limit = Some(l);
                 }
+                if let Some(order) = req.order {
+                    let l = limit
+                        .as_ref()
+                        .ok_or_else(|| storj_uplink::Error::protocol("order before limit"))?;
+                    let pk = PiecePublicKey::from_bytes(&l.uplink_public_key)?;
+                    verify_order(&order, &pk)?;
+                    if order.serial_number != l.serial_number {
+                        return Err(storj_uplink::Error::protocol("order serial mismatch"));
+                    }
+                    if order.amount > l.limit {
+                        return Err(storj_uplink::Error::protocol("order exceeds limit"));
+                    }
+                    ordered = ordered.max(order.amount);
+                }
                 if let Some(chunk) = req.chunk {
+                    let end = chunk
+                        .offset
+                        .checked_add(i64::try_from(chunk.data.len()).unwrap_or(i64::MAX))
+                        .unwrap_or(i64::MAX);
+                    if end > ordered {
+                        return Err(storj_uplink::Error::protocol(format!(
+                            "chunk end {end} exceeds ordered amount {ordered}"
+                        )));
+                    }
                     let off = usize::try_from(chunk.offset).unwrap_or(0);
                     if off == data.len() {
                         data.extend_from_slice(&chunk.data);
@@ -245,10 +273,16 @@ async fn serve_upload(
     let mut hasher = PieceHasher::new(algo);
     hasher.update(&data);
     let digest = hasher.finalize();
-    if let Ok(pk) = PiecePublicKey::from_bytes(&limit.uplink_public_key) {
-        let _ = pk;
-        let _ = digest;
+    // Like a real node: the uplink's hash must match what we received and be
+    // signed by the piece key from the limit.
+    if uplink_done.hash != digest.as_slice() {
+        return Err(storj_uplink::Error::protocol("uplink piece hash mismatch"));
     }
+    if uplink_done.piece_size != i64::try_from(data.len()).unwrap_or(i64::MAX) {
+        return Err(storj_uplink::Error::protocol("uplink piece size mismatch"));
+    }
+    let pk = PiecePublicKey::from_bytes(&limit.uplink_public_key)?;
+    verify_piece_hash_uplink(&uplink_done, &pk)?;
     store.lock().await.insert(limit.piece_id.clone(), data);
     let mut sn_hash = storj_proto::orders::PieceHash {
         piece_id: limit.piece_id,
@@ -277,7 +311,7 @@ async fn serve_upload(
 async fn serve_download(
     conn: &mut Conn<tokio_rustls::server::TlsStream<TcpStream>>,
     stream_id: u64,
-    satellite_ca: &[u8],
+    satellite_cert: &[u8],
     fail_next: &Mutex<bool>,
     store: &Mutex<HashMap<Vec<u8>, Vec<u8>>>,
 ) -> Result<(), storj_uplink::Error> {
@@ -301,7 +335,7 @@ async fn serve_download(
             Kind::MESSAGE => {
                 let req = PieceDownloadRequest::decode(pkt.data.as_slice())?;
                 if let Some(l) = req.limit {
-                    verify_order_limit(&l, satellite_ca)?;
+                    verify_order_limit(&l, satellite_cert)?;
                     limit = Some(l);
                 }
                 if let Some(c) = req.chunk {

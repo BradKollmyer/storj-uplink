@@ -1,0 +1,7 @@
+# The pinned `aes`/`polyval` (RustCrypto 0.8/0.10 line) only use ARMv8 AES and
+# PMULL instructions when these cfgs are set; without them AES-GCM runs in
+# software on Apple Silicon / Graviton (~10x slower). x86_64 autodetects AES-NI.
+# Downstream builds must set the same cfgs (or copy this file) to get the fast
+# path; see README "Build".
+[target.'cfg(target_arch = "aarch64")']
+rustflags = ["--cfg", "aes_armv8", "--cfg", "polyval_armv8"]

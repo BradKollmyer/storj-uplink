@@ -42,9 +42,6 @@ pub enum IdentityError {
     /// Certificate parse, chain, or generation failure.
     #[error("{0}")]
     Certificate(String),
-    /// Generated identity is required for CA signing (PEM loads have no CA key).
-    #[error("identity has no CA private key")]
-    NoCaKey,
     /// ECDSA signature over SHA-256 digest did not verify.
     #[error("invalid signature")]
     Signature,
@@ -134,8 +131,6 @@ pub struct Identity {
     leaf: CertificateDer<'static>,
     ca: CertificateDer<'static>,
     key_pkcs8: Vec<u8>,
-    /// PKCS#8 of the CA key; present for [`Self::generate`], not PEM loads.
-    ca_key_pkcs8: Option<Vec<u8>>,
 }
 
 impl Identity {
@@ -183,7 +178,6 @@ impl Identity {
             leaf: leaf_der,
             ca: ca_der,
             key_pkcs8: leaf_key.serialize_der(),
-            ca_key_pkcs8: Some(ca_key.serialize_der()),
         })
     }
 
@@ -246,32 +240,35 @@ impl Identity {
             leaf,
             ca,
             key_pkcs8,
-            ca_key_pkcs8: None,
         })
     }
 
-    /// SHA-256 digest + ECDSA P-256 (Go `pkcrypto.HashAndSign`) using the CA key.
+    /// SHA-256 digest + ECDSA P-256 (Go `pkcrypto.HashAndSign`) using the
+    /// leaf key: Go `signing.SignerFromFullIdentity` signs with
+    /// `FullIdentity.Key`, the key paired with the leaf certificate.
     pub fn hash_and_sign(&self, data: &[u8]) -> Result<Vec<u8>, IdentityError> {
-        let der = self.ca_key_pkcs8.as_deref().ok_or(IdentityError::NoCaKey)?;
-        let sk = SigningKey::from_pkcs8_der(der)
+        let sk = SigningKey::from_pkcs8_der(&self.key_pkcs8)
             .map_err(|e| IdentityError::Certificate(e.to_string()))?;
         let sig: Signature = sk.sign(data);
         Ok(sig.to_der().as_bytes().to_vec())
     }
 
-    /// SHA-256 + ECDSA P-256 verify using this identity's CA certificate.
+    /// SHA-256 + ECDSA P-256 verify using this identity's leaf certificate
+    /// (Go `signing.SigneeFromPeerIdentity` uses `PeerIdentity.Leaf.PublicKey`).
     pub fn hash_and_verify(&self, data: &[u8], signature: &[u8]) -> Result<(), IdentityError> {
-        hash_and_verify(self.ca.as_ref(), data, signature)
+        hash_and_verify(self.leaf.as_ref(), data, signature)
     }
 }
 
-/// Verify `signature` as Go `pkcrypto.HashAndVerifySignature` against a CA cert.
+/// Verify `signature` as Go `pkcrypto.HashAndVerifySignature` against the
+/// public key in `cert_der`. Peers sign with their leaf key, so pass the
+/// peer's leaf certificate (`peer_certificates()[0]`), not the CA.
 pub fn hash_and_verify(
-    ca_cert_der: &[u8],
+    cert_der: &[u8],
     data: &[u8],
     signature: &[u8],
 ) -> Result<(), IdentityError> {
-    let vk = verifying_key_from_cert_der(ca_cert_der)?;
+    let vk = verifying_key_from_cert_der(cert_der)?;
     let sig = Signature::from_der(signature).map_err(|_| IdentityError::Signature)?;
     vk.verify(data, &sig).map_err(|_| IdentityError::Signature)
 }
@@ -299,17 +296,25 @@ fn is_identity_version_ext(ext: &X509Extension<'_>) -> bool {
     ext.oid.as_bytes() == IDENTITY_VERSION_OID_BER
 }
 
-fn id_version(cert: &X509Certificate<'_>) -> u8 {
+/// Identity version from the extension (Go `GetIDVersion`): absent means V0,
+/// and any version other than V0 is rejected as Go does.
+fn id_version(cert: &X509Certificate<'_>) -> Result<u8, IdentityError> {
     for ext in cert.extensions() {
         if is_identity_version_ext(ext) {
-            return ext.value.first().copied().unwrap_or(ID_VERSION_V0);
+            let v = ext.value.first().copied().unwrap_or(ID_VERSION_V0);
+            if v != ID_VERSION_V0 {
+                return Err(IdentityError::Certificate(format!(
+                    "unsupported identity version {v}"
+                )));
+            }
+            return Ok(v);
         }
     }
-    ID_VERSION_V0
+    Ok(ID_VERSION_V0)
 }
 
 fn from_parsed_cert(cert: &X509Certificate<'_>) -> Result<NodeId, IdentityError> {
-    let version = id_version(cert);
+    let version = id_version(cert)?;
     let spki = pkix_spki(cert)?;
     let mut id = double_sha256(&spki);
     id[NODE_ID_SIZE - 1] = version;
@@ -434,7 +439,7 @@ mod tests {
     fn generate_has_version_ext_and_self_consistent_id() {
         let ident = Identity::generate().expect("generate");
         let ca = parse_cert(ident.ca_der()).unwrap();
-        assert_eq!(id_version(&ca), ID_VERSION_V0);
+        assert_eq!(id_version(&ca).unwrap(), ID_VERSION_V0);
         assert!(
             ca.extensions().iter().any(is_identity_version_ext),
             "CA must carry PeerIDVersions extension 2.999.2.1"
@@ -452,19 +457,19 @@ mod tests {
         let msg = b"order-limit-bytes";
         let sig = ident.hash_and_sign(msg).expect("sign");
         ident.hash_and_verify(msg, &sig).expect("verify self");
-        hash_and_verify(ident.ca_der().as_ref(), msg, &sig).expect("verify der");
-        assert!(hash_and_verify(ident.ca_der().as_ref(), b"tampered", &sig).is_err());
+        hash_and_verify(ident.leaf_der().as_ref(), msg, &sig).expect("verify der");
+        assert!(hash_and_verify(ident.leaf_der().as_ref(), b"tampered", &sig).is_err());
+        // Go verifies with the leaf key; the CA key must not accept it.
+        assert!(hash_and_verify(ident.ca_der().as_ref(), msg, &sig).is_err());
         let other = Identity::generate().expect("other");
         assert!(other.hash_and_verify(msg, &sig).is_err());
     }
 
     #[test]
-    fn pem_identity_cannot_sign() {
+    fn pem_identity_signs_with_leaf() {
         let ident = Identity::from_pem(GO_DUMP).expect("go dump");
-        assert!(matches!(
-            ident.hash_and_sign(b"x"),
-            Err(IdentityError::NoCaKey)
-        ));
+        let sig = ident.hash_and_sign(b"x").expect("leaf key signs");
+        ident.hash_and_verify(b"x", &sig).expect("leaf verifies");
     }
 
     #[test]
@@ -472,7 +477,7 @@ mod tests {
         let ident = Identity::from_pem(GO_DUMP).expect("go dump");
         assert_eq!(ident.node_id().to_string(), GO_NODE_ID);
         let ca = parse_cert(ident.ca_der()).unwrap();
-        assert_eq!(id_version(&ca), ID_VERSION_V0);
+        assert_eq!(id_version(&ca).unwrap(), ID_VERSION_V0);
         assert!(ca.extensions().iter().any(is_identity_version_ext));
         let org = ca
             .subject()

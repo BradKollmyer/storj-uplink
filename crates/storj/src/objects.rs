@@ -242,52 +242,114 @@ struct ObjectListState {
     done: bool,
 }
 
+/// Prefix-relative key codec shared by object and pending-upload listing
+/// (Go `metaclient.listObjects`: the satellite returns keys relative to
+/// `encrypted_prefix`, encrypted under the prefix's parent key, and the cursor
+/// is sent the same way).
+pub(crate) struct ListKeyCodec {
+    prefix: String,
+    parent_key: Key,
+    path_cipher: CipherSuite,
+    encrypted_prefix: Vec<u8>,
+    arbitrary_prefix: bool,
+}
+
+impl ListKeyCodec {
+    pub(crate) fn new(project: &Project, bucket: &str, prefix: &str) -> Result<Self> {
+        let parent_plain = prefix.strip_suffix('/').unwrap_or(prefix);
+        let parent_key = derive_path_key(bucket, parent_plain.as_bytes(), &project.inner.store)
+            .map_err(map_enc)?;
+        let path_cipher = project
+            .inner
+            .store
+            .lookup_unencrypted(bucket, parent_plain.as_bytes())
+            .base
+            .map(|b| {
+                if b.path_cipher.0 == 0 {
+                    CipherSuite::AES_GCM
+                } else {
+                    b.path_cipher
+                }
+            })
+            .unwrap_or(CipherSuite::AES_GCM);
+        // EncNull: satellite does a raw byte-prefix match of the original prefix
+        // (including trailing `/`). AES-GCM uses GetPrefixInfo.ParentEnc (no slash).
+        let arbitrary_prefix = path_cipher == CipherSuite::NULL;
+        let encrypted_prefix = if arbitrary_prefix {
+            prefix.as_bytes().to_vec()
+        } else {
+            encrypt_path(bucket, parent_plain, &project.inner.store).map_err(map_enc)?
+        };
+        Ok(Self {
+            prefix: prefix.to_owned(),
+            parent_key,
+            path_cipher,
+            encrypted_prefix,
+            arbitrary_prefix,
+        })
+    }
+
+    pub(crate) fn encrypted_prefix(&self) -> &[u8] {
+        &self.encrypted_prefix
+    }
+
+    pub(crate) fn arbitrary_prefix(&self) -> bool {
+        self.arbitrary_prefix
+    }
+
+    /// Encrypt a prefix-relative cursor.
+    pub(crate) fn encode_cursor(&self, cursor: &str) -> Result<Vec<u8>> {
+        if cursor.is_empty() {
+            return Ok(Vec::new());
+        }
+        encrypt_iterator(
+            PathIter::new(cursor.as_bytes()),
+            self.path_cipher,
+            &self.parent_key,
+        )
+        .map_err(map_enc)
+    }
+
+    /// Decrypt a prefix-relative listed key and re-attach the prefix.
+    pub(crate) fn decode_key(&self, encrypted_relative: Vec<u8>) -> Result<String> {
+        let rel = decrypt_iterator(
+            PathIter::new(encrypted_relative),
+            self.path_cipher,
+            &self.parent_key,
+        )
+        .map_err(map_enc)?;
+        let rel = String::from_utf8(rel).map_err(|_| {
+            Error::new(
+                ErrorKind::DecryptionFailed,
+                "listed object key is not utf-8",
+            )
+        })?;
+        Ok(if self.prefix.is_empty() {
+            rel
+        } else {
+            format!("{}{rel}", self.prefix)
+        })
+    }
+}
+
 fn prepare_list(
     project: &Project,
     bucket: &str,
     opts: &ListObjectsOptions,
 ) -> Result<ObjectListState> {
-    let parent_plain = opts
-        .prefix
-        .strip_suffix('/')
-        .unwrap_or(opts.prefix.as_str());
-    let parent_key =
-        derive_path_key(bucket, parent_plain.as_bytes(), &project.inner.store).map_err(map_enc)?;
-    let path_cipher = project
-        .inner
-        .store
-        .lookup_unencrypted(bucket, parent_plain.as_bytes())
-        .base
-        .map(|b| {
-            if b.path_cipher.0 == 0 {
-                CipherSuite::AES_GCM
-            } else {
-                b.path_cipher
-            }
-        })
-        .unwrap_or(CipherSuite::AES_GCM);
-    // EncNull: satellite does a raw byte-prefix match of the original prefix
-    // (including trailing `/`). AES-GCM uses GetPrefixInfo.ParentEnc (no slash).
-    let arbitrary_prefix = path_cipher == CipherSuite::NULL;
-    let encrypted_prefix = if arbitrary_prefix {
-        opts.prefix.as_bytes().to_vec()
-    } else {
-        encrypt_path(bucket, parent_plain, &project.inner.store).map_err(map_enc)?
-    };
-    let encrypted_cursor = if opts.cursor.is_empty() {
-        Vec::new()
-    } else {
-        encrypt_iterator(
-            PathIter::new(opts.cursor.as_bytes()),
-            path_cipher,
-            &parent_key,
-        )
-        .map_err(map_enc)?
-    };
+    let codec = ListKeyCodec::new(project, bucket, &opts.prefix)?;
+    let encrypted_cursor = codec.encode_cursor(&opts.cursor)?;
+    let ListKeyCodec {
+        prefix,
+        parent_key,
+        path_cipher,
+        encrypted_prefix,
+        arbitrary_prefix,
+    } = codec;
     Ok(ObjectListState {
         project: project.clone(),
         bucket: bucket.to_owned(),
-        prefix: opts.prefix.clone(),
+        prefix,
         parent_key,
         path_cipher,
         encrypted_prefix,
@@ -379,7 +441,9 @@ fn object_from_info(
     Ok(obj)
 }
 
-fn skippable_list_decrypt(e: &Error) -> bool {
+/// True for errors listing should skip (an entry we cannot decrypt) rather
+/// than abort the whole stream on, as Go does.
+pub(crate) fn skippable_list_decrypt(e: &Error) -> bool {
     matches!(e.kind(), ErrorKind::DecryptionFailed | ErrorKind::Protocol)
 }
 

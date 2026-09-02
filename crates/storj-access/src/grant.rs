@@ -2,6 +2,8 @@
 
 use std::fmt;
 
+use zeroize::{Zeroize, Zeroizing};
+
 use prost::Message;
 
 use crate::base58::{GRANT_VERSION, check_decode, check_encode};
@@ -77,6 +79,12 @@ pub struct StoreEntry {
     pub encryption_parameters: Option<EncryptionParameters>,
 }
 
+impl Drop for StoreEntry {
+    fn drop(&mut self) {
+        self.key.zeroize();
+    }
+}
+
 impl fmt::Debug for StoreEntry {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("StoreEntry")
@@ -137,7 +145,14 @@ pub struct Grant {
     satellite_addr: String,
     api_key: Vec<u8>,
     enc_access: EncryptionAccess,
-    original: Option<String>,
+    /// The full serialized grant (contains every key); zeroized on drop.
+    original: Option<Zeroizing<String>>,
+}
+
+impl Drop for Grant {
+    fn drop(&mut self) {
+        self.api_key.zeroize();
+    }
 }
 
 impl fmt::Debug for Grant {
@@ -186,11 +201,25 @@ impl Grant {
             Error::new(format!("access grant has malformed encryption access: {e}"))
         })?;
 
+        // Go `ParseAccess` calls `encAccess.LimitTo(apiKey)` on every parse:
+        // a grant whose macaroon carries path caveats must not keep the root
+        // key (or out-of-prefix store entries) that would let it decrypt
+        // outside those caveats.
+        let api_key = crate::macaroon::ApiKey::parse_raw(&scope.api_key).map_err(|e| {
+            Error::new(format!(
+                "access grant has malformed api key: {}",
+                e.message()
+            ))
+        })?;
+        let limited = enc_access.limit_to(&api_key)?;
+        // Only an unmodified grant may be echoed back verbatim by `serialize`.
+        let original = (limited == enc_access).then(|| Zeroizing::new(serialized.to_owned()));
+
         Ok(Self {
             satellite_addr: scope.satellite_addr,
             api_key: scope.api_key,
-            enc_access,
-            original: Some(serialized.to_owned()),
+            enc_access: limited,
+            original,
         })
     }
 
@@ -243,7 +272,7 @@ impl Grant {
     /// Serialize. Unmodified parsed grants return the original string.
     pub fn serialize(&self) -> Result<String, Error> {
         if let Some(original) = &self.original {
-            return Ok(original.clone());
+            return Ok(original.to_string());
         }
         self.serialize_from_fields()
     }

@@ -30,7 +30,7 @@ pub struct SnTransport {
     /// Established DRPC connection. `None` while a piece RPC owns it.
     pub conn: Option<Conn<TlsStream<TcpStream>>>,
     /// Storage-node CA DER from the handshake.
-    pub peer_ca: Vec<u8>,
+    pub peer_cert: Vec<u8>,
 }
 
 /// Pool of SN transports keyed by NodeID.
@@ -47,7 +47,7 @@ pub struct PieceAssignment {
     pub address: String,
     /// Storage-node id (order limit / NodeID pin).
     pub node_id: NodeId,
-    /// Placement tags for [`CohortRequirements::Withhold`].
+    /// Placement tags for [`cohort_requirements::Requirement::Withhold`].
     pub tags: HashMap<String, Vec<u8>>,
 }
 
@@ -201,16 +201,19 @@ pub async fn dial_sn(
         let server_name = ServerName::try_from(host.to_string())
             .map_err(|e| Error::protocol(format!("invalid storage-node host {host:?}: {e}")))?;
         let tls = connector.connect(server_name, tcp).await?;
-        let peer_ca = tls
+        // The node signs piece hashes with its leaf key (Go
+        // `SigneeFromPeerIdentity` uses `Leaf.PublicKey`), so keep the leaf
+        // (chain[0]), not the CA.
+        let peer_cert = tls
             .get_ref()
             .1
             .peer_certificates()
-            .and_then(|c| c.last())
+            .and_then(|c| c.first())
             .map(|c| c.as_ref().to_vec())
             .unwrap_or_default();
         Ok::<_, Error>(SnTransport {
             conn: Some(Conn::new(tls)),
-            peer_ca,
+            peer_cert,
         })
     };
     tokio::time::timeout(timeout, dial)
@@ -241,10 +244,11 @@ pub struct LongTailUpload {
     pub segment_id: Vec<u8>,
     /// Piece private key from BeginSegment.
     pub piece_key: PiecePrivateKey,
-    /// Reed-Solomon pieces (`n` buffers).
-    pub pieces: Vec<Vec<u8>>,
+    /// Reed-Solomon pieces (`n` buffers), shared with the per-piece upload
+    /// tasks instead of cloned into each (≈3× less memory per segment).
+    pub pieces: Arc<Vec<Vec<u8>>>,
     /// Satellite CA DER (order-limit verify).
-    pub satellite_ca: Vec<u8>,
+    pub satellite_cert: Vec<u8>,
     /// Uplink identity for SN TLS.
     pub identity: Identity,
     /// SN connection pool.
@@ -271,6 +275,8 @@ where
 {
     let mut successes: Vec<PieceResult> = Vec::new();
     let mut attempts = 0u32;
+    // Most recent piece errors, so a threshold failure explains itself.
+    let mut last_errors: Vec<(i32, String)> = Vec::new();
 
     while !requirements_met(&job, &successes) && attempts < 4 {
         attempts += 1;
@@ -286,8 +292,13 @@ where
             break;
         }
 
-        let (round_ok, failed_nums) = upload_round(&job, pending, &successes).await?;
+        let (round_ok, failed_nums, errors) = upload_round(&job, pending, &successes).await?;
         successes.extend(round_ok);
+        last_errors.extend(errors);
+        if last_errors.len() > MAX_KEPT_PIECE_ERRORS {
+            let drop = last_errors.len() - MAX_KEPT_PIECE_ERRORS;
+            last_errors.drain(..drop);
+        }
 
         if requirements_met(&job, &successes) {
             break;
@@ -297,30 +308,41 @@ where
         }
         let (new_id, new_limits) = retry(job.segment_id.clone(), failed_nums.clone()).await?;
         job.segment_id = new_id;
-        for (i, limit) in new_limits.into_iter().enumerate() {
-            let piece_num = failed_nums.get(i).copied().unwrap_or(i as i32);
-            match PieceAssignment::from_addressed(piece_num as usize, limit) {
-                Ok(mut a) => {
-                    a.piece_num = piece_num;
-                    if let Some(slot) = job
-                        .assignments
-                        .iter_mut()
-                        .find(|x| x.piece_num == piece_num)
-                    {
-                        *slot = a;
-                    } else {
-                        job.assignments.push(a);
-                    }
-                }
-                Err(e) => return Err(e),
+        // The satellite returns the FULL n-length limit list indexed by piece
+        // number (Go `pieceupload/manager.go`: `mgr.limits = limits`, then
+        // `limits[num]`), not a list aligned to the retried piece numbers.
+        for &piece_num in &failed_nums {
+            let idx = usize::try_from(piece_num)
+                .map_err(|_| Error::protocol("negative piece number in retry"))?;
+            let Some(limit) = new_limits.get(idx).cloned().filter(|l| l.limit.is_some()) else {
+                // No replacement for this piece: leave it failed.
+                job.assignments.retain(|x| x.piece_num != piece_num);
+                continue;
+            };
+            let mut a = PieceAssignment::from_addressed(idx, limit)?;
+            a.piece_num = piece_num;
+            if let Some(slot) = job
+                .assignments
+                .iter_mut()
+                .find(|x| x.piece_num == piece_num)
+            {
+                *slot = a;
+            } else {
+                job.assignments.push(a);
             }
         }
     }
 
     if !requirements_met(&job, &successes) {
+        let causes = last_errors
+            .iter()
+            .map(|(n, e)| format!("piece {n}: {e}"))
+            .collect::<Vec<_>>()
+            .join("; ");
         return Err(Error::protocol(format!(
-            "segment upload: {} successful pieces do not meet cohort/o",
-            successes.len()
+            "segment upload: {} successful pieces do not meet cohort/o (o={}); recent piece errors: [{causes}]",
+            successes.len(),
+            job.rs.o
         )));
     }
     Ok((job.segment_id, successes))
@@ -350,23 +372,24 @@ async fn upload_round(
     job: &LongTailUpload,
     pending: Vec<PieceAssignment>,
     already: &[PieceResult],
-) -> Result<(Vec<PieceResult>, Vec<i32>)> {
+) -> Result<(Vec<PieceResult>, Vec<i32>, Vec<(i32, String)>)> {
     let mut set = JoinSet::new();
     for asg in pending {
         let idx = usize::try_from(asg.piece_num).unwrap_or(usize::MAX);
-        let data = job.pieces.get(idx).cloned().unwrap_or_default();
+        let pieces = Arc::clone(&job.pieces);
         let key = job.piece_key.clone();
-        let sat_ca = job.satellite_ca.clone();
+        let sat_cert = job.satellite_cert.clone();
         let ident = job.identity.clone();
         let pool = job.pool.clone();
         let dial_timeout = job.dial_timeout;
         set.spawn(async move {
-            upload_one_piece(asg, key, data, sat_ca, ident, pool, dial_timeout).await
+            upload_one_piece(asg, key, pieces, idx, sat_cert, ident, pool, dial_timeout).await
         });
     }
 
     let mut successes = Vec::new();
     let mut failed = Vec::new();
+    let mut errors = Vec::new();
     while let Some(joined) = set.join_next().await {
         match joined {
             Ok(Ok(result)) => {
@@ -375,25 +398,41 @@ async fn upload_round(
                 all.extend(successes.iter().cloned());
                 if requirements_met(job, &all) {
                     set.abort_all();
-                    while set.join_next().await.is_some() {}
+                    // Pieces that already finished but were still queued in
+                    // the set are durably stored: report them to the
+                    // satellite rather than dropping them (Go records every
+                    // finished piece before cancelling the long tail).
+                    while let Some(rest) = set.join_next().await {
+                        if let Ok(Ok(result)) = rest {
+                            successes.push(result);
+                        }
+                    }
                     break;
                 }
             }
-            Ok(Err((piece_num, _err))) => failed.push(piece_num),
+            Ok(Err((piece_num, err))) => {
+                errors.push((piece_num, err.to_string()));
+                failed.push(piece_num);
+            }
             Err(e) if e.is_cancelled() => {}
             Err(e) => {
                 return Err(Error::protocol(format!("piece upload join: {e}")));
             }
         }
     }
-    Ok((successes, failed))
+    Ok((successes, failed, errors))
 }
 
+/// How many recent piece errors are kept for the terminal error message.
+const MAX_KEPT_PIECE_ERRORS: usize = 5;
+
+#[allow(clippy::too_many_arguments)]
 async fn upload_one_piece(
     asg: PieceAssignment,
     piece_key: PiecePrivateKey,
-    data: Vec<u8>,
-    satellite_ca: Vec<u8>,
+    pieces: Arc<Vec<Vec<u8>>>,
+    idx: usize,
+    satellite_cert: Vec<u8>,
     identity: Identity,
     pool: SnPool,
     dial_timeout: Duration,
@@ -425,7 +464,8 @@ async fn upload_one_piece(
         .as_mut()
         .and_then(Pooled::get_mut)
         .ok_or_else(|| (asg.piece_num, Error::protocol("pooled SN conn missing")))?;
-    match put_piece(transport, &satellite_ca, &piece_key, &asg.limit, &data).await {
+    let data: &[u8] = pieces.get(idx).map(Vec::as_slice).unwrap_or(&[]);
+    match put_piece(transport, &satellite_cert, &piece_key, &asg.limit, data).await {
         Ok(hash) => Ok(SegmentPieceUploadResult {
             piece_num: asg.piece_num,
             node_id: asg.node_id.as_bytes().to_vec(),
@@ -435,9 +475,25 @@ async fn upload_one_piece(
     }
 }
 
+/// True when `result` failed at the transport level (the DRPC connection is
+/// dead or in an unknown framing state), as opposed to a remote error or a
+/// verification failure on an otherwise healthy connection.
+pub(crate) fn is_transport_error<T>(result: &Result<T>) -> bool {
+    matches!(
+        result,
+        Err(Error::Rpc(
+            storj_rpc::Error::Io(_)
+                | storj_rpc::Error::Closed
+                | storj_rpc::Error::Truncated
+                | storj_rpc::Error::Frame(_)
+                | storj_rpc::Error::MuxPrefix { .. }
+        ))
+    )
+}
+
 async fn put_piece(
     transport: &mut SnTransport,
-    satellite_ca: &[u8],
+    satellite_cert: &[u8],
     piece_key: &PiecePrivateKey,
     limit: &OrderLimit,
     data: &[u8],
@@ -446,11 +502,16 @@ async fn put_piece(
         .conn
         .take()
         .ok_or_else(|| Error::protocol("storage-node connection in use"))?;
-    let peer_ca = transport.peer_ca.clone();
+    let peer_cert = transport.peer_cert.clone();
     let mut client =
-        Client::new(conn, satellite_ca.to_vec(), peer_ca).with_config(PieceConfig::default());
+        Client::new(conn, satellite_cert.to_vec(), peer_cert).with_config(PieceConfig::default());
     let result = client.upload(limit, piece_key, data).await;
-    transport.conn = Some(client.into_conn());
+    let conn = client.into_conn();
+    // Keep the connection only if the transport is still healthy; a poisoned
+    // or transport-failed conn must not go back into the idle pool.
+    if !conn.is_poisoned() && !is_transport_error(&result) {
+        transport.conn = Some(conn);
+    }
     result
 }
 

@@ -4,8 +4,14 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  test:
+  lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -15,11 +21,32 @@ jobs:
       - name: fmt
         run: cargo fmt --all -- --check
       - name: clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: rustdoc
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps --locked
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
       - name: test
-        run: cargo test --workspace
-      - name: compile all tests including ignored
-        run: cargo test --workspace --no-run
+        run: cargo test --workspace --locked
+
+  # MSRV per README (rust-version in Cargo.toml).
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85
+      - name: check on MSRV
+        run: cargo check --workspace --all-targets --locked
 
   # Mitigation 3 / R1: fail if vendored proto drifts from the pin without a PR.
   proto:
@@ -35,7 +62,13 @@ jobs:
         run: |
           bash proto/gen-prost.sh
           cargo fmt --all
-          git diff --exit-code crates/storj-proto/src/gen
+          # `git status` also catches newly generated (untracked) files that
+          # `git diff` would miss.
+          if [ -n "$(git status --porcelain crates/storj-proto/src/gen)" ]; then
+            git status --porcelain crates/storj-proto/src/gen
+            git diff crates/storj-proto/src/gen
+            exit 1
+          fi
 
   deny:
     runs-on: ubuntu-latest
@@ -49,7 +82,7 @@ jobs:
       - name: cargo deny
         run: cargo deny check
 
-  # Go generator vs checked-in fixtures (Argon2 p=1/p=8, path HMAC, grant).
+  # Go generator vs checked-in fixtures (Argon2 p=1/p=8, path HMAC, grant, RS).
   vectors:
     runs-on: ubuntu-latest
     steps:
@@ -61,6 +94,10 @@ jobs:
       - name: generate goldens
         run: go run -C scripts .
       - name: fixtures are not stale
-        run: git diff --exit-code crates/storj/tests/fixtures/derive_root_key.jsonl crates/storj/tests/fixtures/path_hmac.jsonl crates/storj/tests/fixtures/grant_go.txt
-      - name: kdf, path HMAC, and grant goldens match Go
-        run: cargo test -p storj --test encryption_kdf --test encryption_golden --test grant_golden
+        run: git diff --exit-code crates/storj/tests/fixtures/
+      - name: kdf, path HMAC, grant, and RS goldens match Go
+        run: >
+          cargo test --locked -p storj --test encryption_kdf --test encryption_golden
+          --test grant_golden --test ec_golden
+      - name: storj-ec goldens match infectious
+        run: cargo test --locked -p storj-ec --test golden

@@ -345,6 +345,11 @@ impl PacketAssembler {
                 return Err(FrameError::KindChange);
             }
             pkt.control |= fr.control;
+            // Reject before copying so a hostile peer cannot force an
+            // over-limit allocation that is only checked afterwards.
+            if pkt.data.len().saturating_add(fr.data.len()) > self.max_data {
+                return Err(FrameError::Overflow);
+            }
             pkt.data.extend_from_slice(&fr.data);
         }
 

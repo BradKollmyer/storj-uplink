@@ -33,6 +33,10 @@ pub(crate) struct UploadInner {
     pub(crate) pending_flush: Option<tokio::task::JoinHandle<Result<FlushedSegment>>>,
     pub(crate) part_number: i32,
     pub(crate) etag: Option<Vec<u8>>,
+    /// Set once a background segment flush fails. Every later write, flush,
+    /// shutdown and commit returns this error so a caller that ignores one
+    /// write error cannot publish an object with a missing segment.
+    pub(crate) failed: Option<(ErrorKind, String)>,
 }
 
 pub(crate) struct FlushedSegment {
@@ -41,6 +45,20 @@ pub(crate) struct FlushedSegment {
 }
 
 impl UploadInner {
+    /// The sticky flush error, if any.
+    pub(crate) fn failed_error(&self) -> Option<Error> {
+        self.failed
+            .as_ref()
+            .map(|(kind, msg)| Error::new(*kind, format!("upload failed earlier: {msg}")))
+    }
+
+    fn poison(&mut self, e: Error) -> Error {
+        if self.failed.is_none() {
+            self.failed = Some((e.kind(), e.to_string()));
+        }
+        e
+    }
+
     pub(crate) fn apply_flush(&mut self, flushed: FlushedSegment) {
         self.next_segment = self.next_segment.max(flushed.index + 1);
         self.total_plain += flushed.plain_size;
@@ -48,6 +66,9 @@ impl UploadInner {
     }
 
     pub(crate) fn poll_pending_flush(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        if let Some(e) = self.failed_error() {
+            return Poll::Ready(Err(e));
+        }
         let Some(mut handle) = self.pending_flush.take() else {
             return Poll::Ready(Ok(()));
         };
@@ -57,8 +78,15 @@ impl UploadInner {
                 Poll::Pending
             }
             Poll::Ready(join) => {
-                let flushed = join?;
-                self.apply_flush(flushed?);
+                let flushed = match join {
+                    Ok(Ok(f)) => f,
+                    Ok(Err(e)) => return Poll::Ready(Err(self.poison(e))),
+                    Err(e) => {
+                        let e = Error::from(e);
+                        return Poll::Ready(Err(self.poison(e)));
+                    }
+                };
+                self.apply_flush(flushed);
                 Poll::Ready(Ok(()))
             }
         }
@@ -197,15 +225,50 @@ impl AsyncWrite for Upload {
 }
 
 /// Object download. Implements `AsyncRead`. `info()` is populated at start.
+///
+/// Streams at **segment granularity**: segments are fetched, erasure-decoded
+/// and decrypted one at a time by a background task that runs at most one
+/// segment ahead of the reader, so memory is bounded by about two segments
+/// (≈128 MiB worst case) however large the object is. Dropping or closing the
+/// download cancels the background task and releases its storage-node
+/// connections.
 pub struct Download {
     info: Object,
     buf: Vec<u8>,
     pos: usize,
+    rx: Option<tokio::sync::mpsc::Receiver<Result<Vec<u8>>>>,
+    producer: Option<tokio::task::JoinHandle<()>>,
+    /// Plaintext bytes still expected from the producer.
+    remaining: i64,
 }
 
 impl Download {
+    /// An already-materialized (empty or inline) body.
     pub(crate) fn new(info: Object, buf: Vec<u8>) -> Self {
-        Self { info, buf, pos: 0 }
+        Self {
+            info,
+            buf,
+            pos: 0,
+            rx: None,
+            producer: None,
+            remaining: 0,
+        }
+    }
+
+    pub(crate) fn streaming(
+        info: Object,
+        rx: tokio::sync::mpsc::Receiver<Result<Vec<u8>>>,
+        producer: tokio::task::JoinHandle<()>,
+        total: i64,
+    ) -> Self {
+        Self {
+            info,
+            buf: Vec::new(),
+            pos: 0,
+            rx: Some(rx),
+            producer: Some(producer),
+            remaining: total,
+        }
     }
 
     /// Object info available immediately.
@@ -213,26 +276,68 @@ impl Download {
         &self.info
     }
 
-    /// Close piece RPCs. Drop is best-effort.
-    pub async fn close(self) -> Result<()> {
+    /// Stop fetching: cancels the background segment task and releases its
+    /// storage-node connections. Drop does the same (best-effort).
+    pub async fn close(mut self) -> Result<()> {
+        self.cancel();
         Ok(())
+    }
+
+    fn cancel(&mut self) {
+        if let Some(task) = self.producer.take() {
+            task.abort();
+        }
+        self.rx = None;
+    }
+}
+
+impl Drop for Download {
+    fn drop(&mut self) {
+        self.cancel();
     }
 }
 
 impl AsyncRead for Download {
     fn poll_read(
         self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
+        cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
-        if this.pos >= this.buf.len() {
-            return Poll::Ready(Ok(()));
+        loop {
+            if this.pos < this.buf.len() {
+                let n = buf.remaining().min(this.buf.len() - this.pos);
+                buf.put_slice(&this.buf[this.pos..this.pos + n]);
+                this.pos += n;
+                return Poll::Ready(Ok(()));
+            }
+            let Some(rx) = this.rx.as_mut() else {
+                return Poll::Ready(Ok(()));
+            };
+            match rx.poll_recv(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Some(Ok(segment))) => {
+                    this.remaining -= i64::try_from(segment.len()).unwrap_or(i64::MAX);
+                    this.buf = segment;
+                    this.pos = 0;
+                }
+                Poll::Ready(Some(Err(e))) => {
+                    this.cancel();
+                    return Poll::Ready(Err(e.into()));
+                }
+                Poll::Ready(None) => {
+                    this.cancel();
+                    if this.remaining != 0 {
+                        return Poll::Ready(Err(Error::new(
+                            ErrorKind::Protocol,
+                            "download missing segment data",
+                        )
+                        .into()));
+                    }
+                    return Poll::Ready(Ok(()));
+                }
+            }
         }
-        let n = buf.remaining().min(this.buf.len() - this.pos);
-        buf.put_slice(&this.buf[this.pos..this.pos + n]);
-        this.pos += n;
-        Poll::Ready(Ok(()))
     }
 }
 

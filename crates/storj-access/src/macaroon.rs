@@ -6,7 +6,9 @@
 //! produce `tail`.
 
 use std::fmt;
+
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use zeroize::Zeroize;
 
 use hmac::{Hmac, Mac};
 use prost::Message;
@@ -36,6 +38,16 @@ pub struct Macaroon {
     head: Vec<u8>,
     caveats: Vec<Vec<u8>>,
     tail: [u8; TAIL_LEN],
+}
+
+impl Drop for Macaroon {
+    fn drop(&mut self) {
+        self.head.zeroize();
+        self.tail.zeroize();
+        for c in &mut self.caveats {
+            c.zeroize();
+        }
+    }
 }
 
 impl fmt::Debug for Macaroon {

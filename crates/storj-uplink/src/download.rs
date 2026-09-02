@@ -121,16 +121,22 @@ pub fn piece_byte_range(
     if nblocks <= 0 || enc_block == 0 || rs.share_size == 0 {
         return (0, 0);
     }
+    // Sizes come from the satellite: saturate rather than wrap on extremes.
     let enc_start = first_block.saturating_mul(enc_block as i64);
-    let enc_end = (first_block + nblocks).saturating_mul(enc_block as i64);
+    let enc_end = first_block
+        .saturating_add(nblocks)
+        .saturating_mul(enc_block as i64);
     let stripe = rs.stripe_size() as i64;
     let share = rs.share_size as i64;
     if stripe == 0 {
         return (0, 0);
     }
     let first_stripe = enc_start / stripe;
-    let last_stripe = (enc_end + stripe - 1) / stripe;
-    (first_stripe * share, (last_stripe - first_stripe) * share)
+    let last_stripe = enc_end.saturating_add(stripe - 1) / stripe;
+    (
+        first_stripe.saturating_mul(share),
+        (last_stripe - first_stripe).saturating_mul(share),
+    )
 }
 
 /// Reconstruct encrypted bytes from any `k` indexed piece buffers (same length).
@@ -258,7 +264,7 @@ pub struct LongTailDownload {
     /// Piece private key from the download response.
     pub piece_key: PiecePrivateKey,
     /// Satellite CA DER (order-limit verify).
-    pub satellite_ca: Vec<u8>,
+    pub satellite_cert: Vec<u8>,
     /// Uplink identity for SN TLS.
     pub identity: Identity,
     /// SN connection pool.
@@ -273,7 +279,17 @@ pub struct LongTailDownload {
     pub dial_timeout: Duration,
 }
 
+/// Extra pieces requested beyond `k` up front so one slow/failed node does
+/// not stall the download (Go starts `k` readers plus a small margin and
+/// promotes the rest lazily rather than ordering every piece).
+const LAUNCH_MARGIN: usize = 1;
+
 /// Download pieces until `k` succeed, then cancel the rest (long-tail).
+///
+/// Only `k + LAUNCH_MARGIN` pieces are requested initially; each failure
+/// promotes the next unused assignment. Every launched piece signs an order
+/// for its full byte range, so this bounds egress to roughly `k + 1` pieces
+/// instead of all `n`.
 pub async fn download_pieces_long_tail(job: LongTailDownload) -> Result<Vec<(i32, Vec<u8>)>> {
     if job.size < 0 || job.offset < 0 {
         return Err(Error::protocol("piece download offset/size must be >= 0"));
@@ -281,18 +297,41 @@ pub async fn download_pieces_long_tail(job: LongTailDownload) -> Result<Vec<(i32
     if job.size == 0 {
         return Ok(Vec::new());
     }
+    let LongTailDownload {
+        assignments,
+        piece_key,
+        satellite_cert,
+        identity,
+        pool,
+        rs,
+        offset,
+        size,
+        dial_timeout,
+    } = job;
+    let mut queue: std::collections::VecDeque<PieceAssignment> = assignments.into();
     let mut set = JoinSet::new();
-    for asg in job.assignments {
-        let key = job.piece_key.clone();
-        let sat_ca = job.satellite_ca.clone();
-        let ident = job.identity.clone();
-        let pool = job.pool.clone();
-        let dial_timeout = job.dial_timeout;
-        let offset = job.offset;
-        let size = job.size;
+    let spawn = |set: &mut JoinSet<_>, asg: PieceAssignment| {
+        let key = piece_key.clone();
+        let sat_cert = satellite_cert.clone();
+        let ident = identity.clone();
+        let pool = pool.clone();
         set.spawn(async move {
-            download_one_piece(asg, key, sat_ca, ident, pool, (offset, size), dial_timeout).await
+            download_one_piece(
+                asg,
+                key,
+                sat_cert,
+                ident,
+                pool,
+                (offset, size),
+                dial_timeout,
+            )
+            .await
         });
+    };
+    let want = rs.k.saturating_add(LAUNCH_MARGIN);
+    while set.len() < want {
+        let Some(asg) = queue.pop_front() else { break };
+        spawn(&mut set, asg);
     }
 
     let mut successes = Vec::new();
@@ -301,17 +340,24 @@ pub async fn download_pieces_long_tail(job: LongTailDownload) -> Result<Vec<(i32
         match joined {
             Ok(Ok(piece)) => {
                 successes.push(piece);
-                if successes.len() >= job.rs.k {
+                if successes.len() >= rs.k {
                     set.abort_all();
                     while set.join_next().await.is_some() {}
                     break;
                 }
             }
-            Ok(Err((_piece_num, err))) => last_err = Some(err),
+            Ok(Err((_piece_num, err))) => {
+                last_err = Some(err);
+                // Promote the next unused piece to replace the failed one.
+                if let Some(asg) = queue.pop_front() {
+                    spawn(&mut set, asg);
+                }
+            }
             Err(e) if e.is_cancelled() => {}
             Err(e) => return Err(Error::protocol(format!("piece download join: {e}"))),
         }
     }
+    let job = LongTailDownloadTail { rs };
     if successes.len() < job.rs.k {
         return Err(last_err.unwrap_or_else(|| {
             Error::protocol(format!(
@@ -324,10 +370,14 @@ pub async fn download_pieces_long_tail(job: LongTailDownload) -> Result<Vec<(i32
     Ok(successes)
 }
 
+struct LongTailDownloadTail {
+    rs: Redundancy,
+}
+
 async fn download_one_piece(
     asg: PieceAssignment,
     piece_key: PiecePrivateKey,
-    satellite_ca: Vec<u8>,
+    satellite_cert: Vec<u8>,
     identity: Identity,
     pool: SnPool,
     range: (i64, i64),
@@ -363,7 +413,7 @@ async fn download_one_piece(
         .ok_or_else(|| (asg.piece_num, Error::protocol("pooled SN conn missing")))?;
     match get_piece(
         transport,
-        &satellite_ca,
+        &satellite_cert,
         &piece_key,
         &asg.limit,
         offset,
@@ -378,7 +428,7 @@ async fn download_one_piece(
 
 async fn get_piece(
     transport: &mut SnTransport,
-    satellite_ca: &[u8],
+    satellite_cert: &[u8],
     piece_key: &PiecePrivateKey,
     limit: &OrderLimit,
     offset: i64,
@@ -388,11 +438,16 @@ async fn get_piece(
         .conn
         .take()
         .ok_or_else(|| Error::protocol("storage-node connection in use"))?;
-    let peer_ca = transport.peer_ca.clone();
+    let peer_cert = transport.peer_cert.clone();
     let mut client =
-        Client::new(conn, satellite_ca.to_vec(), peer_ca).with_config(PieceConfig::default());
+        Client::new(conn, satellite_cert.to_vec(), peer_cert).with_config(PieceConfig::default());
     let result = client.download(limit, piece_key, offset, size).await;
-    transport.conn = Some(client.into_conn());
+    let conn = client.into_conn();
+    // Keep the connection only if the transport is still healthy; a poisoned
+    // or transport-failed conn must not go back into the idle pool.
+    if !conn.is_poisoned() && !crate::segment::is_transport_error(&result) {
+        transport.conn = Some(conn);
+    }
     result
 }
 

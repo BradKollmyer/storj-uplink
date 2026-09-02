@@ -160,13 +160,18 @@ async fn k_minus_one_pieces_fails_download() {
     for i in 1..4 {
         mock.fail_sn_download(i).await;
     }
-    let err = match project
+    // Downloads are lazy (segments are fetched on read, as in Go), so the
+    // piece shortage surfaces when the body is read, not when it is opened.
+    let mut download = project
         .download_object(&name, "r", Default::default())
         .await
-    {
+        .expect("open is lazy");
+    let mut body = Vec::new();
+    let err = match tokio::io::copy(&mut download, &mut body).await {
         Ok(_) => panic!("k-1 pieces must fail"),
         Err(e) => e,
     };
+    let err = storj::Error::from(err);
     assert_eq!(err.kind(), storj::ErrorKind::Protocol);
 }
 

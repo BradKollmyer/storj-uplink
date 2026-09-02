@@ -2,7 +2,7 @@
 //!
 //! Layering (see `crates/storj/tests/README.md`):
 //! 1. Unit / contract tests always run.
-//! 2. Golden / protocol tests are `#[ignore]` until the matching PR lands.
+//! 2. Golden / protocol tests run by default against checked-in Go fixtures.
 //! 3. Interop (`STORJ_INTEROP=1`) builds Go uplink as a helper.
 //! 4. Sim (`STORJ_SIM=1` + `STORJ_SIM_ACCESS`) talks to `storj-sim`.
 
@@ -134,14 +134,22 @@ pub fn size_label(n: u64) -> String {
     }
 }
 
-/// True once the in-process mock satellite can be started (PR 11).
-pub fn mock_satellite_available() -> bool {
-    true
-}
-
-/// Check that a path looks like a fixture directory the tests expect.
+/// Assert the checked-in fixture directory has the files the golden tests read.
 pub fn assert_fixtures_layout(root: &Path) {
-    assert!(root.join("README.md").exists() || root.exists());
+    for f in [
+        "README.md",
+        "derive_root_key.jsonl",
+        "path_hmac.jsonl",
+        "grant_go.txt",
+        "rs_shares.jsonl",
+        "rs_stripe.bin",
+    ] {
+        assert!(
+            root.join(f).is_file(),
+            "missing fixture {}",
+            root.join(f).display()
+        );
+    }
 }
 
 #[cfg(test)]
@@ -156,11 +164,8 @@ mod tests {
     }
 
     #[test]
-    fn env_flags_default_off() {
-        // Unset in unit tests.
-        let _ = interop_enabled();
-        let _ = sim_enabled();
-        let _ = interop_access();
-        let _ = sim_access();
+    fn fixtures_are_checked_in() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../storj/tests/fixtures");
+        assert_fixtures_layout(&root);
     }
 }

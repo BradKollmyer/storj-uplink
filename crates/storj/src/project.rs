@@ -34,7 +34,7 @@ pub(crate) struct ProjectInner {
     pub(crate) store: storj_encryption::Store,
     pub(crate) identity: storj_rpc::Identity,
     pub(crate) pool: storj_uplink::upload::SnPool,
-    pub(crate) satellite_ca: Vec<u8>,
+    pub(crate) satellite_cert: Vec<u8>,
     pub(crate) dial_timeout: std::time::Duration,
 }
 
@@ -57,7 +57,7 @@ impl Project {
             MetainfoClient::connect(node, access.api_key_raw().to_vec(), &config).await?;
         let store = store_from_grant(access.grant())?;
         let identity = metainfo.identity().clone();
-        let satellite_ca = metainfo.satellite_ca().await;
+        let satellite_cert = metainfo.satellite_cert().await;
         let dial_timeout = config.dial_timeout_or_default();
         Ok(Self {
             inner: Arc::new(ProjectInner {
@@ -67,13 +67,15 @@ impl Project {
                 pool: storj_uplink::pool::ConnectionPool::new(
                     storj_uplink::pool::PoolConfig::default(),
                 ),
-                satellite_ca,
+                satellite_cert,
                 dial_timeout,
             }),
         })
     }
 
-    /// Close pooled connections. Also called on Drop (best-effort).
+    /// Close the satellite connection(s). Storage-node connections are pooled
+    /// per `Project` and released when the last handle (project, upload,
+    /// download) is dropped. Also called on Drop (best-effort).
     pub async fn close(self) -> Result<()> {
         self.inner.metainfo.close().await;
         Ok(())
@@ -106,6 +108,7 @@ impl Project {
         let info = Object {
             key: key.to_owned(),
             is_prefix: false,
+            version: Vec::new(),
             system: SystemMetadata {
                 created: None,
                 expires: opts.expires,
@@ -116,6 +119,7 @@ impl Project {
         Ok(Upload::new(
             info,
             UploadInner {
+                failed: None,
                 project: Arc::clone(&self.inner),
                 bucket: bucket.to_owned(),
                 key: key.to_owned(),
@@ -157,7 +161,15 @@ impl Project {
             .metainfo
             .download_object(bucket, key, enc_path, range)
             .await?;
-        download_segments(&self.inner, bucket, key, content_key, opts, resp).await
+        download_segments(
+            Arc::clone(&self.inner),
+            bucket,
+            key,
+            content_key,
+            opts,
+            resp,
+        )
+        .await
     }
 
     /// Replace custom metadata. Existing custom metadata is deleted.
@@ -303,6 +315,7 @@ impl Project {
                 etag: Vec::new(),
             },
             UploadInner {
+                failed: None,
                 project: Arc::clone(&self.inner),
                 bucket: bucket.to_owned(),
                 key: key.to_owned(),
@@ -377,20 +390,19 @@ impl Project {
         let stream_id = decode_upload_id(upload_id)?;
         let enc_path =
             storj_encryption::encrypt_path(bucket, key, &self.inner.store).map_err(map_enc)?;
+        // Go `AbortUpload` sends only `BeginDeleteObject{Status: UPLOADING,
+        // StreamID}`; `FinishDeleteObject` is unimplemented on the satellite.
         let _ = self
             .inner
             .metainfo
             .begin_delete_object(
                 bucket,
                 enc_path,
-                stream_id.clone(),
+                stream_id,
                 storj_proto::metainfo::object::Status::Uploading as i32,
             )
             .await?;
-        self.inner
-            .metainfo
-            .finish_delete_object(bucket, stream_id)
-            .await
+        Ok(())
     }
 
     /// List uncommitted uploads.
@@ -403,15 +415,25 @@ impl Project {
         }
         let project = self.clone();
         let bucket = bucket.to_owned();
+        // Same prefix-relative key handling as `list_objects` (Go `ListUploads`
+        // reuses `listObjects` with `Status: UPLOADING`).
+        let codec = match crate::objects::ListKeyCodec::new(&project, &bucket, &opts.prefix) {
+            Ok(c) => c,
+            Err(e) => return Box::pin(stream::once(async move { Err(e) })),
+        };
+        let cursor = match codec.encode_cursor(&opts.cursor) {
+            Ok(c) => c,
+            Err(e) => return Box::pin(stream::once(async move { Err(e) })),
+        };
         Box::pin(stream::try_unfold(
             ListUploadsState {
                 project,
                 bucket,
                 opts,
-                cursor: Vec::new(),
+                codec,
+                cursor,
                 pending: VecDeque::new(),
                 done: false,
-                started: false,
             },
             |mut st| async move {
                 loop {
@@ -421,29 +443,17 @@ impl Project {
                     if st.done {
                         return Ok(None);
                     }
-                    let enc_prefix = if st.opts.prefix.is_empty() {
-                        Vec::new()
-                    } else {
-                        storj_encryption::encrypt_prefix(
-                            &st.bucket,
-                            &st.opts.prefix,
-                            &st.project.inner.store,
-                        )
-                        .map_err(map_enc)?
-                    };
-                    let enc_cursor = if !st.started && !st.opts.cursor.is_empty() {
-                        let plain = format!("{}{}", st.opts.prefix, st.opts.cursor);
-                        storj_encryption::encrypt_path(&st.bucket, &plain, &st.project.inner.store)
-                            .map_err(map_enc)?
-                    } else {
-                        st.cursor.clone()
-                    };
-                    st.started = true;
                     let page = st
                         .project
                         .inner
                         .metainfo
-                        .list_pending_uploads(&st.bucket, enc_prefix, enc_cursor, &st.opts)
+                        .list_pending_uploads(
+                            &st.bucket,
+                            st.codec.encrypted_prefix().to_vec(),
+                            st.cursor.clone(),
+                            st.codec.arbitrary_prefix(),
+                            &st.opts,
+                        )
                         .await?;
                     if page.items.is_empty() {
                         st.done = true;
@@ -461,18 +471,11 @@ impl Project {
                         {
                             continue;
                         }
-                        let key_bytes = storj_encryption::decrypt_path(
-                            &st.bucket,
-                            &item.encrypted_object_key,
-                            &st.project.inner.store,
-                        )
-                        .map_err(map_enc)?;
-                        let key = String::from_utf8(key_bytes).map_err(|e| {
-                            Error::new(
-                                ErrorKind::Protocol,
-                                format!("listed object key is not utf-8: {e}"),
-                            )
-                        })?;
+                        let key = match st.codec.decode_key(item.encrypted_object_key) {
+                            Ok(k) => k,
+                            Err(e) if crate::objects::skippable_list_decrypt(&e) => continue,
+                            Err(e) => return Err(e),
+                        };
                         st.pending.push_back(UploadInfo {
                             key,
                             upload_id: storj_uplink::multipart::encode_upload_id(&item.stream_id),
@@ -598,10 +601,10 @@ struct ListUploadsState {
     project: Project,
     bucket: String,
     opts: ListUploadsOptions,
+    codec: crate::objects::ListKeyCodec,
     cursor: Vec<u8>,
     pending: VecDeque<UploadInfo>,
     done: bool,
-    started: bool,
 }
 
 struct ListPartsState {
@@ -752,7 +755,7 @@ pub(crate) fn map_uplink(e: storj_uplink::Error) -> Error {
 }
 
 async fn download_segments(
-    project: &ProjectInner,
+    project: Arc<ProjectInner>,
     bucket: &str,
     key: &str,
     content_key: storj_encryption::Key,
@@ -856,11 +859,15 @@ async fn download_segments(
             .unwrap_or_default()
     });
 
-    let mut plaintext = Vec::new();
-    for seg in downloaded {
-        plaintext.extend(
-            decrypt_one_segment(
-                project,
+    // Stream segment by segment: the reader pulls the next decrypted segment
+    // lazily, and the producer runs at most one segment ahead (bounded
+    // channel), so memory is bounded by ~2 segments regardless of object size
+    // and the first bytes are available before later segments are fetched.
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>>>(1);
+    let producer = tokio::spawn(async move {
+        for seg in downloaded {
+            let res = decrypt_one_segment(
+                &project,
                 &content_key,
                 cipher,
                 block_size,
@@ -868,17 +875,14 @@ async fn download_segments(
                 plain_len,
                 seg,
             )
-            .await?,
-        );
-    }
-    let want = usize::try_from(plain_len).unwrap_or(usize::MAX);
-    if plaintext.len() != want {
-        return Err(Error::new(
-            ErrorKind::Protocol,
-            "download missing segment data",
-        ));
-    }
-    Ok(Download::new(info, plaintext))
+            .await;
+            let failed = res.is_err();
+            if tx.send(res).await.is_err() || failed {
+                return;
+            }
+        }
+    });
+    Ok(Download::streaming(info, rx, producer, plain_len))
 }
 
 async fn decrypt_one_segment(
@@ -939,7 +943,7 @@ async fn decrypt_one_segment(
     let shares = download_pieces_long_tail(LongTailDownload {
         assignments,
         piece_key,
-        satellite_ca: project.satellite_ca.clone(),
+        satellite_cert: project.satellite_cert.clone(),
         identity: project.identity.clone(),
         pool: project.pool.clone(),
         rs,
@@ -949,22 +953,28 @@ async fn decrypt_one_segment(
     })
     .await
     .map_err(map_uplink)?;
-    let decoded = decode_encrypted(&shares, &rs).map_err(map_uplink)?;
     let decoded_offset = usize::try_from(piece_off.saturating_mul(rs.k as i64)).unwrap_or(0);
     let encrypted_size = usize::try_from(seg.segment_size.max(0)).unwrap_or(0);
-    decrypt_remote(RemoteDecrypt {
-        decoded: &decoded,
-        decoded_offset,
-        encrypted_size,
-        cipher,
-        key: &segment_key,
-        nonce: &nonce,
-        encrypted_block_size: block_size,
-        plain_start: local_start,
-        plain_len: local_len,
-        plain_size: seg.plain_size,
+    let plain_size = seg.plain_size;
+    // RS decode + AEAD decrypt of a 64 MiB segment is CPU-bound: keep it off
+    // the async executor threads (the upload side already does this).
+    tokio::task::spawn_blocking(move || {
+        let decoded = decode_encrypted(&shares, &rs).map_err(map_uplink)?;
+        decrypt_remote(RemoteDecrypt {
+            decoded: &decoded,
+            decoded_offset,
+            encrypted_size,
+            cipher,
+            key: &segment_key,
+            nonce: &nonce,
+            encrypted_block_size: block_size,
+            plain_start: local_start,
+            plain_len: local_len,
+            plain_size,
+        })
+        .map_err(map_uplink)
     })
-    .map_err(map_uplink)
+    .await?
 }
 
 fn slice_plain(full: &[u8], start: i64, len: i64) -> Vec<u8> {
@@ -1023,6 +1033,12 @@ struct SegmentCommit {
 
 pub(crate) async fn commit_upload(mut inner: UploadInner) -> Result<Object> {
     use storj_uplink::pipeline::encrypt_user_data;
+
+    if let Some(e) = inner.failed_error() {
+        // A segment flush already failed: never commit a partial object.
+        let _ = abort_upload(inner).await;
+        return Err(e);
+    }
 
     let abort = PendingAbort {
         project: Arc::clone(&inner.project),
@@ -1170,8 +1186,8 @@ async fn commit_one_segment(job: SegmentCommit) -> Result<i64> {
             assignments,
             segment_id: begin.segment_id.clone(),
             piece_key,
-            pieces,
-            satellite_ca: project.satellite_ca.clone(),
+            pieces: Arc::new(pieces),
+            satellite_cert: project.satellite_cert.clone(),
             identity: project.identity.clone(),
             pool: project.pool.clone(),
             rs,
@@ -1264,14 +1280,13 @@ async fn delete_pending_upload(pending: &PendingAbort) -> Result<()> {
             storj_proto::metainfo::object::Status::Uploading as i32,
         )
         .await?;
-    pending
-        .project
-        .metainfo
-        .finish_delete_object(&pending.bucket, pending.stream_id.clone())
-        .await
+    Ok(())
 }
 
 pub(crate) async fn commit_part(mut inner: UploadInner) -> Result<()> {
+    if let Some(e) = inner.failed_error() {
+        return Err(e);
+    }
     if let Some(handle) = inner.pending_flush.take() {
         let flushed = handle.await??;
         inner.apply_flush(flushed);
@@ -1351,7 +1366,7 @@ mod tests {
                 pool: storj_uplink::pool::ConnectionPool::new(
                     storj_uplink::pool::PoolConfig::for_redundancy_n(4),
                 ),
-                satellite_ca: Vec::new(),
+                satellite_cert: Vec::new(),
                 dial_timeout: std::time::Duration::from_secs(1),
             }),
         }

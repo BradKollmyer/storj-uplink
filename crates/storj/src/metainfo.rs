@@ -16,13 +16,13 @@ use storj_proto::metainfo::{
     BeginMoveObjectRequest, BeginObjectRequest, BeginSegmentRequest, CommitObjectRequest,
     CommitSegmentRequest, CompressedBatchResponse, CreateBucketRequest, DeleteBucketRequest,
     DownloadObjectRequest, DownloadSegmentRequest, FinishCopyObjectRequest,
-    FinishDeleteObjectRequest, FinishMoveObjectRequest, GetBucketObjectLockConfigurationRequest,
-    GetBucketRequest, GetObjectLegalHoldRequest, GetObjectRequest, GetObjectRetentionRequest,
-    ListBucketsRequest, ListObjectsRequest, ListSegmentsRequest, MakeInlineSegmentRequest,
-    ObjectListItemIncludes, ProjectInfoRequest, ProjectInfoResponse, Range, RequestHeader,
-    RetryBeginSegmentPiecesRequest, RevokeApiKeyRequest, SegmentPosition,
-    SetBucketObjectLockConfigurationRequest, SetObjectLegalHoldRequest, SetObjectRetentionRequest,
-    UpdateObjectMetadataRequest, batch_request_item, batch_response_item,
+    FinishMoveObjectRequest, GetBucketObjectLockConfigurationRequest, GetBucketRequest,
+    GetObjectLegalHoldRequest, GetObjectRequest, GetObjectRetentionRequest, ListBucketsRequest,
+    ListObjectsRequest, ListSegmentsRequest, MakeInlineSegmentRequest, ObjectListItemIncludes,
+    ProjectInfoRequest, ProjectInfoResponse, Range, RequestHeader, RetryBeginSegmentPiecesRequest,
+    RevokeApiKeyRequest, SegmentPosition, SetBucketObjectLockConfigurationRequest,
+    SetObjectLegalHoldRequest, SetObjectRetentionRequest, UpdateObjectMetadataRequest,
+    batch_request_item, batch_response_item,
 };
 use storj_proto::rpc;
 use storj_rpc::tls::client_config;
@@ -99,7 +99,7 @@ pub(crate) struct MetainfoClient {
     user_agent: Vec<u8>,
     identity: Identity,
     dial_timeout: Duration,
-    satellite_ca: Mutex<Vec<u8>>,
+    satellite_cert: Mutex<Vec<u8>>,
     conn: Mutex<Option<Conn<SatelliteStream>>>,
 }
 
@@ -118,7 +118,7 @@ impl MetainfoClient {
                 .to_vec(),
             identity,
             dial_timeout: config.dial_timeout_or_default(),
-            satellite_ca: Mutex::new(Vec::new()),
+            satellite_cert: Mutex::new(Vec::new()),
             conn: Mutex::new(None),
         };
         client.ensure_connected().await?;
@@ -140,7 +140,7 @@ impl MetainfoClient {
             user_agent: Vec::new(),
             identity: Identity::generate().expect("ephemeral identity"),
             dial_timeout: Duration::from_secs(1),
-            satellite_ca: Mutex::new(Vec::new()),
+            satellite_cert: Mutex::new(Vec::new()),
             conn: Mutex::new(None),
         }
     }
@@ -153,8 +153,8 @@ impl MetainfoClient {
         &self.api_key
     }
 
-    pub(crate) async fn satellite_ca(&self) -> Vec<u8> {
-        self.satellite_ca.lock().await.clone()
+    pub(crate) async fn satellite_cert(&self) -> Vec<u8> {
+        self.satellite_cert.lock().await.clone()
     }
 
     fn header(&self) -> RequestHeader {
@@ -179,14 +179,17 @@ impl MetainfoClient {
             let connector = TlsConnector::from(Arc::new(tls_cfg));
             let server_name = server_name_from_address(&self.node.address)?;
             let tls = connector.connect(server_name, tcp).await?;
-            if let Some(ca) = tls
+            // The satellite signs order limits with its leaf key (Go
+            // `SignerFromFullIdentity` uses `FullIdentity.Key`), so keep the
+            // leaf (chain[0]), not the CA.
+            if let Some(leaf) = tls
                 .get_ref()
                 .1
                 .peer_certificates()
-                .and_then(|c| c.last())
+                .and_then(|c| c.first())
                 .map(|c| c.as_ref().to_vec())
             {
-                *self.satellite_ca.lock().await = ca;
+                *self.satellite_cert.lock().await = leaf;
             }
             Ok::<_, Error>(Conn::new(tls))
         };
@@ -195,20 +198,40 @@ impl MetainfoClient {
             .map_err(|_| Error::new(ErrorKind::Protocol, "satellite dial timed out"))?
     }
 
+    /// Invoke `rpc`, retrying transport failures only when `idempotent`
+    /// (design: `CommitSegment`/`CommitObject`/`Begin*` get no automatic retry
+    /// because a lost response does not mean the satellite did not apply it).
     async fn invoke(&self, rpc: &str, request: &[u8], bucket: &str, key: &str) -> Result<Vec<u8>> {
+        self.invoke_with(rpc, request, bucket, key, is_idempotent_rpc(rpc))
+            .await
+    }
+
+    async fn invoke_with(
+        &self,
+        rpc: &str,
+        request: &[u8],
+        bucket: &str,
+        key: &str,
+        idempotent: bool,
+    ) -> Result<Vec<u8>> {
+        let attempts = if idempotent { SATELLITE_ATTEMPTS } else { 1 };
         let mut last_err = None;
-        for attempt in 0..SATELLITE_ATTEMPTS {
+        for attempt in 0..attempts {
             match self.invoke_once(rpc, request).await {
                 Ok(body) => return Ok(body),
-                Err(e) if attempt + 1 < SATELLITE_ATTEMPTS && is_retryable(&e) => {
+                Err(e) if attempt + 1 < attempts && is_retryable(&e) => {
                     last_err = Some(e);
-                    let backoff = Duration::from_millis(200 * 2u64.pow(attempt));
+                    // Exponential backoff with jitter, capped at 2 s.
+                    let base = 200 * 2u64.pow(attempt);
+                    let jitter = rand::random::<u64>() % (base / 2 + 1);
+                    let backoff = Duration::from_millis(base + jitter);
                     tokio::time::sleep(backoff.min(Duration::from_secs(2))).await;
                 }
-                Err(e) => return Err(map_rpc_error(e, bucket, key)),
+                Err(e) => return Err(map_rpc_error(rpc, e, bucket, key)),
             }
         }
         Err(map_rpc_error(
+            rpc,
             last_err.expect("retry loop ran"),
             bucket,
             key,
@@ -336,9 +359,16 @@ impl MetainfoClient {
             header: Some(self.header()),
             requests,
         };
+        let idempotent = batch.requests.iter().all(is_idempotent_batch_item);
         let wrapped = encode_batch_request(&batch);
         let body = self
-            .invoke(rpc::COMPRESSED_BATCH, &wrapped.encode_to_vec(), bucket, key)
+            .invoke_with(
+                rpc::COMPRESSED_BATCH,
+                &wrapped.encode_to_vec(),
+                bucket,
+                key,
+                idempotent,
+            )
             .await?;
         let resp = CompressedBatchResponse::decode(body.as_slice()).map_err(map_decode)?;
         let decoded = decode_batch_response(&resp)
@@ -678,6 +708,7 @@ impl MetainfoClient {
         bucket: &str,
         encrypted_prefix: Vec<u8>,
         encrypted_cursor: Vec<u8>,
+        arbitrary_prefix: bool,
         opts: &crate::types::ListUploadsOptions,
     ) -> Result<metainfo::ListObjectsResponse> {
         let req = ListObjectsRequest {
@@ -690,6 +721,7 @@ impl MetainfoClient {
             },
             encrypted_prefix,
             encrypted_cursor,
+            arbitrary_prefix,
             recursive: opts.recursive,
             limit: 0,
             status: metainfo::object::Status::Uploading as i32,
@@ -748,33 +780,6 @@ impl MetainfoClient {
             _ => Err(Error::new(
                 ErrorKind::Protocol,
                 "unexpected BeginDeleteObject response",
-            )),
-        }
-    }
-
-    pub(crate) async fn finish_delete_object(
-        &self,
-        bucket: &str,
-        stream_id: Vec<u8>,
-    ) -> Result<()> {
-        let req = FinishDeleteObjectRequest {
-            header: Some(self.header()),
-            stream_id,
-        };
-        let items = self
-            .compressed_batch(
-                vec![BatchRequestItem {
-                    request: Some(batch_request_item::Request::ObjectFinishDelete(req)),
-                }],
-                bucket,
-                "",
-            )
-            .await?;
-        match Self::expect_one(items, "FinishDeleteObject")? {
-            batch_response_item::Response::ObjectFinishDelete(_) => Ok(()),
-            _ => Err(Error::new(
-                ErrorKind::Protocol,
-                "unexpected FinishDeleteObject response",
             )),
         }
     }
@@ -1176,17 +1181,19 @@ fn system_time_to_proto(t: std::time::SystemTime) -> prost_types::Timestamp {
 }
 
 pub(crate) fn object_from_proto(pb: Option<metainfo::Object>, plaintext_key: &str) -> Object {
-    let (created, expires, content_length) = match &pb {
+    let (created, expires, content_length, version) = match &pb {
         Some(o) => (
             o.created_at.map(|t| proto_timestamp(Some(t))),
             o.expires_at.map(|t| proto_timestamp(Some(t))),
             o.plain_size,
+            o.object_version.clone(),
         ),
-        None => (None, None, 0),
+        None => (None, None, 0, Vec::new()),
     };
     Object {
         key: plaintext_key.to_owned(),
         is_prefix: false,
+        version,
         system: SystemMetadata {
             created,
             expires,
@@ -1216,6 +1223,38 @@ fn host_from_address(address: &str) -> &str {
         Some((host, port)) if port.chars().all(|c| c.is_ascii_digit()) => host,
         _ => address,
     }
+}
+
+/// Unary RPCs that are safe to re-send after a lost response.
+fn is_idempotent_rpc(rpc: &str) -> bool {
+    matches!(
+        rpc,
+        rpc::PROJECT_INFO
+            | rpc::GET_BUCKET
+            | rpc::LIST_BUCKETS
+            | rpc::GET_OBJECT_RETENTION
+            | rpc::GET_OBJECT_LEGAL_HOLD
+            | rpc::GET_BUCKET_OBJECT_LOCK_CONFIGURATION
+    )
+}
+
+/// Batch items that are safe to re-send after a lost response: reads and
+/// listings. `Begin*`, `Commit*`, `MakeInline`, `Delete`, `Finish{Copy,Move}`
+/// and `RetryBeginSegmentPieces` mutate satellite state and are never retried.
+fn is_idempotent_batch_item(item: &BatchRequestItem) -> bool {
+    use batch_request_item::Request as R;
+    matches!(
+        item.request,
+        Some(
+            R::BucketGet(_)
+                | R::BucketList(_)
+                | R::ObjectGet(_)
+                | R::ObjectList(_)
+                | R::ObjectDownload(_)
+                | R::SegmentDownload(_)
+                | R::SegmentList(_)
+        )
+    )
 }
 
 fn is_retryable(err: &storj_rpc::Error) -> bool {
@@ -1253,9 +1292,7 @@ pub(crate) fn map_identity_err(e: storj_rpc::IdentityError) -> Error {
         | storj_rpc::IdentityError::NodeUrl(_) => {
             Error::new(ErrorKind::InvalidGrant, e.to_string()).with_source(e)
         }
-        storj_rpc::IdentityError::Certificate(_)
-        | storj_rpc::IdentityError::NoCaKey
-        | storj_rpc::IdentityError::Signature => {
+        storj_rpc::IdentityError::Certificate(_) | storj_rpc::IdentityError::Signature => {
             Error::new(ErrorKind::Protocol, e.to_string()).with_source(e)
         }
     }
@@ -1265,38 +1302,55 @@ pub(crate) fn parse_satellite_url(address: &str) -> Result<NodeUrl> {
     parse_node_url(address).map_err(map_identity_err)
 }
 
-pub(crate) fn map_rpc_error(err: storj_rpc::Error, bucket: &str, key: &str) -> Error {
+pub(crate) fn map_rpc_error(rpc: &str, err: storj_rpc::Error, bucket: &str, key: &str) -> Error {
     match err {
-        storj_rpc::Error::Remote { code, message } => map_remote(code, &message, bucket, key),
+        storj_rpc::Error::Remote { code, message } => map_remote(rpc, code, &message, bucket, key),
         storj_rpc::Error::Io(e) => Error::from(e),
         other => Error::new(ErrorKind::Protocol, other.to_string()).with_source(other),
     }
 }
 
-fn map_remote(code: u64, message: &str, bucket: &str, key: &str) -> Error {
+/// gRPC code 16.
+const RPC_UNAUTHENTICATED: u64 = 16;
+
+/// Map a satellite error the way Go uplink's `convertKnownErrors` plus its
+/// per-call-site checks do: generic codes are only turned into bucket/object
+/// kinds when the RPC (or the satellite's message) says so, never merely
+/// because a bucket or key happened to be in scope.
+fn map_remote(rpc: &str, code: u64, message: &str, bucket: &str, key: &str) -> Error {
+    let lower = message.to_ascii_lowercase();
     match code {
         RPC_CANCELED => Error::new(ErrorKind::Canceled, message),
-        RPC_INVALID_ARGUMENT if !key.is_empty() => Error::new(
-            ErrorKind::ObjectKeyInvalid,
-            format!("object key invalid ({key:?})"),
-        ),
-        RPC_INVALID_ARGUMENT => Error::new(
-            ErrorKind::BucketNameInvalid,
-            format!("bucket name invalid ({bucket:?})"),
-        ),
+        // Go: CreateBucket maps InvalidArgument to ErrBucketNameInvalid.
+        RPC_INVALID_ARGUMENT if rpc == rpc::CREATE_BUCKET || lower.contains("bucket name") => {
+            Error::new(
+                ErrorKind::BucketNameInvalid,
+                format!("bucket name invalid ({bucket:?})"),
+            )
+        }
+        RPC_INVALID_ARGUMENT
+            if !key.is_empty()
+                && (lower.contains("object key") || lower.contains("encrypted path")) =>
+        {
+            Error::new(
+                ErrorKind::ObjectKeyInvalid,
+                format!("object key invalid ({key:?})"),
+            )
+        }
+        RPC_INVALID_ARGUMENT => Error::new(ErrorKind::Protocol, message),
         RPC_NOT_FOUND => {
-            if message.starts_with("bucket not found") {
+            if lower.starts_with("bucket not found") {
                 let name = bucket_from_not_found(message).unwrap_or(bucket);
                 Error::new(
                     ErrorKind::BucketNotFound,
                     format!("bucket not found ({name:?})"),
                 )
-            } else if message.starts_with("object not found") {
+            } else if lower.starts_with("object not found") {
                 Error::new(
                     ErrorKind::ObjectNotFound,
                     format!("object not found ({key:?})"),
                 )
-            } else if !bucket.is_empty() {
+            } else if rpc == rpc::GET_BUCKET || rpc == rpc::DELETE_BUCKET {
                 Error::new(
                     ErrorKind::BucketNotFound,
                     format!("bucket not found ({bucket:?})"),
@@ -1326,9 +1380,16 @@ fn map_remote(code: u64, message: &str, bucket: &str, key: &str) -> Error {
                 Error::new(ErrorKind::Protocol, message)
             }
         }
-        RPC_FAILED_PRECONDITION if !bucket.is_empty() => Error::new(
-            ErrorKind::BucketNotEmpty,
-            format!("bucket not empty ({bucket:?})"),
+        // Go: only DeleteBucket maps FailedPrecondition to ErrBucketNotEmpty.
+        RPC_FAILED_PRECONDITION if rpc == rpc::DELETE_BUCKET || lower.contains("not empty") => {
+            Error::new(
+                ErrorKind::BucketNotEmpty,
+                format!("bucket not empty ({bucket:?})"),
+            )
+        }
+        RPC_UNAUTHENTICATED => Error::new(
+            ErrorKind::PermissionDenied,
+            format!("permission denied ({message})"),
         ),
         RPC_OBJECT_LOCK_ENDPOINTS_DISABLED => {
             Error::new(ErrorKind::Protocol, "object lock is not enabled")
@@ -1408,36 +1469,37 @@ mod tests {
 
     #[test]
     fn remote_not_found_is_bucket() {
-        let e = map_remote(RPC_NOT_FOUND, "bucket not found: logs", "logs", "");
+        let e = map_remote("", RPC_NOT_FOUND, "bucket not found: logs", "logs", "");
         assert_eq!(e.kind(), ErrorKind::BucketNotFound);
         assert!(e.to_string().contains("logs"));
     }
 
     #[test]
     fn remote_already_exists() {
-        let e = map_remote(RPC_ALREADY_EXISTS, "exists", "photos", "");
+        let e = map_remote("", RPC_ALREADY_EXISTS, "exists", "photos", "");
         assert_eq!(e.kind(), ErrorKind::BucketAlreadyExists);
         assert!(e.to_string().contains("photos"));
     }
 
     #[test]
     fn remote_failed_precondition_not_empty() {
-        let e = map_remote(RPC_FAILED_PRECONDITION, "not empty", "b", "");
+        let e = map_remote("", RPC_FAILED_PRECONDITION, "not empty", "b", "");
         assert_eq!(e.kind(), ErrorKind::BucketNotEmpty);
     }
 
     #[test]
     fn remote_resource_exhausted_kinds() {
         assert_eq!(
-            map_remote(RPC_RESOURCE_EXHAUSTED, "Exceeded Usage Limit", "", "").kind(),
+            map_remote("", RPC_RESOURCE_EXHAUSTED, "Exceeded Usage Limit", "", "").kind(),
             ErrorKind::BandwidthLimitExceeded
         );
         assert_eq!(
-            map_remote(RPC_RESOURCE_EXHAUSTED, "Too Many Requests", "", "").kind(),
+            map_remote("", RPC_RESOURCE_EXHAUSTED, "Too Many Requests", "", "").kind(),
             ErrorKind::TooManyRequests
         );
         assert_eq!(
             map_remote(
+                "",
                 RPC_RESOURCE_EXHAUSTED,
                 "project Exceeded Storage Limit",
                 "",
@@ -1448,6 +1510,7 @@ mod tests {
         );
         assert_eq!(
             map_remote(
+                "",
                 RPC_RESOURCE_EXHAUSTED,
                 "project Exceeded Segments Limit",
                 "",
@@ -1480,33 +1543,34 @@ mod tests {
     #[test]
     fn object_lock_rpc_codes() {
         assert_eq!(
-            map_remote(RPC_OBJECT_LOCK_OBJECT_RETENTION_MISSING, "", "b", "k").kind(),
+            map_remote("", RPC_OBJECT_LOCK_OBJECT_RETENTION_MISSING, "", "b", "k").kind(),
             ErrorKind::Protocol
         );
-        let e = map_remote(RPC_OBJECT_LOCK_OBJECT_RETENTION_MISSING, "", "b", "k");
+        let e = map_remote("", RPC_OBJECT_LOCK_OBJECT_RETENTION_MISSING, "", "b", "k");
         assert!(is_retention_not_found(&e), "{e}");
         assert_eq!(
-            map_remote(RPC_OBJECT_LOCK_BUCKET_CONFIG_MISSING, "", "b", "").to_string(),
+            map_remote("", RPC_OBJECT_LOCK_BUCKET_CONFIG_MISSING, "", "b", "").to_string(),
             "protocol: object lock is not enabled for this bucket"
         );
         assert_eq!(
-            map_remote(RPC_OBJECT_LOCK_INVALID_BUCKET_CONFIG, "", "b", "").kind(),
+            map_remote("", RPC_OBJECT_LOCK_INVALID_BUCKET_CONFIG, "", "b", "").kind(),
             ErrorKind::Protocol
         );
         assert_eq!(
-            map_remote(RPC_OBJECT_LOCK_OBJECT_PROTECTED, "", "b", "k").kind(),
+            map_remote("", RPC_OBJECT_LOCK_OBJECT_PROTECTED, "", "b", "k").kind(),
             ErrorKind::Protocol
         );
         assert_eq!(
-            map_remote(RPC_OBJECT_LOCK_UPLOAD_WITH_TTL, "", "b", "k").to_string(),
+            map_remote("", RPC_OBJECT_LOCK_UPLOAD_WITH_TTL, "", "b", "k").to_string(),
             "protocol: cannot specify an object expiration time when uploading into an Object Lock enabled bucket"
         );
         assert_eq!(
-            map_remote(RPC_OBJECT_LOCK_UPLOAD_WITH_TTL_API_KEY, "", "b", "k").to_string(),
+            map_remote("", RPC_OBJECT_LOCK_UPLOAD_WITH_TTL_API_KEY, "", "b", "k").to_string(),
             "protocol: cannot upload into an Object Lock enabled bucket using an API key that enforces an object expiration time"
         );
         assert_eq!(
             map_remote(
+                "",
                 RPC_OBJECT_LOCK_UPLOAD_WITH_TTL_AND_DEFAULT_RETENTION,
                 "",
                 "b",
@@ -1517,6 +1581,7 @@ mod tests {
         );
         assert_eq!(
             map_remote(
+                "",
                 RPC_OBJECT_LOCK_UPLOAD_WITH_TTL_API_KEY_AND_DEFAULT_RETENTION,
                 "",
                 "b",

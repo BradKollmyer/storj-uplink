@@ -1284,6 +1284,7 @@ dependencies = [
  "prost",
  "sha2",
  "storj-encryption",
+ "zeroize",
 ]
 
 [[package]]

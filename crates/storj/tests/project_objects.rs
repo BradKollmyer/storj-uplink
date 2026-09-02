@@ -1,8 +1,8 @@
 //! Object metadata operations (PR 23) and list prefix rules.
 
 use futures_util::StreamExt;
-use storj::encryption::{CipherSuite, Store, encrypt_path};
 use storj::{CustomMetadata, EncryptionKey, ErrorKind, ListObjectsOptions, Permission, Project};
+use storj_encryption::{CipherSuite, Store, encrypt_path};
 use storj_test::MockSatellite;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -318,7 +318,7 @@ async fn open_test_project(mock: &MockSatellite) -> Project {
 
 fn mock_aes_store() -> Store {
     let mut store = Store::new();
-    store.set_default_key(EncryptionKey::from_bytes([1u8; 32]).inner().clone());
+    store.set_default_key(storj_encryption::Key::from_bytes([1u8; 32]));
     store.set_default_path_cipher(CipherSuite::AES_GCM);
     store
 }

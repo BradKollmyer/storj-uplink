@@ -221,7 +221,7 @@ Crate root (2025): `Bucket`, `Error`, `Object`, `Project`, `Config`, `Encryption
 - Cover the 2025 `uplink` 0.11 **native Uplink** surface (grants, project, buckets, objects, multipart, copy/move, revoke, metadata) with a Tokio/`Send+Sync` API. Domain names stay familiar; signatures are not source-compatible.
 - Object Lock **RPCs** in v1.0: Put/Get object retention, Put/Get legal hold, and bucket Object Lock configuration (Go v1.14 lock surface). `Permission` lock bits remain required for `share()`.
 - `cargo build` of this crate and its dependents **never requires Go**.
-- Claim crates.io name **`storj`** as soon as PR 1 lands. Publish only the `storj` facade until 1.0.
+- crates.io publication is deferred: 1.0.0 is consumed via git/path (internal crates are `publish = false`, so `cargo publish -p storj` is not yet possible; see README).
 
 ### Non-Goals (v1)
 
@@ -243,7 +243,7 @@ Crate root (2025): `Bucket`, `Error`, `Object`, `Project`, `Config`, `Encryption
 |---|---|---|
 | K1 | **Native protocol implementation**, not FFI to `uplink-c` | Avoids Go toolchain, cgo, and blocking I/O. Enables idiomatic async. Compatibility is enforced by golden tests, not by linking Go. |
 | K2 | **Tokio is the only async runtime** | Ecosystem default; `AsyncRead`/`AsyncWrite` via `tokio::io`; cancellation via task abort + `Drop`. No async-std, no `maybe_async`. |
-| K3 | **Public crate name `storj`**, workspace of internal crates | `uplink` and `uplink-sys` are already taken on crates.io by the FFI project. `storj` is unused (crates.io keyword search, 2026-09-01). **Claim `storj` on crates.io as soon as PR 1 lands.** Facade crate re-exports the stable API. |
+| K3 | **Public crate name `storj`**, workspace of internal crates | `uplink` and `uplink-sys` are already taken on crates.io by the FFI project. `storj` is unused (crates.io keyword search, 2026-09-01). crates.io publication is deferred until the internal crates can be published (README); the facade re-exports the stable API. |
 | K4 | **Not an S3 SDK** | Native Uplink is the product. S3 is GatewayMT. Optional `object_store` impl later. |
 | K5 | **Access-grant crate is independently usable in the workspace** | Parse/restrict/serialize needs no network. Grant-only tools use `storj` facade re-exports until 1.0 (K17). |
 | K6 | **Satellite-supplied RS scheme; client does not hardcode k/m/o/n** | Production RS has moved (docs say 29/35/80/130; satellite `releaseDefault` is `29/35/80/110-256B`; US1 discussed 29/46/54/70 in 2025). BeginSegment returns the scheme. |
@@ -1507,7 +1507,7 @@ DownloadObject → segment metadata
 
 Range reads: compute encompassing encryption blocks (`CalcEncompassingBlocks`) and piece offsets. Negative offset = suffix (Go behavior).
 
-**Memory:** decode stripe-at-a-time (stripe ≈ 7 KiB plaintext at k=29, share=256), not whole segment.
+**Memory:** decode per segment with bounded look-ahead (1.0.x: the `Download` reader fetches, decodes and decrypts one segment at a time and prefetches the next); stripe-at-a-time decode is a later refinement.
 
 ### Multipart
 

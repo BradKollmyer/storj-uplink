@@ -25,9 +25,42 @@ pub(crate) fn require_bucket_name(name: &str) -> Result<()> {
 pub(crate) fn proto_timestamp(ts: Option<prost_types::Timestamp>) -> SystemTime {
     match ts {
         Some(t) if t.seconds >= 0 && t.nanos >= 0 => {
-            UNIX_EPOCH + Duration::new(t.seconds as u64, t.nanos as u32)
+            // Satellite-supplied; never panic on extremes (nanos >= 1e9 carries
+            // into seconds inside `Duration::new`, and `SystemTime + Duration`
+            // panics on overflow). Saturate instead.
+            let secs = u64::try_from(t.seconds).unwrap_or(u64::MAX);
+            let nanos = u32::try_from(t.nanos).unwrap_or(0).min(999_999_999);
+            UNIX_EPOCH
+                .checked_add(Duration::new(secs, nanos))
+                .unwrap_or(UNIX_EPOCH)
         }
         _ => UNIX_EPOCH,
+    }
+}
+
+#[cfg(test)]
+mod proto_timestamp_tests {
+    use super::*;
+
+    #[test]
+    fn extremes_do_not_panic() {
+        let max = proto_timestamp(Some(prost_types::Timestamp {
+            seconds: i64::MAX,
+            nanos: 999_999_999,
+        }));
+        assert!(max >= UNIX_EPOCH);
+        let carry = proto_timestamp(Some(prost_types::Timestamp {
+            seconds: 1,
+            nanos: 2_000_000_000,
+        }));
+        assert!(carry >= UNIX_EPOCH + Duration::from_secs(1));
+        assert_eq!(
+            proto_timestamp(Some(prost_types::Timestamp {
+                seconds: -5,
+                nanos: 0
+            })),
+            UNIX_EPOCH
+        );
     }
 }
 

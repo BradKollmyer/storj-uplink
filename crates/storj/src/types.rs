@@ -15,12 +15,20 @@ pub struct Bucket {
 }
 
 /// Object metadata. Keys are encrypted on the wire; this struct holds plaintext.
+///
+/// Produced by the satellite; `#[non_exhaustive]` so fields can be added in
+/// 1.x without breaking callers.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct Object {
     /// Plaintext object key (`/`-delimited).
     pub key: String,
     /// True when this list entry is a common prefix, not an object.
     pub is_prefix: bool,
+    /// Object version bytes as returned by the satellite (empty when unknown,
+    /// e.g. for list entries without version info). Pass to the Object Lock
+    /// methods' `version` argument to address this exact version.
+    pub version: Vec<u8>,
     /// System timestamps and length.
     pub system: SystemMetadata,
     /// User custom metadata.
@@ -114,6 +122,7 @@ impl DownloadOptions {
 
 /// Go `storj.RetentionMode`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum RetentionMode {
     /// Governance mode (bypassable with the bypass permission).
     Governance,
@@ -157,8 +166,9 @@ pub struct BucketObjectLockConfiguration {
     pub default_retention: Option<DefaultRetention>,
 }
 
-/// 2025: `object::upload::Info`.
+/// 2025: `object::upload::Info`. Satellite-produced; `#[non_exhaustive]`.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct UploadInfo {
     /// Object key.
     pub key: String,
@@ -204,8 +214,9 @@ pub struct ListUploadPartsOptions {
     pub cursor: u32,
 }
 
-/// 2025: `object::upload::Part`.
+/// 2025: `object::upload::Part`. Satellite-produced; `#[non_exhaustive]`.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct Part {
     /// Part number (1-indexed in S3; Storj follows Go uplink).
     pub part_number: u32,

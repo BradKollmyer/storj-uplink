@@ -52,6 +52,7 @@ const RPC_PERMISSION_DENIED: u64 = 7;
 const RPC_FAILED_PRECONDITION: u64 = 9;
 const RPC_INTERNAL: u64 = 13;
 const RPC_UNIMPLEMENTED: u64 = 12;
+const RPC_UNAUTHENTICATED: u64 = 16;
 const RPC_OBJECT_LOCK_BUCKET_CONFIG_MISSING: u64 = 10003;
 const RPC_OBJECT_LOCK_OBJECT_RETENTION_MISSING: u64 = 10004;
 const RPC_OBJECT_LOCK_INVALID_BUCKET_CONFIG: u64 = 10007;
@@ -163,12 +164,12 @@ impl MockSatellite {
         let api_key = api.serialize();
         let api_key_raw = api.serialize_raw();
         let project_salt = PROJECT_SALT.to_vec();
-        let sat_ca = identity.ca_der().as_ref().to_vec();
+        let sat_cert = identity.leaf_der().as_ref().to_vec();
         let piece_key = PiecePrivateKey::generate().to_bytes().to_vec();
 
         let mut sns = Vec::new();
         for _ in 0..6 {
-            sns.push(Arc::new(MockStorageNode::start(sat_ca.clone()).await));
+            sns.push(Arc::new(MockStorageNode::start(sat_cert.clone()).await));
         }
 
         let state = Arc::new(Mutex::new(MockState {
@@ -962,13 +963,19 @@ fn begin_delete(
     })
 }
 
+/// The production satellite embeds `DRPCMetainfoUnimplementedServer` and
+/// never implements `FinishDeleteObject`; Go uplink never calls it. Mirror
+/// that so a client regression surfaces here.
 fn finish_delete(
     req: FinishDeleteObjectRequest,
     state: &Mutex<MockState>,
 ) -> Result<FinishDeleteObjectResponse, (u64, String)> {
     let st = state.lock().expect("mock state");
     check_key(&req.header, &st)?;
-    Ok(FinishDeleteObjectResponse {})
+    Err((
+        RPC_UNIMPLEMENTED,
+        "FinishDeleteObject is unimplemented".into(),
+    ))
 }
 
 fn get_object(
@@ -1379,7 +1386,8 @@ fn retry_pieces(
     drop(st);
     let pk = PiecePrivateKey::from_bytes(&piece_key)
         .map_err(|e| (RPC_INVALID_ARGUMENT, e.to_string()))?;
-    let mut addressed_limits = Vec::new();
+    // Fresh limits for the retried piece numbers only, on different nodes.
+    let mut replacements: HashMap<i32, AddressedOrderLimit> = HashMap::new();
     for (i, num) in req.retry_piece_numbers.iter().enumerate() {
         let sn_idx = (4 + i) % sns.len().max(1);
         let sn = sns
@@ -1387,28 +1395,57 @@ fn retry_pieces(
             .or_else(|| sns.first())
             .ok_or_else(|| (RPC_INVALID_ARGUMENT, "no storage nodes".into()))?;
         let tags = sn_tags.get(sn_idx).cloned().unwrap_or_default();
-        addressed_limits.push(signed_limit(
-            identity,
-            sn,
-            &pk,
+        replacements.insert(
             *num,
-            &new_id,
-            None,
-            64 * 1024,
-            tags,
-            PieceAction::Put,
-        )?);
+            signed_limit(
+                identity,
+                sn,
+                &pk,
+                *num,
+                &new_id,
+                None,
+                64 * 1024,
+                tags,
+                PieceAction::Put,
+            )?,
+        );
     }
+    // Like the real satellite, answer with the FULL n-length list indexed by
+    // piece number: untouched pieces keep their original limits, retried
+    // pieces get the replacements. Positions with no limit are empty entries.
+    let mut addressed_limits = Vec::new();
     if let Some(sid) = stream_id {
         let mut st = state.lock().expect("mock state");
         if let Some(pending) = st.pending.get_mut(&sid) {
             if let Some(mut inflight) = pending.in_flight.remove(&req.segment_id) {
-                for (i, limit) in addressed_limits.iter().enumerate() {
-                    let num = req.retry_piece_numbers.get(i).copied().unwrap_or(i as i32);
-                    inflight.piece_limits.insert(num, limit.clone());
+                for (num, limit) in &replacements {
+                    inflight.piece_limits.insert(*num, limit.clone());
+                }
+                let n = inflight
+                    .piece_limits
+                    .keys()
+                    .copied()
+                    .max()
+                    .map_or(0, |m| m + 1);
+                for num in 0..n {
+                    addressed_limits
+                        .push(inflight.piece_limits.get(&num).cloned().unwrap_or_default());
                 }
                 pending.in_flight.insert(new_id.clone(), inflight);
             }
+        }
+    }
+    if addressed_limits.is_empty() {
+        // Unknown segment: still shaped as a full list up to the highest
+        // retried piece number.
+        let n = req
+            .retry_piece_numbers
+            .iter()
+            .copied()
+            .max()
+            .map_or(0, |m| m + 1);
+        for num in 0..n {
+            addressed_limits.push(replacements.get(&num).cloned().unwrap_or_default());
         }
     }
     Ok(RetryBeginSegmentPiecesResponse {
@@ -1636,17 +1673,20 @@ fn list_uploading_objects(
     st: &MockState,
     name: &str,
 ) -> Result<ListObjectsResponse, (u64, String)> {
-    let mut items: Vec<&PendingObject> = st
+    // Like metabase, keys (and the cursor) are relative to `encrypted_prefix`.
+    let mut items: Vec<(Vec<u8>, &PendingObject)> = st
         .pending
         .values()
         .filter(|p| p.bucket == name)
-        .filter(|p| req.encrypted_prefix.is_empty() || p.enc_key.starts_with(&req.encrypted_prefix))
-        .filter(|p| {
-            req.encrypted_cursor.is_empty()
-                || p.enc_key.as_slice() > req.encrypted_cursor.as_slice()
+        .filter_map(|p| {
+            strip_list_prefix(&p.enc_key, &req.encrypted_prefix, req.arbitrary_prefix)
+                .map(|rem| (rem, p))
+        })
+        .filter(|(rem, _)| {
+            req.encrypted_cursor.is_empty() || rem.as_slice() > req.encrypted_cursor.as_slice()
         })
         .collect();
-    items.sort_by(|a, b| a.enc_key.cmp(&b.enc_key));
+    items.sort_by(|a, b| a.0.cmp(&b.0));
     let delimiter = if req.recursive {
         None
     } else if req.delimiter.is_empty() {
@@ -1656,15 +1696,11 @@ fn list_uploading_objects(
     };
     let mut out = Vec::new();
     let mut seen_prefix = BTreeSet::new();
-    for pending in items {
-        let remainder = pending
-            .enc_key
-            .strip_prefix(req.encrypted_prefix.as_slice())
-            .unwrap_or(pending.enc_key.as_slice());
+    for (remainder, pending) in items {
+        let remainder = remainder.as_slice();
         if let Some(del) = delimiter {
             if let Some(idx) = remainder.iter().position(|b| *b == del) {
-                let mut prefix_key = req.encrypted_prefix.clone();
-                prefix_key.extend_from_slice(&remainder[..=idx]);
+                let prefix_key = remainder[..=idx].to_vec();
                 if seen_prefix.insert(prefix_key.clone()) {
                     out.push(ObjectListItem {
                         encrypted_object_key: prefix_key,
@@ -1678,7 +1714,7 @@ fn list_uploading_objects(
         }
         let plain_size: i64 = pending.segments.iter().map(|s| s.plain_size).sum();
         out.push(ObjectListItem {
-            encrypted_object_key: pending.enc_key.clone(),
+            encrypted_object_key: remainder.to_vec(),
             status: ObjectStatus::Uploading as i32,
             created_at: Some(timestamp(pending.created)),
             expires_at: pending.expires.map(timestamp),
@@ -1953,15 +1989,41 @@ fn object_lock_rec_mut<'a>(
         .or_default())
 }
 
+/// Secret the mock's root API key was minted with (see `MockSatellite::start`).
+const MOCK_MACAROON_SECRET: [u8; 32] = [0x42; 32];
+
+/// Like the satellite: the key must derive from our root (same head), its
+/// HMAC chain must validate under our secret, and time caveats must hold.
 fn check_key(header: &Option<RequestHeader>, state: &MockState) -> Result<(), (u64, String)> {
     let got = header.as_ref().map(|h| h.api_key.as_slice()).unwrap_or(&[]);
     if key_revoked(got, &state.revoked) {
         return Err((RPC_PERMISSION_DENIED, "permission denied".into()));
     }
-    if same_macaroon_head(got, &state.api_key) {
-        return Ok(());
+    if !same_macaroon_head(got, &state.api_key) {
+        return Err((RPC_PERMISSION_DENIED, "permission denied".into()));
     }
-    Err((RPC_PERMISSION_DENIED, "permission denied".into()))
+    let mac = storj_access::Macaroon::parse(got)
+        .map_err(|_| (RPC_UNAUTHENTICATED, "invalid api key".to_string()))?;
+    if !mac.validate(&MOCK_MACAROON_SECRET) {
+        return Err((RPC_UNAUTHENTICATED, "invalid api key signature".into()));
+    }
+    let now = std::time::SystemTime::now();
+    for raw in mac.caveats() {
+        let Ok(c) = storj_access::Caveat::decode(raw) else {
+            return Err((RPC_UNAUTHENTICATED, "invalid caveat".into()));
+        };
+        if let Some(t) = c.not_after {
+            if now > t {
+                return Err((RPC_UNAUTHENTICATED, "api key expired".into()));
+            }
+        }
+        if let Some(t) = c.not_before {
+            if now < t {
+                return Err((RPC_UNAUTHENTICATED, "api key not yet valid".into()));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn parse_api_key(raw: &[u8]) -> Option<storj_access::ApiKey> {

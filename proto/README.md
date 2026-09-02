@@ -33,7 +33,7 @@ STORJ_UPLINK_SHA=2fef38720d8395837567da60ab69016099dca9f5
 
 `proto/check-pin.sh` globs `proto/*.proto` against `storj/common` `pb/` at the pin.
 Vendored files must be byte-identical to that pin (no local annotation comments).
-Grant types are generated into `crates/storj-proto/src/gen/` and used by `storj-access`.
+Grant wire types (`Scope`, `EncryptionAccess`, `Caveat`) are hand-maintained in `crates/storj-access/src/pb.rs` (kept in sync with these protos; see `check-pin.sh`), not generated into `crates/storj-proto`.
 Do not invent proto fields. Go `EncryptionAccess.toProto` writes only fields 1–3.
 
 Checked-in prost types live in `crates/storj-proto/src/gen/`.
