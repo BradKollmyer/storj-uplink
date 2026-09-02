@@ -12,6 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use storj::constants::MAX_SEGMENT_SIZE;
 use storj::{Access, Permission, Project, SharePrefix};
+use storj_access::{ApiKey, Caveat, Grant};
 use storj_test::{INTEROP_SIDES, INTEROP_SIZES, Side, size_label};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -41,7 +42,16 @@ fn rust_parse_go_grant_and_go_parse_rust_grant() {
     let fixture = load_go_grant();
     let rust = Access::parse(&fixture).expect("Rust Access::parse of grant_go.txt");
     assert_eq!(rust.satellite_address(), GO_SAT);
-    let rust_serialized = rust.serialize().expect("Rust serialize");
+    // Unmodified serialize is the cached fixture. share(full) re-encodes.
+    let rust_serialized = rust
+        .share(Permission::full(), &[])
+        .expect("share(full) re-encodes")
+        .serialize()
+        .unwrap();
+    assert_ne!(
+        rust_serialized, fixture,
+        "Go must parse a Rust re-encode, not the identity fixture"
+    );
 
     let parsed = go_ok(&["parse", &rust_serialized]);
     assert!(
@@ -61,7 +71,7 @@ fn rust_parse_go_grant_and_go_parse_rust_grant() {
 
 #[test]
 #[ignore = "STORJ_INTEROP=1 + Go helper"]
-fn rust_share_then_go_open() {
+fn rust_share_then_go_parse() {
     if !storj_test::interop_enabled() {
         return;
     }
@@ -72,6 +82,7 @@ fn rust_share_then_go_open() {
         .share(Permission::read_only(), &[prefix])
         .expect("Rust share");
     let shared_ser = shared.serialize().unwrap();
+    assert_ne!(shared_ser, fixture, "Rust share() must not be a no-op");
 
     let parsed = go_ok(&["parse", &shared_ser]);
     assert!(
@@ -79,10 +90,13 @@ fn rust_share_then_go_open() {
         "Go ParseAccess of Rust share(): {parsed}"
     );
     assert!(parsed.contains(GO_SAT), "shared grant satellite: {parsed}");
+    assert_read_only_app_user1(&shared_ser);
 
     let go_restricted = go_ok(&["restrict", "-bucket", "app", "-prefix", "user1/", &fixture]);
+    assert_ne!(go_restricted, fixture, "Go Restrict must not be a no-op");
     let from_go = Access::parse(&go_restricted).expect("Rust parse of Go restrict");
     assert_eq!(from_go.satellite_address(), GO_SAT);
+    assert_read_only_app_user1(&go_restricted);
 }
 
 #[tokio::test]
@@ -231,6 +245,38 @@ fn load_go_grant() -> String {
     storj_test::read_fixture_str("grant_go.txt")
         .trim()
         .to_owned()
+}
+
+fn assert_read_only_app_user1(serialized: &str) {
+    let g = Grant::parse(serialized).expect("parse restricted grant");
+    assert_eq!(g.satellite_addr(), GO_SAT);
+    assert!(
+        g.enc_access().default_key.is_none(),
+        "ancestor default key must be dropped"
+    );
+    let entry = g
+        .enc_access()
+        .store_entries
+        .iter()
+        .find(|e| e.bucket == b"app" && e.unencrypted_path == b"user1")
+        .expect("store entry app/user1");
+    assert_eq!(entry.key, [0x44; 32]);
+
+    let key = ApiKey::parse_raw(g.api_key()).expect("api key");
+    let cavs: Vec<Caveat> = key
+        .macaroon()
+        .caveats()
+        .iter()
+        .map(|c| Caveat::decode(c).expect("caveat"))
+        .collect();
+    assert!(
+        cavs.iter().any(|c| c.disallow_writes && c.disallow_deletes),
+        "read-only DISALLOW writes/deletes"
+    );
+    assert!(
+        cavs.iter().any(|c| !c.disallow_reads && !c.disallow_lists),
+        "read-only still allows reads/lists"
+    );
 }
 
 fn helper_dir() -> PathBuf {

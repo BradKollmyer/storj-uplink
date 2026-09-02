@@ -29,14 +29,16 @@ Maps to `docs/design-native-uplink.md` § Testing Strategy.
 
 ```bash
 cargo test -p storj                  # contract suite
-cargo test -p storj -- --ignored     # protocol/interop (grant/object cells skip without env)
 go run -C scripts .                  # KDF + path HMAC + infectious RS + synthetic grant fixtures
 go run -C scripts/interop . parse "$(tr -d '\n' < crates/storj/tests/fixtures/grant_go.txt)"
-STORJ_INTEROP=1 cargo test -p storj --test interop -- --ignored
+STORJ_INTEROP=1 cargo test -p storj --test interop -- --ignored --skip writer_reader_size_matrix
+STORJ_INTEROP=1 STORJ_INTEROP_ACCESS=... cargo test -p storj --test interop writer_reader_size_matrix -- --ignored
 STORJ_SIM=1 STORJ_SIM_ACCESS=... cargo test -p storj --test sim -- --ignored
 cargo test -p storj --test encryption_golden --test grant_golden
 ```
 
+`cargo test -p storj -- --ignored` still runs other ignored tests (`multipart`, `object_lock`, …) that panic until later PRs. Use `--test interop` / `--test sim` as above.
+
 ## Interop matrix (v1.0 exit criterion)
 
-`{go,rust} writer × {go,rust} reader × {empty, 1B, inline-1, inline+1, 1seg, 64MiB+1}` plus ranged read, prefix list, and `Share` restriction. Defined in `storj-test::INTEROP_SIZES` / `INTEROP_SIDES`. PR 20 runs grant round-trip on every PR and the object matrix up to one segment (`64MiB+1` is skipped until PR 26). Object cells need a satellite grant; grant parse/serialize/share do not.
+`{go,rust} writer × {go,rust} reader × {empty, 1B, inline-1, inline+1, 1seg, 64MiB+1}` plus ranged read, prefix list, and `Share` restriction. Defined in `storj-test::INTEROP_SIZES` / `INTEROP_SIDES`. PR 20 `grant-roundtrip` runs grant parse/serialize/share on every PR (no satellite) and `--skip`s the object matrix. The object matrix is opt-in (`STORJ_INTEROP=1` plus `STORJ_INTEROP_ACCESS` / `STORJ_SIM_ACCESS`); `64MiB+1` is skipped until PR 26.
