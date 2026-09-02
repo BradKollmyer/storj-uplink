@@ -19,6 +19,7 @@ storj-encryption.workspace = true
 hex.workspace = true
 hmac.workspace = true
 sha2.workspace = true
+storj-proto.workspace = true
 storj-test.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util"] }
 futures-util.workspace = true
