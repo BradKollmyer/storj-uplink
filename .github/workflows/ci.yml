@@ -21,6 +21,13 @@ jobs:
       - name: compile all tests including ignored
         run: cargo test --workspace --no-run
 
+  proto:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: checksum vendored protos against pin
+        run: bash proto/check-pin.sh
+
   deny:
     runs-on: ubuntu-latest
     steps:

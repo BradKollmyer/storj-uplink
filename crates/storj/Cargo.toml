@@ -19,6 +19,7 @@ futures-util.workspace = true
 
 [dev-dependencies]
 hex.workspace = true
+storj-proto.workspace = true
 storj-test.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util"] }
 futures-util.workspace = true

@@ -12,11 +12,15 @@ repository = "https://github.com/storj/storj-rust"
 [workspace.dependencies]
 storj = { path = "crates/storj" }
 storj-access = { path = "crates/storj-access" }
+storj-proto = { path = "crates/storj-proto" }
 storj-rpc = { path = "crates/storj-rpc" }
 storj-test = { path = "crates/storj-test" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "time"] }
 bytes = "1"
+prost = "0.13"
+prost-types = "0.13"
 thiserror = "2"
+zstd = "0.13"
 zeroize = { version = "1", features = ["derive"] }
 argon2 = "0.5"
 hmac = "0.12"
