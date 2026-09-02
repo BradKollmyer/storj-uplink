@@ -1,0 +1,19 @@
+[package]
+name = "storj-ec"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Reed-Solomon erasure coding compatible with Go infectious / eestream"
+repository.workspace = true
+publish = false
+
+[dependencies]
+thiserror.workspace = true
+
+[dev-dependencies]
+hex.workspace = true
+reed-solomon-erasure.workspace = true
+
+[lints]
+workspace = true

@@ -6,6 +6,7 @@ Design targets:
 |---|---|
 | `Access::parse` | 3 |
 | macaroon parser | 4 |
+| RS encode/decode round-trip (crate tests in `storj-ec`) | 8 |
 | DRPC frame parser | 9a |
 | path decrypt (must not panic) | 5–7 |
 

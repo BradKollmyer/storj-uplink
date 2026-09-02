@@ -1,6 +1,6 @@
 //! Encryption goldens vs `storj.io/common/encryption`.
 //!
-//! Generate with `go run ./scripts/gen-vectors.go`.
+//! Generate with `go run -C scripts .`.
 
 use std::fs;
 
@@ -22,9 +22,8 @@ struct DeriveVector {
 }
 
 fn parse_json_lines(path: &str) -> Vec<DeriveVector> {
-    let text = fs::read_to_string(storj_test::fixture(path)).unwrap_or_else(|e| {
-        panic!("missing fixture {path} ({e}). Run: go run ./scripts/gen-vectors.go")
-    });
+    let text = fs::read_to_string(storj_test::fixture(path))
+        .unwrap_or_else(|e| panic!("missing fixture {path} ({e}). Run: go run -C scripts ."));
     // Minimal JSON object parser for the generator's stable shape:
     // {"passphrase":"...","salt_hex":"...","path":"...","parallelism":1,"key_hex":"..."}
     text.lines()
@@ -87,9 +86,8 @@ fn derive_root_key_matches_go() {
 
 #[test]
 fn path_component_matches_go() {
-    let text = fs::read_to_string(storj_test::fixture("path_hmac.jsonl")).unwrap_or_else(|e| {
-        panic!("missing path_hmac.jsonl ({e}). Run: go run ./scripts/gen-vectors.go")
-    });
+    let text = fs::read_to_string(storj_test::fixture("path_hmac.jsonl"))
+        .unwrap_or_else(|e| panic!("missing path_hmac.jsonl ({e}). Run: go run -C scripts ."));
     for line in text.lines().filter(|l| !l.trim().is_empty()) {
         let get = |k: &str| {
             let key = format!("\"{k}\":\"");

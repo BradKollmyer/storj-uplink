@@ -1,0 +1,15 @@
+storj-ec is dual-licensed MIT OR Apache-2.0 (see LICENSE-MIT and LICENSE-APACHE).
+
+Portions of src/fec.rs and src/gf.rs are derived from storj.io/infectious
+(https://github.com/storj/infectious), itself based on zfec / Luigi Rizzo's FEC:
+
+  Copyright (C) 1996-1998 Luigi Rizzo (luigi@iet.unipi.it)
+  Copyright (C) 2009-2010 Jack Lloyd (lloyd@randombit.net)
+  Copyright (C) 2011 Billy Brumley (billy.brumley@aalto.fi)
+  Copyright (C) 2016-2017 Vivint, Inc.
+  Portions derived from code by Phil Karn (karn@ka9q.ampr.org),
+  Robert Morelos-Zaragoza (robert@spectra.eng.hawaii.edu) and Hari
+  Thirumoorthy (harit@spectra.eng.hawaii.edu), Aug 1995
+
+Those files retain the original BSD-2-Clause notice (see the headers in
+src/fec.rs and src/gf.rs).

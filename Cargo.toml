@@ -12,6 +12,7 @@ repository = "https://github.com/storj/storj-rust"
 [workspace.dependencies]
 storj = { path = "crates/storj" }
 storj-access = { path = "crates/storj-access" }
+storj-ec = { path = "crates/storj-ec" }
 storj-encryption = { path = "crates/storj-encryption" }
 storj-proto = { path = "crates/storj-proto" }
 storj-rpc = { path = "crates/storj-rpc" }
@@ -43,6 +44,7 @@ rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "aws_lc_rs"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["tls12", "aws_lc_rs"] }
 x509-parser = "0.16"
+reed-solomon-erasure = "6"
 
 [workspace.lints.rust]
 missing_docs = "allow"

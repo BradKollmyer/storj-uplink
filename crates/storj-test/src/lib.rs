@@ -96,7 +96,7 @@ pub fn require_fixture(name: &str) -> PathBuf {
     let path = fixture(name);
     assert!(
         path.exists(),
-        "missing fixture {} — run: go run ./scripts/gen-vectors.go",
+        "missing fixture {} — run: go run -C scripts .",
         path.display()
     );
     path
