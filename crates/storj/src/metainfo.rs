@@ -92,7 +92,15 @@ pub(crate) struct ListObjectsParams {
 
 type SatelliteStream = TlsStream<TcpStream>;
 
-/// Long-lived satellite metainfo connection (one in-flight RPC at a time).
+/// Upper bound on concurrent satellite connections per `Project`.
+const MAX_SATELLITE_CONNS: usize = 8;
+
+/// Satellite metainfo client backed by a small connection pool: each RPC
+/// checks out an idle connection (or dials one, up to
+/// [`MAX_SATELLITE_CONNS`]), runs without holding any lock, and returns the
+/// connection if it is still healthy. Concurrent uploads therefore no longer
+/// serialize on every `BeginSegment`/`CommitSegment`, and a stalled RPC cannot
+/// wedge the others.
 pub(crate) struct MetainfoClient {
     node: NodeUrl,
     api_key: Vec<u8>,
@@ -100,7 +108,10 @@ pub(crate) struct MetainfoClient {
     identity: Identity,
     dial_timeout: Duration,
     satellite_cert: Mutex<Vec<u8>>,
-    conn: Mutex<Option<Conn<SatelliteStream>>>,
+    /// Idle connections. `std` mutex: never held across an await.
+    idle: std::sync::Mutex<Vec<Conn<SatelliteStream>>>,
+    /// Caps in-flight + idle connections.
+    slots: Arc<tokio::sync::Semaphore>,
 }
 
 impl MetainfoClient {
@@ -119,14 +130,19 @@ impl MetainfoClient {
             identity,
             dial_timeout: config.dial_timeout_or_default(),
             satellite_cert: Mutex::new(Vec::new()),
-            conn: Mutex::new(None),
+            idle: std::sync::Mutex::new(Vec::new()),
+            slots: Arc::new(tokio::sync::Semaphore::new(MAX_SATELLITE_CONNS)),
         };
         client.ensure_connected().await?;
         Ok(client)
     }
 
     pub(crate) async fn close(&self) {
-        *self.conn.lock().await = None;
+        self.idle_guard().clear();
+    }
+
+    fn idle_guard(&self) -> std::sync::MutexGuard<'_, Vec<Conn<SatelliteStream>>> {
+        self.idle.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     #[cfg(test)]
@@ -141,7 +157,8 @@ impl MetainfoClient {
             identity: Identity::generate().expect("ephemeral identity"),
             dial_timeout: Duration::from_secs(1),
             satellite_cert: Mutex::new(Vec::new()),
-            conn: Mutex::new(None),
+            idle: std::sync::Mutex::new(Vec::new()),
+            slots: Arc::new(tokio::sync::Semaphore::new(MAX_SATELLITE_CONNS)),
         }
     }
 
@@ -162,9 +179,10 @@ impl MetainfoClient {
     }
 
     async fn ensure_connected(&self) -> Result<()> {
-        let mut guard = self.conn.lock().await;
-        if guard.is_none() {
-            *guard = Some(self.dial().await?);
+        let empty = self.idle_guard().is_empty();
+        if empty {
+            let conn = self.dial().await?;
+            self.idle_guard().push(conn);
         }
         Ok(())
     }
@@ -243,28 +261,30 @@ impl MetainfoClient {
         rpc: &str,
         request: &[u8],
     ) -> std::result::Result<Vec<u8>, storj_rpc::Error> {
-        {
-            let mut guard = self.conn.lock().await;
-            if guard.is_none() {
-                match self.dial().await {
-                    Ok(conn) => *guard = Some(conn),
-                    Err(e) => {
-                        return Err(storj_rpc::Error::Io(std::io::Error::other(e.to_string())));
-                    }
-                }
-            }
-            if let Some(conn) = guard.as_mut() {
-                match conn.invoke(rpc, request).await {
-                    Ok(body) => return Ok(body),
-                    Err(e) if is_conn_dead(&e) => {
-                        *guard = None;
-                        return Err(e);
-                    }
-                    Err(e) => return Err(e),
-                }
-            }
+        // Bound total connections; waits when all slots are in flight.
+        let _permit = self
+            .slots
+            .acquire()
+            .await
+            .map_err(|_| storj_rpc::Error::Closed)?;
+        // Bind before matching so the std guard is released before any await.
+        let idle = self.idle_guard().pop();
+        let mut conn = match idle {
+            Some(c) => c,
+            None => self
+                .dial()
+                .await
+                .map_err(|e| storj_rpc::Error::Io(std::io::Error::other(e.to_string())))?,
+        };
+        let result = conn.invoke(rpc, request).await;
+        let keep = match &result {
+            Ok(_) => !conn.is_poisoned(),
+            Err(e) => !is_conn_dead(e) && !conn.is_poisoned(),
+        };
+        if keep {
+            self.idle_guard().push(conn);
         }
-        Err(storj_rpc::Error::Closed)
+        result
     }
 
     pub(crate) async fn project_info(&self) -> Result<ProjectInfoResponse> {
