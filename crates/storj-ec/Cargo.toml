@@ -9,11 +9,11 @@ repository.workspace = true
 publish = false
 
 [dependencies]
-reed-solomon-erasure.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
 hex.workspace = true
+reed-solomon-erasure.workspace = true
 
 [lints]
 workspace = true

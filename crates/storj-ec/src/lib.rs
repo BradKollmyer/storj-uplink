@@ -3,9 +3,9 @@
 //! Shipping codec matches Go `storj.io/infectious` / `eestream` byte-for-byte
 //! (Rizzo/zfec systematic matrix over GF(2^8), poly 0x11d).
 //!
-//! [`reed_solomon_erasure`] (Klaus Post / Backblaze Vandermonde) is a workspace
-//! dependency (K16) and is compared in tests. It shares the field polynomial
-//! but **not** the encoding matrix, so its parity shares diverge.
+//! `reed-solomon-erasure` (Klaus Post / Backblaze Vandermonde) is a workspace
+//! pin compared in tests (K16). It shares the field polynomial but **not** the
+//! encoding matrix, so its parity shares diverge.
 
 #![deny(clippy::undocumented_unsafe_blocks)]
 

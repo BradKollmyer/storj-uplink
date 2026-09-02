@@ -1,6 +1,6 @@
 //! Grant parse/serialize goldens vs Go `uplink.ParseAccess` / `Serialize`.
 //!
-//! Fixtures are produced by `go run ./scripts/gen-vectors.go` and must not
+//! Fixtures are produced by `go run -C scripts .` and must not
 //! contain production secrets.
 
 use storj::{Access, ErrorKind};
@@ -8,7 +8,7 @@ use storj::{Access, ErrorKind};
 fn load_grant(name: &str) -> String {
     let path = storj_test::fixture(name);
     std::fs::read_to_string(&path).unwrap_or_else(|e| {
-        panic!("missing {name} ({e}). Run: go run ./scripts/gen-vectors.go (from repo root)")
+        panic!("missing {name} ({e}). Run: go run -C scripts . (from repo root)")
     })
 }
 

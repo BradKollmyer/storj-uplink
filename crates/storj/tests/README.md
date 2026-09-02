@@ -30,7 +30,7 @@ Maps to `docs/design-native-uplink.md` § Testing Strategy.
 ```bash
 cargo test -p storj                  # contract suite
 cargo test -p storj -- --ignored     # full (expected fail until impl)
-go run ./scripts/gen-vectors.go      # KDF + path HMAC fixtures
+go run -C scripts .                  # KDF + path HMAC + infectious RS fixtures
 cargo test -p storj --test encryption_golden -- --ignored --exact derive_root_key_matches_go
 ```
 

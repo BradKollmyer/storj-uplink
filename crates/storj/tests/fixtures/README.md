@@ -5,7 +5,7 @@ Do **not** check in production access grants.
 Generate local, disposable vectors from Go uplink / `storj.io/common`:
 
 ```bash
-go run ./scripts/gen-vectors.go
+go run -C scripts .
 ```
 
 Expected files:

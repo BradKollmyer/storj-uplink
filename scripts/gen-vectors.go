@@ -1,6 +1,6 @@
 // Generate golden vectors for the native Rust uplink tests.
 //
-//	cd repo-root && go run ./scripts/gen-vectors.go
+//	cd repo-root && go run -C scripts .
 //
 // Implements storj.io/common/encryption.DeriveRootKey and the path HMAC
 // using the same primitives (HMAC-SHA256 mix, Argon2id, HMAC-SHA512 "path:").
