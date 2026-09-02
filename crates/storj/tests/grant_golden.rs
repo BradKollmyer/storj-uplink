@@ -20,13 +20,13 @@ fn load_grant(name: &str) -> String {
 fn parse_go_serialized_grant() {
     let serialized = load_grant("grant_go.txt");
     let body = serialized.trim();
-    assert!(
-        !body.to_ascii_lowercase().contains("storj.io"),
-        "fixture must not be a production satellite"
-    );
 
     let mut g = Grant::parse(body).expect("parse Go grant");
     assert_eq!(g.satellite_addr(), GO_SAT);
+    assert!(
+        !g.satellite_addr().to_ascii_lowercase().contains("storj.io"),
+        "fixture must not be a production satellite"
+    );
     assert_eq!(g.enc_access().default_key, Some([0x33; 32]));
     assert_eq!(g.enc_access().default_path_cipher, CipherSuite::AES_GCM);
     assert_eq!(hex::encode(g.api_key()), GO_API_KEY_HEX);

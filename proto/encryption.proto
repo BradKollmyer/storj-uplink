@@ -1,8 +1,5 @@
 // Copyright (C) 2019 Storj Labs, Inc.
 // See LICENSE for copying information.
-//
-// Vendored from storj.io/common/pb/encryption.proto (grant wire types).
-// Do not invent fields.
 
 syntax = "proto3";
 option go_package = "storj.io/common/pb";
