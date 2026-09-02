@@ -143,6 +143,7 @@ pub fn assert_fixtures_layout(root: &Path) {
         "grant_go.txt",
         "rs_shares.jsonl",
         "rs_stripe.bin",
+        "signed_go.jsonl",
     ] {
         assert!(
             root.join(f).is_file(),

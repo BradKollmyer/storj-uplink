@@ -98,6 +98,6 @@ jobs:
       - name: kdf, path HMAC, grant, and RS goldens match Go
         run: >
           cargo test --locked -p storj --test encryption_kdf --test encryption_golden
-          --test grant_golden --test ec_golden
+          --test grant_golden --test ec_golden --test signing_golden
       - name: storj-ec goldens match infectious
         run: cargo test --locked -p storj-ec --test golden

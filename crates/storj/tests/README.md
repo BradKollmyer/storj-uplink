@@ -15,6 +15,7 @@ env.
 | `grant_golden.rs` | Parse Go grants | yes |
 | `share_restrict.rs` | `share()` intersection | yes |
 | `ec_golden.rs` | infectious RS (Berlekamp-Welch still ignore) | yes |
+| `signing_golden.rs` | Go-signed order limits / piece hashes verify with the leaf cert, not the CA | yes |
 | `project_buckets.rs` | Bucket CRUD (mock) | yes |
 | `project_objects.rs` | List/stat/delete/copy/move/revoke (mock) | yes |
 | `upload_download.rs` | Pipeline including 64MiB+1 (mock) | yes |
