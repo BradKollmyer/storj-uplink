@@ -59,6 +59,9 @@ struct PendingObject {
     bucket: String,
     enc_key: Vec<u8>,
     stream_id: Vec<u8>,
+    expires: Option<SystemTime>,
+    created: SystemTime,
+    encryption_parameters: Option<storj_proto::encryption::EncryptionParameters>,
     segments: Vec<StoredSegment>,
     in_flight: HashMap<Vec<u8>, InFlightSegment>,
 }
@@ -85,6 +88,8 @@ struct StoredSegment {
     inline_data: Vec<u8>,
     pieces: Vec<StoredPiece>,
     scheme: RedundancyScheme,
+    encrypted_etag: Vec<u8>,
+    created: SystemTime,
 }
 
 #[derive(Clone)]
@@ -703,12 +708,23 @@ fn begin_object(
     }
     st.next_id += 1;
     let stream_id = st.next_id.to_be_bytes().to_vec();
+    let expires = req.expires_at.map(|t| {
+        UNIX_EPOCH + std::time::Duration::new(t.seconds.max(0) as u64, t.nanos.max(0) as u32)
+    });
     st.pending.insert(
         stream_id.clone(),
         PendingObject {
             bucket: name,
             enc_key: req.encrypted_object_key.clone(),
             stream_id: stream_id.clone(),
+            expires,
+            created: SystemTime::now(),
+            encryption_parameters: req.encryption_parameters.or(Some(
+                storj_proto::encryption::EncryptionParameters {
+                    cipher_suite: storj_proto::encryption::CipherSuite::EncAesgcm as i32,
+                    block_size: 7424,
+                },
+            )),
             segments: Vec::new(),
             in_flight: HashMap::new(),
         },
@@ -736,6 +752,15 @@ fn commit_object(
     if st.fail_commit {
         st.fail_commit = false;
         return Err((RPC_INTERNAL, "commit object failed".into()));
+    }
+    {
+        let pending = st
+            .pending
+            .get(&req.stream_id)
+            .ok_or_else(|| (RPC_NOT_FOUND, "object not found".into()))?;
+        let mut segments = pending.segments.clone();
+        segments.sort_by_key(|s| (s.position.part_number, s.position.index));
+        check_multipart_limits(&segments)?;
     }
     let pending = st
         .pending
@@ -851,6 +876,9 @@ fn list_objects(
     let name = utf8_name(&req.bucket)?;
     if !st.buckets.contains_key(&name) {
         return Err((RPC_NOT_FOUND, format!("bucket not found: {name}")));
+    }
+    if req.status == ObjectStatus::Uploading as i32 {
+        return list_uploading_objects(&req, &st, &name);
     }
     let recursive = req.recursive || req.delimiter.is_empty();
     let delim = if recursive {
@@ -1308,6 +1336,8 @@ fn commit_segment(
                 inline_data: Vec::new(),
                 pieces,
                 scheme: test_scheme(),
+                encrypted_etag: req.encrypted_e_tag.clone(),
+                created: SystemTime::now(),
             });
         }
     }
@@ -1339,6 +1369,8 @@ fn make_inline(
             inline_data: req.encrypted_inline_data,
             pieces: Vec::new(),
             scheme: test_scheme(),
+            encrypted_etag: req.encrypted_e_tag,
+            created: SystemTime::now(),
         });
     }
     Ok(MakeInlineSegmentResponse {})
@@ -1424,14 +1456,22 @@ fn list_segments(
 ) -> Result<ListSegmentsResponse, (u64, String)> {
     let st = state.lock().expect("mock state");
     check_key(&req.header, &st)?;
-    let committed = st
+    let (mut segments, encryption_parameters) = if let Some(committed) = st
         .committed
         .values()
         .find(|c| c.object.stream_id == req.stream_id)
-        .ok_or_else(|| (RPC_NOT_FOUND, "object not found".into()))?;
-    let obj = committed.object.clone();
-    let segments = committed.segments.clone();
+    {
+        (
+            committed.segments.clone(),
+            committed.object.encryption_parameters,
+        )
+    } else if let Some(pending) = st.pending.get(&req.stream_id) {
+        (pending.segments.clone(), pending.encryption_parameters)
+    } else {
+        return Err((RPC_NOT_FOUND, "object not found".into()));
+    };
     drop(st);
+    segments.sort_by_key(|s| (s.position.part_number, s.position.index));
 
     let total: i64 = segments.iter().map(|s| s.plain_size).sum();
     let window = resolve_mock_range(req.range.as_ref(), total)?;
@@ -1452,6 +1492,8 @@ fn list_segments(
                 position: Some(seg.position),
                 plain_size: seg.plain_size,
                 plain_offset: offset,
+                created_at: Some(timestamp(seg.created)),
+                encrypted_e_tag: seg.encrypted_etag.clone(),
                 encrypted_key_nonce: seg.encrypted_key_nonce.clone(),
                 encrypted_key: seg.encrypted_key.clone(),
                 ..Default::default()
@@ -1462,8 +1504,93 @@ fn list_segments(
     Ok(ListSegmentsResponse {
         items,
         more: false,
-        encryption_parameters: obj.encryption_parameters,
+        encryption_parameters,
     })
+}
+
+fn list_uploading_objects(
+    req: &ListObjectsRequest,
+    st: &MockState,
+    name: &str,
+) -> Result<ListObjectsResponse, (u64, String)> {
+    let mut items: Vec<&PendingObject> = st
+        .pending
+        .values()
+        .filter(|p| p.bucket == name)
+        .filter(|p| req.encrypted_prefix.is_empty() || p.enc_key.starts_with(&req.encrypted_prefix))
+        .filter(|p| {
+            req.encrypted_cursor.is_empty()
+                || p.enc_key.as_slice() > req.encrypted_cursor.as_slice()
+        })
+        .collect();
+    items.sort_by(|a, b| a.enc_key.cmp(&b.enc_key));
+    let delimiter = if req.recursive {
+        None
+    } else if req.delimiter.is_empty() {
+        Some(b'/')
+    } else {
+        req.delimiter.first().copied()
+    };
+    let mut out = Vec::new();
+    let mut seen_prefix = BTreeSet::new();
+    for pending in items {
+        let remainder = pending
+            .enc_key
+            .strip_prefix(req.encrypted_prefix.as_slice())
+            .unwrap_or(pending.enc_key.as_slice());
+        if let Some(del) = delimiter {
+            if let Some(idx) = remainder.iter().position(|b| *b == del) {
+                let mut prefix_key = req.encrypted_prefix.clone();
+                prefix_key.extend_from_slice(&remainder[..=idx]);
+                if seen_prefix.insert(prefix_key.clone()) {
+                    out.push(ObjectListItem {
+                        encrypted_object_key: prefix_key,
+                        status: ObjectStatus::Prefix as i32,
+                        created_at: Some(timestamp(pending.created)),
+                        ..Default::default()
+                    });
+                }
+                continue;
+            }
+        }
+        let plain_size: i64 = pending.segments.iter().map(|s| s.plain_size).sum();
+        out.push(ObjectListItem {
+            encrypted_object_key: pending.enc_key.clone(),
+            status: ObjectStatus::Uploading as i32,
+            created_at: Some(timestamp(pending.created)),
+            expires_at: pending.expires.map(timestamp),
+            plain_size,
+            stream_id: pending.stream_id.clone(),
+            ..Default::default()
+        });
+    }
+    Ok(ListObjectsResponse {
+        items: out,
+        more: false,
+    })
+}
+
+fn check_multipart_limits(segments: &[StoredSegment]) -> Result<(), (u64, String)> {
+    let mut by_part: BTreeMap<i32, i64> = BTreeMap::new();
+    for seg in segments {
+        *by_part.entry(seg.position.part_number).or_default() += seg.plain_size;
+    }
+    if by_part.len() as u32 > storj::constants::MAX_MULTIPART_PARTS {
+        return Err((RPC_INVALID_ARGUMENT, "too many parts".into()));
+    }
+    if by_part.len() <= 1 {
+        return Ok(());
+    }
+    let last = *by_part.keys().next_back().expect("non-empty");
+    for (part, size) in &by_part {
+        if *part != last && *size < storj::constants::MIN_MULTIPART_PART_SIZE as i64 {
+            return Err((
+                RPC_INVALID_ARGUMENT,
+                format!("part {part} is smaller than the minimum allowed size"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn resolve_mock_range(
@@ -1506,6 +1633,8 @@ fn build_segment_views(
                 position: Some(seg.position),
                 plain_size: seg.plain_size,
                 plain_offset: offset,
+                created_at: Some(timestamp(seg.created)),
+                encrypted_e_tag: seg.encrypted_etag.clone(),
                 encrypted_key_nonce: seg.encrypted_key_nonce.clone(),
                 encrypted_key: seg.encrypted_key.clone(),
                 ..Default::default()

@@ -45,6 +45,8 @@ pub const MAX_MULTIPART_PARTS: u32 = 10_000;
 
 /// Access grant Base58Check version byte. `ParseAccess` rejects any other.
 pub const GRANT_BASE58_VERSION: u8 = 0;
+/// Multipart upload ID / StreamID Base58Check version byte (Go `CheckEncode(..., 1)`).
+pub const STREAM_ID_BASE58_VERSION: u8 = 1;
 
 /// Macaroon binary version.
 pub const MACAROON_VERSION: u8 = 2;
@@ -97,6 +99,12 @@ mod tests {
     fn multipart_limits() {
         assert_eq!(MIN_MULTIPART_PART_SIZE, 5 * 1024 * 1024);
         assert_eq!(MAX_MULTIPART_PARTS, 10_000);
+        assert_eq!(STREAM_ID_BASE58_VERSION, 1);
+        assert_ne!(STREAM_ID_BASE58_VERSION, GRANT_BASE58_VERSION);
+        assert_eq!(
+            STREAM_ID_BASE58_VERSION,
+            storj_uplink::multipart::STREAM_ID_VERSION
+        );
     }
 
     #[test]

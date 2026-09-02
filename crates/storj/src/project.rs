@@ -1,7 +1,9 @@
 //! `Project` — bucket and object operations.
 
+use std::collections::VecDeque;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use futures_core::Stream;
 use futures_util::stream;
@@ -9,13 +11,13 @@ use futures_util::stream;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 use crate::access::Access;
-use crate::bucket::require_bucket_name;
+use crate::bucket::{proto_timestamp, require_bucket_name};
 use crate::error::{Error, ErrorKind, Result};
 use crate::metainfo::{MetainfoClient, object_from_proto, parse_satellite_url};
 use crate::types::{
     Bucket, BucketObjectLockConfiguration, CommitUploadOptions, Config, CustomMetadata,
-    DownloadOptions, ListUploadPartsOptions, ListUploadsOptions, Object, Retention,
-    SetObjectRetentionOptions, SystemMetadata, UploadInfo, UploadOptions,
+    DownloadOptions, ListUploadPartsOptions, ListUploadsOptions, Object, Part,
+    Retention, SetObjectRetentionOptions, SystemMetadata, UploadInfo, UploadOptions,
 };
 use crate::upload::{Download, FlushedSegment, PartUpload, Upload, UploadInner};
 
@@ -129,6 +131,8 @@ impl Project {
                 total_plain: 0,
                 last_segment_plain: 0,
                 pending_flush: None,
+                part_number: 0,
+                etag: None,
             },
         ))
     }
@@ -316,8 +320,28 @@ impl Project {
         key: &str,
         opts: UploadOptions,
     ) -> Result<UploadInfo> {
-        let _ = (bucket, key, opts);
-        Err(Error::not_implemented("Project::begin_upload"))
+        require_bucket_name(bucket)?;
+        require_object_key(key)?;
+        let enc_path =
+            storj_encryption::encrypt_path(bucket, key, &self.inner.store).map_err(map_enc)?;
+        let enc_params = storj_proto::encryption::EncryptionParameters {
+            cipher_suite: storj_proto::encryption::CipherSuite::EncAesgcm as i32,
+            block_size: crate::constants::ENCRYPTION_BLOCK_SIZE as i64,
+        };
+        let begin = self
+            .inner
+            .metainfo
+            .begin_object(bucket, enc_path, opts.expires, Some(enc_params))
+            .await?;
+        Ok(UploadInfo {
+            key: key.to_owned(),
+            upload_id: storj_uplink::multipart::encode_upload_id(&begin.stream_id),
+            system: SystemMetadata {
+                created: None,
+                expires: opts.expires,
+                content_length: 0,
+            },
+        })
     }
 
     /// Upload one part of a multipart upload.
@@ -328,8 +352,46 @@ impl Project {
         upload_id: &str,
         part_number: u32,
     ) -> Result<PartUpload> {
-        let _ = (bucket, key, upload_id, part_number);
-        Err(Error::not_implemented("Project::upload_part"))
+        require_bucket_name(bucket)?;
+        require_object_key(key)?;
+        let stream_id = decode_upload_id(upload_id)?;
+        let part_number = i32::try_from(part_number).map_err(|_| {
+            Error::new(
+                ErrorKind::Protocol,
+                "partNumber should be less than max(int32)",
+            )
+        })?;
+        let enc_path =
+            storj_encryption::encrypt_path(bucket, key, &self.inner.store).map_err(map_enc)?;
+        let content_key =
+            storj_encryption::derive_content_key(bucket, key.as_bytes(), &self.inner.store)
+                .map_err(map_enc)?;
+        Ok(PartUpload::new(
+            Part {
+                part_number: part_number as u32,
+                size: 0,
+                modified: SystemTime::now(),
+                etag: Vec::new(),
+            },
+            UploadInner {
+                project: Arc::clone(&self.inner),
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+                encrypted_object_key: enc_path,
+                stream_id,
+                content_key,
+                cipher: storj_encryption::CipherSuite::AES_GCM,
+                block_size: crate::constants::ENCRYPTION_BLOCK_SIZE,
+                custom: CustomMetadata::new(),
+                plaintext: Vec::new(),
+                next_segment: 0,
+                total_plain: 0,
+                last_segment_plain: 0,
+                pending_flush: None,
+                part_number,
+                etag: None,
+            },
+        ))
     }
 
     /// Commit a multipart upload.
@@ -340,25 +402,161 @@ impl Project {
         upload_id: &str,
         opts: CommitUploadOptions,
     ) -> Result<Object> {
-        let _ = (bucket, key, upload_id, opts);
-        Err(Error::not_implemented("Project::commit_upload"))
+        require_bucket_name(bucket)?;
+        require_object_key(key)?;
+        let stream_id = decode_upload_id(upload_id)?;
+        let content_key =
+            storj_encryption::derive_content_key(bucket, key.as_bytes(), &self.inner.store)
+                .map_err(map_enc)?;
+        let mut listed = self
+            .inner
+            .metainfo
+            .list_all_segments(bucket, key, stream_id.clone())
+            .await?;
+        listed.items.sort_by_key(segment_list_order);
+        let (cipher, block_size) = encryption_from_params(listed.encryption_parameters.as_ref());
+        let last_segment_plain = listed.items.last().map(|i| i.plain_size).unwrap_or(0);
+        let total_plain: i64 = listed.items.iter().map(|i| i.plain_size).sum();
+        let custom_pairs: Vec<(String, String)> = opts.custom_metadata.into_iter().collect();
+        let user = storj_uplink::pipeline::encrypt_user_data(
+            &custom_pairs,
+            crate::constants::MAX_SEGMENT_SIZE as i64,
+            last_segment_plain,
+            i64::try_from(listed.items.len()).unwrap_or(i64::MAX),
+            cipher,
+            &content_key,
+            block_size,
+        )
+        .map_err(map_uplink)?;
+        let committed = self
+            .inner
+            .metainfo
+            .commit_object(bucket, key, stream_id, user)
+            .await?;
+        let mut obj = object_from_proto(committed.object, key);
+        if obj.system.content_length <= 0 {
+            obj.system.content_length = total_plain;
+        }
+        obj.custom = custom_pairs.into_iter().collect();
+        Ok(obj)
     }
 
     /// Abort a multipart upload.
     pub async fn abort_upload(&self, bucket: &str, key: &str, upload_id: &str) -> Result<()> {
-        let _ = (bucket, key, upload_id);
-        Err(Error::not_implemented("Project::abort_upload"))
+        require_bucket_name(bucket)?;
+        require_object_key(key)?;
+        let stream_id = decode_upload_id(upload_id)?;
+        let enc_path =
+            storj_encryption::encrypt_path(bucket, key, &self.inner.store).map_err(map_enc)?;
+        let _ = self
+            .inner
+            .metainfo
+            .begin_delete_object(
+                bucket,
+                enc_path,
+                stream_id.clone(),
+                storj_proto::metainfo::object::Status::Uploading as i32,
+            )
+            .await?;
+        self.inner
+            .metainfo
+            .finish_delete_object(bucket, stream_id)
+            .await
     }
 
     /// List uncommitted uploads.
     pub fn list_uploads(&self, bucket: &str, opts: ListUploadsOptions) -> UploadStream {
-        let _ = bucket;
+        if let Err(e) = require_bucket_name(bucket) {
+            return Box::pin(stream::once(async move { Err(e) }));
+        }
         if let Err(e) = opts.validate() {
             return Box::pin(stream::once(async move { Err(e) }));
         }
-        Box::pin(stream::once(async {
-            Err(Error::not_implemented("Project::list_uploads"))
-        }))
+        let project = self.clone();
+        let bucket = bucket.to_owned();
+        Box::pin(stream::try_unfold(
+            ListUploadsState {
+                project,
+                bucket,
+                opts,
+                cursor: Vec::new(),
+                pending: VecDeque::new(),
+                done: false,
+                started: false,
+            },
+            |mut st| async move {
+                loop {
+                    if let Some(info) = st.pending.pop_front() {
+                        return Ok(Some((info, st)));
+                    }
+                    if st.done {
+                        return Ok(None);
+                    }
+                    let enc_prefix = if st.opts.prefix.is_empty() {
+                        Vec::new()
+                    } else {
+                        storj_encryption::encrypt_prefix(
+                            &st.bucket,
+                            &st.opts.prefix,
+                            &st.project.inner.store,
+                        )
+                        .map_err(map_enc)?
+                    };
+                    let enc_cursor = if !st.started && !st.opts.cursor.is_empty() {
+                        let plain = format!("{}{}", st.opts.prefix, st.opts.cursor);
+                        storj_encryption::encrypt_path(&st.bucket, &plain, &st.project.inner.store)
+                            .map_err(map_enc)?
+                    } else {
+                        st.cursor.clone()
+                    };
+                    st.started = true;
+                    let page = st
+                        .project
+                        .inner
+                        .metainfo
+                        .list_pending_uploads(&st.bucket, enc_prefix, enc_cursor, &st.opts)
+                        .await?;
+                    if page.items.is_empty() {
+                        st.done = true;
+                        continue;
+                    }
+                    st.cursor = page
+                        .items
+                        .last()
+                        .map(|i| i.encrypted_object_key.clone())
+                        .unwrap_or_default();
+                    st.done = !page.more;
+                    for item in page.items {
+                        if item.status == storj_proto::metainfo::object::Status::Prefix as i32
+                            || item.stream_id.is_empty()
+                        {
+                            continue;
+                        }
+                        let key_bytes = storj_encryption::decrypt_path(
+                            &st.bucket,
+                            &item.encrypted_object_key,
+                            &st.project.inner.store,
+                        )
+                        .map_err(map_enc)?;
+                        let key = String::from_utf8(key_bytes).map_err(|e| {
+                            Error::new(
+                                ErrorKind::Protocol,
+                                format!("listed object key is not utf-8: {e}"),
+                            )
+                        })?;
+                        st.pending.push_back(UploadInfo {
+                            key,
+                            upload_id: storj_uplink::multipart::encode_upload_id(&item.stream_id),
+                            system: SystemMetadata {
+                                created: item.created_at.map(|t| proto_timestamp(Some(t))),
+                                expires: item.expires_at.map(|t| proto_timestamp(Some(t))),
+                                content_length: item.plain_size,
+                            },
+                        });
+                    }
+                }
+            },
+        ))
     }
 
     /// List parts of a multipart upload.
@@ -369,10 +567,44 @@ impl Project {
         upload_id: &str,
         opts: ListUploadPartsOptions,
     ) -> PartStream {
-        let _ = (bucket, key, upload_id, opts);
-        Box::pin(stream::once(async {
-            Err(Error::not_implemented("Project::list_upload_parts"))
-        }))
+        if let Err(e) = require_bucket_name(bucket) {
+            return Box::pin(stream::once(async move { Err(e) }));
+        }
+        if let Err(e) = require_object_key(key) {
+            return Box::pin(stream::once(async move { Err(e) }));
+        }
+        let stream_id = match decode_upload_id(upload_id) {
+            Ok(id) => id,
+            Err(e) => return Box::pin(stream::once(async move { Err(e) })),
+        };
+        let project = self.clone();
+        let bucket = bucket.to_owned();
+        let key = key.to_owned();
+        Box::pin(stream::try_unfold(
+            ListPartsState {
+                project,
+                bucket,
+                key,
+                stream_id,
+                cursor: opts.cursor,
+                pending: VecDeque::new(),
+                fetched: false,
+            },
+            |mut st| async move {
+                if !st.fetched {
+                    st.pending = list_parts_page(
+                        &st.project,
+                        &st.bucket,
+                        &st.key,
+                        st.stream_id.clone(),
+                        st.cursor,
+                    )
+                    .await?;
+                    st.fetched = true;
+                }
+                Ok(st.pending.pop_front().map(|part| (part, st)))
+            },
+        ))
     }
 
     /// `AsyncRead` → object. Commits on success, aborts on error.
@@ -426,6 +658,98 @@ pub(crate) fn require_object_key(key: &str) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+fn decode_upload_id(upload_id: &str) -> Result<Vec<u8>> {
+    storj_uplink::multipart::decode_upload_id(upload_id)
+        .map_err(|_| Error::new(ErrorKind::UploadIdInvalid, "upload ID invalid"))
+}
+
+struct ListUploadsState {
+    project: Project,
+    bucket: String,
+    opts: ListUploadsOptions,
+    cursor: Vec<u8>,
+    pending: VecDeque<UploadInfo>,
+    done: bool,
+    started: bool,
+}
+
+struct ListPartsState {
+    project: Project,
+    bucket: String,
+    key: String,
+    stream_id: Vec<u8>,
+    cursor: u32,
+    pending: VecDeque<Part>,
+    fetched: bool,
+}
+
+async fn list_parts_page(
+    project: &Project,
+    bucket: &str,
+    key: &str,
+    stream_id: Vec<u8>,
+    cursor: u32,
+) -> Result<VecDeque<Part>> {
+    let mut listed = project
+        .inner
+        .metainfo
+        .list_all_segments(bucket, key, stream_id)
+        .await?;
+    listed.items.sort_by_key(segment_list_order);
+    let (cipher, _) = encryption_from_params(listed.encryption_parameters.as_ref());
+    let content_key =
+        storj_encryption::derive_content_key(bucket, key.as_bytes(), &project.inner.store)
+            .map_err(map_enc)?;
+    let mut parts: VecDeque<Part> = VecDeque::new();
+    for item in listed.items {
+        let part_number = item.position.map(|p| p.part_number as u32).unwrap_or(0);
+        if cursor != 0 && part_number <= cursor {
+            continue;
+        }
+        let etag = decrypt_part_etag(&item, cipher, &content_key)?;
+        if let Some(last) = parts.back_mut().filter(|p| p.part_number == part_number) {
+            last.size += item.plain_size;
+            if let Some(created) = item.created_at {
+                last.modified = proto_timestamp(Some(created));
+            }
+            if !etag.is_empty() {
+                last.etag = etag;
+            }
+        } else {
+            parts.push_back(Part {
+                part_number,
+                size: item.plain_size,
+                modified: proto_timestamp(item.created_at),
+                etag,
+            });
+        }
+    }
+    Ok(parts)
+}
+
+fn segment_list_order(item: &storj_proto::metainfo::SegmentListItem) -> (i32, i32) {
+    item.position
+        .map(|p| (p.part_number, p.index))
+        .unwrap_or_default()
+}
+
+fn decrypt_part_etag(
+    item: &storj_proto::metainfo::SegmentListItem,
+    cipher: storj_encryption::CipherSuite,
+    content_key: &storj_encryption::Key,
+) -> Result<Vec<u8>> {
+    if item.encrypted_e_tag.is_empty() {
+        return Ok(Vec::new());
+    }
+    let nonce =
+        storj_uplink::pipeline::nonce_from_slice(&item.encrypted_key_nonce).map_err(map_uplink)?;
+    let segment_key =
+        storj_uplink::pipeline::decrypt_key(&item.encrypted_key, cipher, content_key, &nonce)
+            .map_err(map_uplink)?;
+    storj_uplink::multipart::decrypt_etag(&item.encrypted_e_tag, cipher, &segment_key)
+        .map_err(map_uplink)
 }
 
 pub(crate) fn map_enc(e: storj_encryption::Error) -> Error {
@@ -742,8 +1066,10 @@ pub(crate) fn spawn_flush_segment(inner: &mut UploadInner) {
         content_key: inner.content_key.clone(),
         cipher: inner.cipher,
         block_size: inner.block_size,
+        part_number: inner.part_number,
         index: inner.next_segment,
         plain: chunk,
+        encrypted_etag: Vec::new(),
     };
     inner.pending_flush = Some(tokio::spawn(async move {
         let index = job.index;
@@ -760,8 +1086,10 @@ struct SegmentCommit {
     content_key: storj_encryption::Key,
     cipher: storj_encryption::CipherSuite,
     block_size: usize,
+    part_number: i32,
     index: i32,
     plain: Vec<u8>,
+    encrypted_etag: Vec<u8>,
 }
 
 pub(crate) async fn commit_upload(mut inner: UploadInner) -> Result<Object> {
@@ -788,8 +1116,10 @@ pub(crate) async fn commit_upload(mut inner: UploadInner) -> Result<Object> {
             content_key: inner.content_key.clone(),
             cipher: inner.cipher,
             block_size: inner.block_size,
+            part_number: inner.part_number,
             index: inner.next_segment,
             plain: std::mem::take(&mut inner.plaintext),
+            encrypted_etag: Vec::new(),
         };
         let index = job.index;
         let plain_size = commit_one_segment(job).await?;
@@ -837,18 +1167,20 @@ async fn commit_one_segment(job: SegmentCommit) -> Result<i64> {
         content_key,
         cipher,
         block_size,
+        part_number,
         index,
         plain,
+        encrypted_etag,
     } = job;
     let segment_key = random_key();
     let encrypted_key_nonce = random_nonce();
     let encrypted_key = encrypt_key(&segment_key, cipher, &content_key, &encrypted_key_nonce)
         .map_err(map_uplink)?;
-    let nonce = content_nonce(0, index);
-    let position = SegmentPosition {
-        part_number: 0,
-        index,
-    };
+    let encrypted_etag =
+        storj_uplink::multipart::encrypt_etag(&encrypted_etag, cipher, &segment_key)
+            .map_err(map_uplink)?;
+    let nonce = content_nonce(part_number, index);
+    let position = SegmentPosition { part_number, index };
     let last_plain = i64::try_from(plain.len()).unwrap_or(i64::MAX);
 
     let inline_data = if plain.len() > MAX_INLINE_SEGMENT_SIZE {
@@ -870,6 +1202,7 @@ async fn commit_one_segment(job: SegmentCommit) -> Result<i64> {
                     encrypted_key,
                     encrypted_inline_data: inline_data,
                     plain_size: last_plain,
+                    encrypted_e_tag: encrypted_etag,
                     ..Default::default()
                 },
             )
@@ -942,6 +1275,7 @@ async fn commit_one_segment(job: SegmentCommit) -> Result<i64> {
                 encrypted_key,
                 size_encrypted_data: enc_size,
                 plain_size: last_plain,
+                encrypted_e_tag: encrypted_etag,
                 upload_result: results,
                 ..Default::default()
             },
@@ -1008,6 +1342,41 @@ async fn delete_pending_upload(pending: &PendingAbort) -> Result<()> {
         .await
 }
 
+pub(crate) async fn commit_part(mut inner: UploadInner) -> Result<()> {
+    if let Some(handle) = inner.pending_flush.take() {
+        let flushed = handle.await??;
+        inner.apply_flush(flushed);
+    }
+    let etag = inner.etag.take().unwrap_or_default();
+    if !inner.plaintext.is_empty() || inner.next_segment == 0 {
+        let job = SegmentCommit {
+            project: Arc::clone(&inner.project),
+            bucket: inner.bucket.clone(),
+            key: inner.key.clone(),
+            stream_id: inner.stream_id.clone(),
+            content_key: inner.content_key.clone(),
+            cipher: inner.cipher,
+            block_size: inner.block_size,
+            part_number: inner.part_number,
+            index: inner.next_segment,
+            plain: std::mem::take(&mut inner.plaintext),
+            encrypted_etag: etag,
+        };
+        let index = job.index;
+        let plain_size = commit_one_segment(job).await?;
+        inner.apply_flush(FlushedSegment { index, plain_size });
+    }
+    Ok(())
+}
+
+pub(crate) async fn abort_part(inner: UploadInner) -> Result<()> {
+    let UploadInner { pending_flush, .. } = inner;
+    if let Some(handle) = pending_flush {
+        join_aborted_flush(handle).await?;
+    }
+    Ok(())
+}
+
 pub(crate) async fn abort_upload(inner: UploadInner) -> Result<()> {
     let pending = PendingAbort {
         project: Arc::clone(&inner.project),
@@ -1017,8 +1386,7 @@ pub(crate) async fn abort_upload(inner: UploadInner) -> Result<()> {
     };
     let UploadInner { pending_flush, .. } = inner;
     if let Some(handle) = pending_flush {
-        handle.abort();
-        let _ = handle.await;
+        join_aborted_flush(handle).await?;
     }
     match delete_pending_upload(&pending).await {
         Ok(()) => Ok(()),
@@ -1026,6 +1394,15 @@ pub(crate) async fn abort_upload(inner: UploadInner) -> Result<()> {
             spawn_abort(pending);
             Err(e)
         }
+    }
+}
+
+async fn join_aborted_flush(handle: tokio::task::JoinHandle<Result<FlushedSegment>>) -> Result<()> {
+    handle.abort();
+    match handle.await {
+        Ok(_) => Ok(()),
+        Err(e) if e.is_cancelled() => Ok(()),
+        Err(e) => std::panic::resume_unwind(e.into_panic()),
     }
 }
 

@@ -3,6 +3,7 @@
 #![deny(clippy::undocumented_unsafe_blocks)]
 
 pub mod download;
+pub mod multipart;
 pub mod orders;
 pub mod piecestore;
 pub mod pipeline;

@@ -1361,6 +1361,7 @@ dependencies = [
  "rand",
  "rustls",
  "sha2",
+ "storj-access",
  "storj-ec",
  "storj-encryption",
  "storj-proto",
