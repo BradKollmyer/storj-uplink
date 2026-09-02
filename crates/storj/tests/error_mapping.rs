@@ -51,6 +51,14 @@ fn io_round_trip_other() {
     assert_eq!(back.kind(), io::ErrorKind::Other);
 }
 
+#[tokio::test]
+async fn join_error_canceled_maps() {
+    let handle = tokio::spawn(std::future::pending::<()>());
+    handle.abort();
+    let e = Error::from(handle.await.unwrap_err());
+    assert!(e.is_canceled());
+}
+
 #[test]
 fn system_metadata_content_length_is_i64() {
     let m = SystemMetadata {

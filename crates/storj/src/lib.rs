@@ -7,6 +7,7 @@
 #![deny(clippy::undocumented_unsafe_blocks)]
 
 pub mod access;
+pub mod config;
 pub mod constants;
 pub mod encryption;
 pub mod error;
@@ -15,14 +16,15 @@ pub mod types;
 pub mod upload;
 
 pub use access::{Access, Permission, SharePrefix};
+pub use config::Config;
 pub use encryption::EncryptionKey;
 pub use error::{Error, ErrorKind, Result};
 pub use project::{BucketStream, ObjectStream, PartStream, Project, UploadStream};
 pub use types::{
-    Bucket, BucketObjectLockConfiguration, CommitUploadOptions, Config, CustomMetadata,
-    DefaultRetention, DownloadOptions, ListBucketsOptions, ListObjectsOptions,
-    ListUploadPartsOptions, ListUploadsOptions, Object, Part, Retention, RetentionMode,
-    SetObjectRetentionOptions, SystemMetadata, UploadInfo, UploadOptions,
+    Bucket, BucketObjectLockConfiguration, CommitUploadOptions, CustomMetadata, DefaultRetention,
+    DownloadOptions, ListBucketsOptions, ListObjectsOptions, ListUploadPartsOptions,
+    ListUploadsOptions, Object, Part, Retention, RetentionMode, SetObjectRetentionOptions,
+    SystemMetadata, UploadInfo, UploadOptions,
 };
 pub use upload::{Download, PartUpload, Upload};
 
@@ -31,18 +33,20 @@ pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
-#[allow(dead_code)]
-fn _assert_send_sync() {
-    fn check<T: Send + Sync>() {}
-    check::<Access>();
-    check::<Project>();
-    check::<Config>();
-    check::<Upload>();
-    check::<Download>();
-    check::<Error>();
-    check::<EncryptionKey>();
-    check::<PartUpload>();
-    check::<Permission>();
-    check::<Object>();
-    check::<Bucket>();
-}
+const _: () = {
+    fn assert_send_sync<T: Send + Sync>() {}
+    #[allow(dead_code)]
+    fn _assert() {
+        assert_send_sync::<Access>();
+        assert_send_sync::<Project>();
+        assert_send_sync::<Config>();
+        assert_send_sync::<Upload>();
+        assert_send_sync::<Download>();
+        assert_send_sync::<Error>();
+        assert_send_sync::<EncryptionKey>();
+        assert_send_sync::<PartUpload>();
+        assert_send_sync::<Permission>();
+        assert_send_sync::<Object>();
+        assert_send_sync::<Bucket>();
+    }
+};

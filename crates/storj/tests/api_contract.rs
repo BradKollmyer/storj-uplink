@@ -77,6 +77,15 @@ fn config_has_no_temp_dir() {
 }
 
 #[test]
+fn config_lives_in_config_module() {
+    // Design module layout: `config.rs` re-exports the type also available at crate root.
+    assert_eq!(
+        std::any::type_name::<storj::config::Config>(),
+        std::any::type_name::<Config>()
+    );
+}
+
+#[test]
 fn download_options_match_go_defaults() {
     let d = DownloadOptions::default();
     assert_eq!(d.offset, 0);

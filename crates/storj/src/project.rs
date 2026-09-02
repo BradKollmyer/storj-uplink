@@ -6,6 +6,8 @@ use std::sync::Arc;
 use futures_core::Stream;
 use futures_util::stream;
 
+use tokio::io::{AsyncRead, AsyncWrite};
+
 use crate::access::Access;
 use crate::error::{Error, Result};
 use crate::types::{
@@ -313,5 +315,79 @@ impl Project {
         Box::pin(stream::once(async {
             Err(Error::not_implemented("Project::list_upload_parts"))
         }))
+    }
+
+    /// `AsyncRead` → object. Commits on success, aborts on error.
+    pub async fn upload_from(
+        &self,
+        bucket: &str,
+        key: &str,
+        reader: impl AsyncRead + Send,
+        opts: UploadOptions,
+    ) -> Result<Object> {
+        let _ = (bucket, key, reader, opts);
+        Err(Error::not_implemented("Project::upload_from"))
+    }
+
+    /// Object → `AsyncWrite`.
+    pub async fn download_to(
+        &self,
+        bucket: &str,
+        key: &str,
+        writer: impl AsyncWrite + Send,
+        opts: DownloadOptions,
+    ) -> Result<Object> {
+        opts.validate()?;
+        let _ = (bucket, key, writer);
+        Err(Error::not_implemented("Project::download_to"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::ErrorKind;
+    use tokio::io::{empty, sink};
+
+    fn placeholder() -> Project {
+        Project {
+            _inner: Arc::new(()),
+        }
+    }
+
+    #[tokio::test]
+    async fn upload_from_not_implemented() {
+        let e = placeholder()
+            .upload_from("b", "k", empty(), UploadOptions::default())
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Protocol);
+        assert!(e.to_string().contains("not implemented"));
+    }
+
+    #[tokio::test]
+    async fn download_to_not_implemented() {
+        let e = placeholder()
+            .download_to("b", "k", sink(), DownloadOptions::default())
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Protocol);
+    }
+
+    #[tokio::test]
+    async fn download_to_rejects_go_unsupported_combo() {
+        let e = placeholder()
+            .download_to(
+                "b",
+                "k",
+                sink(),
+                DownloadOptions {
+                    offset: -10,
+                    length: 100,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::ObjectKeyInvalid);
     }
 }

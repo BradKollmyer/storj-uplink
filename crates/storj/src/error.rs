@@ -120,6 +120,16 @@ impl From<Error> for io::Error {
     }
 }
 
+impl From<tokio::task::JoinError> for Error {
+    fn from(e: tokio::task::JoinError) -> Self {
+        if e.is_cancelled() {
+            Self::new(ErrorKind::Canceled, "task canceled").with_source(e)
+        } else {
+            Self::new(ErrorKind::Protocol, e.to_string()).with_source(e)
+        }
+    }
+}
+
 /// Stable error classification. Mapped 1:1 from `storj.io/uplink` v1.14.5
 /// user-visible errors. Intentionally omitted vs 2025 `uplink` crate:
 /// `InvalidHandle`, FFI `Internal`, `Uplink` wrapping.
