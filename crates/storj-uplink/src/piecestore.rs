@@ -13,7 +13,7 @@ use storj_proto::piecestore::{
     piece_download_request, piece_upload_request,
 };
 use storj_proto::rpc::{PIECESTORE_DOWNLOAD, PIECESTORE_UPLOAD};
-use storj_rpc::Conn;
+use storj_rpc::{Conn, RpcStream};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::orders::{
@@ -120,6 +120,27 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Client<T> {
         let digest = hasher.finalize();
 
         let mut stream = self.conn.open_stream(PIECESTORE_UPLOAD).await?;
+        let result = self
+            .upload_once(&mut stream, limit, piece_key, data, &digest)
+            .await;
+        let close_err = self.conn.close_stream(&mut stream).await;
+        match result {
+            Ok(hash) => {
+                close_err?;
+                Ok(hash)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn upload_once(
+        &mut self,
+        stream: &mut RpcStream,
+        limit: &OrderLimit,
+        piece_key: &PiecePrivateKey,
+        data: &[u8],
+        digest: &[u8],
+    ) -> Result<PieceHash> {
         let buf = self.config.upload_buffer_size.max(1);
         let mut offset: i64 = 0;
         let mut ordered_so_far: i64 = 0;
@@ -135,14 +156,12 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Client<T> {
                 done: Some(signed_uplink_hash(
                     limit,
                     piece_key,
-                    &digest,
+                    digest,
                     0,
                     self.hash_algo,
                 )?),
             };
-            self.conn
-                .send_msg(&mut stream, &req.encode_to_vec())
-                .await?;
+            self.conn.send_msg(stream, &req.encode_to_vec()).await?;
         } else {
             let mut rest = data;
             while !rest.is_empty() {
@@ -176,25 +195,22 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Client<T> {
                     req.done = Some(signed_uplink_hash(
                         limit,
                         piece_key,
-                        &digest,
+                        digest,
                         end,
                         self.hash_algo,
                     )?);
                 }
-                self.conn
-                    .send_msg(&mut stream, &req.encode_to_vec())
-                    .await?;
+                self.conn.send_msg(stream, &req.encode_to_vec()).await?;
                 offset = end;
             }
         }
 
-        self.conn.close_send(&mut stream).await?;
-        let resp = PieceUploadResponse::decode(self.conn.recv_msg(&stream).await?.as_slice())?;
+        self.conn.close_send(stream).await?;
+        let resp = PieceUploadResponse::decode(self.conn.recv_msg(stream).await?.as_slice())?;
         let sn_hash = resp
             .done
             .ok_or_else(|| Error::protocol("expected piece hash"))?;
-        verify_sn_piece_hash(&sn_hash, limit, &digest, self.hash_algo, &self.peer_ca_der)?;
-        self.conn.close_stream(&mut stream).await?;
+        verify_sn_piece_hash(&sn_hash, limit, digest, self.hash_algo, &self.peer_ca_der)?;
         Ok(sn_hash)
     }
 
@@ -222,6 +238,21 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Client<T> {
         }
 
         let mut stream = self.conn.open_stream(PIECESTORE_DOWNLOAD).await?;
+        let result = self
+            .download_once(&mut stream, limit, piece_key, offset, size)
+            .await;
+        let _ = self.conn.close_stream(&mut stream).await;
+        result
+    }
+
+    async fn download_once(
+        &mut self,
+        stream: &mut RpcStream,
+        limit: &OrderLimit,
+        piece_key: &PiecePrivateKey,
+        offset: i64,
+        size: i64,
+    ) -> Result<Vec<u8>> {
         let req = PieceDownloadRequest {
             limit: Some(limit.clone()),
             order: Some(signed_order(limit, piece_key, size)?),
@@ -231,13 +262,11 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Client<T> {
             }),
             maximum_chunk_size: self.config.maximum_chunk_size,
         };
-        self.conn
-            .send_msg(&mut stream, &req.encode_to_vec())
-            .await?;
+        self.conn.send_msg(stream, &req.encode_to_vec()).await?;
 
         let mut out = Vec::new();
         while (out.len() as i64) < size {
-            match self.conn.recv_msg_opt(&stream).await? {
+            match self.conn.recv_msg_opt(stream).await? {
                 Some(bytes) => {
                     let resp = PieceDownloadResponse::decode(bytes.as_slice())?;
                     if let Some(chunk) = resp.chunk {
@@ -247,8 +276,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Client<T> {
                 None => break,
             }
         }
-        let _ = self.conn.close_send(&mut stream).await;
-        let _ = self.conn.close_stream(&mut stream).await;
+        let _ = self.conn.close_send(stream).await;
         if (out.len() as i64) > size {
             out.truncate(size as usize);
         }
@@ -324,8 +352,16 @@ fn timestamp_too_old(ts: Option<&prost_types::Timestamp>) -> bool {
     let Ok(secs) = u64::try_from(ts.seconds) else {
         return true;
     };
-    let nanos = u32::try_from(ts.nanos.max(0)).unwrap_or(0);
-    let Some(t) = UNIX_EPOCH.checked_add(Duration::new(secs, nanos)) else {
+    // Unnormalized protobuf timestamps must not reach Duration::new (panics
+    // when nanos >= 1e9). Treat them as invalid / expired.
+    if !(0..1_000_000_000).contains(&ts.nanos) {
+        return true;
+    }
+    let nanos = u64::from(u32::try_from(ts.nanos).unwrap_or(0));
+    let Some(t) = UNIX_EPOCH
+        .checked_add(Duration::from_secs(secs))
+        .and_then(|t| t.checked_add(Duration::from_nanos(nanos)))
+    else {
         return true;
     };
     let cutoff = SystemTime::now()
@@ -392,11 +428,36 @@ mod tests {
 
     type PieceStore = Arc<Mutex<HashMap<Vec<u8>, Vec<u8>>>>;
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum UploadFault {
+        None,
+        WrongDigest,
+        WrongSigner,
+        ExpiredTimestamp,
+    }
+
     async fn serve_mock<T: AsyncRead + AsyncWrite + Unpin>(
+        conn: Conn<T>,
+        sn: Identity,
+        satellite_ca: Vec<u8>,
+        store: PieceStore,
+    ) {
+        serve_mock_with_fault(
+            conn,
+            sn,
+            satellite_ca,
+            store,
+            Arc::new(Mutex::new(UploadFault::None)),
+        )
+        .await;
+    }
+
+    async fn serve_mock_with_fault<T: AsyncRead + AsyncWrite + Unpin>(
         mut conn: Conn<T>,
         sn: Identity,
         satellite_ca: Vec<u8>,
         store: PieceStore,
+        fault: Arc<Mutex<UploadFault>>,
     ) {
         loop {
             let invoke = match read_invoke(&mut conn).await {
@@ -405,7 +466,13 @@ mod tests {
             };
             let result = match invoke.1.as_str() {
                 PIECESTORE_UPLOAD => {
-                    serve_upload(&mut conn, invoke.0, &sn, &satellite_ca, &store).await
+                    let f = {
+                        let mut g = fault.lock().await;
+                        let f = *g;
+                        *g = UploadFault::None;
+                        f
+                    };
+                    serve_upload(&mut conn, invoke.0, &sn, &satellite_ca, &store, f).await
                 }
                 PIECESTORE_DOWNLOAD => {
                     serve_download(&mut conn, invoke.0, &satellite_ca, &store).await
@@ -438,6 +505,7 @@ mod tests {
         sn: &Identity,
         satellite_ca: &[u8],
         store: &PieceStore,
+        fault: UploadFault,
     ) -> Result<()> {
         let mut limit = None;
         let mut algo = PieceHashAlgo::Sha256;
@@ -506,7 +574,26 @@ mod tests {
             signature: Vec::new(),
             hash_algorithm: algo.to_i32(),
         };
-        sign_piece_hash_node(&mut sn_hash, sn)?;
+        match fault {
+            UploadFault::None => {}
+            UploadFault::WrongDigest => sn_hash.hash = vec![0xab; 32],
+            UploadFault::WrongSigner => {}
+            UploadFault::ExpiredTimestamp => {
+                sn_hash.timestamp = Some(prost_types::Timestamp {
+                    seconds: 1,
+                    nanos: 0,
+                });
+            }
+        }
+        let other;
+        let signer = match fault {
+            UploadFault::WrongSigner => {
+                other = Identity::generate().unwrap();
+                &other
+            }
+            _ => sn,
+        };
+        sign_piece_hash_node(&mut sn_hash, signer)?;
         let resp = PieceUploadResponse {
             done: Some(sn_hash),
             node_certchain: Vec::new(),
@@ -765,5 +852,97 @@ mod tests {
         assert_eq!(got, payload);
         drop(client);
         let _ = server.await;
+    }
+
+    #[test]
+    fn unnormalized_timestamp_is_expired_not_panic() {
+        assert!(timestamp_too_old(Some(&prost_types::Timestamp {
+            seconds: 1_700_000_000,
+            nanos: 1_000_000_000,
+        })));
+        assert!(timestamp_too_old(Some(&prost_types::Timestamp {
+            seconds: 1_700_000_000,
+            nanos: i32::MAX,
+        })));
+        assert!(timestamp_too_old(Some(&prost_types::Timestamp {
+            seconds: 1_700_000_000,
+            nanos: -1,
+        })));
+        assert!(timestamp_too_old(None));
+        assert!(!timestamp_too_old(Some(&proto_now())));
+    }
+
+    async fn upload_with_fault(fault: UploadFault, want: fn(&Error) -> bool) {
+        let satellite = Identity::generate().unwrap();
+        let sn = Identity::generate().unwrap();
+        let piece_key = PiecePrivateKey::generate();
+        let piece_id = vec![0x44; 32];
+        let sat_ca = satellite.ca_der().as_ref().to_vec();
+        let sn_ca = sn.ca_der().as_ref().to_vec();
+        let store: PieceStore = Arc::new(Mutex::new(HashMap::new()));
+        let faults = Arc::new(Mutex::new(fault));
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(serve_mock_with_fault(
+            Conn::new(server_io),
+            sn,
+            sat_ca.clone(),
+            Arc::clone(&store),
+            Arc::clone(&faults),
+        ));
+        let mut client = Client::new(Conn::new(client_io), sat_ca, sn_ca);
+        let dummy_sn = Identity::generate().unwrap();
+        let put = signed_limit(
+            &satellite,
+            &dummy_sn,
+            &piece_key,
+            &piece_id,
+            PieceAction::Put,
+            1024,
+        );
+        let err = client
+            .upload(&put, &piece_key, b"fault-piece")
+            .await
+            .unwrap_err();
+        assert!(want(&err), "unexpected error: {err}");
+
+        // Stream was closed: a second upload on this conn (fault consumed) works.
+        let put2 = signed_limit(
+            &satellite,
+            &dummy_sn,
+            &piece_key,
+            &[0x45; 32],
+            PieceAction::Put,
+            1024,
+        );
+        client
+            .upload(&put2, &piece_key, b"after-fault")
+            .await
+            .expect("conn usable after failed upload");
+        drop(client);
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn upload_wrong_digest_is_mismatch() {
+        upload_with_fault(UploadFault::WrongDigest, |e| {
+            matches!(e, Error::PieceHashMismatch)
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn upload_wrong_signer_is_bad_signature() {
+        upload_with_fault(UploadFault::WrongSigner, |e| {
+            matches!(e, Error::PieceHashSignature)
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn upload_expired_timestamp_is_expired() {
+        upload_with_fault(UploadFault::ExpiredTimestamp, |e| {
+            matches!(e, Error::PieceHashExpired)
+        })
+        .await;
     }
 }

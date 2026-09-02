@@ -78,6 +78,51 @@ struct PoolInner<T> {
     notify: Notify,
 }
 
+impl<T> PoolInner<T> {
+    fn guard(&self) -> std::sync::MutexGuard<'_, Inner<T>> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// Decrements `in_use` on drop unless converted into a [`Pooled`] (dial cancel).
+struct Slot<T> {
+    pool: Arc<PoolInner<T>>,
+    node: NodeId,
+    armed: bool,
+}
+
+impl<T> Slot<T> {
+    fn new(pool: Arc<PoolInner<T>>, node: NodeId) -> Self {
+        Self {
+            pool,
+            node,
+            armed: true,
+        }
+    }
+
+    fn into_pooled(mut self, conn: T) -> Pooled<T> {
+        self.armed = false;
+        Pooled {
+            conn: Some(conn),
+            node: self.node,
+            pool: Arc::clone(&self.pool),
+        }
+    }
+}
+
+impl<T> Drop for Slot<T> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        {
+            let mut g = self.pool.guard();
+            g.in_use = g.in_use.saturating_sub(1);
+        }
+        self.pool.notify.notify_one();
+    }
+}
+
 /// LRU-ish SN pool keyed by [`NodeId`]. Checkout waits when `in_use == max`.
 pub struct ConnectionPool<T> {
     inner: Arc<PoolInner<T>>,
@@ -117,21 +162,13 @@ impl<T: Send + 'static> ConnectionPool<T> {
     /// Idle connections currently cached.
     #[must_use]
     pub fn idle_count(&self) -> usize {
-        self.inner
-            .inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .idle_count
+        self.inner.guard().idle_count
     }
 
     /// Connections checked out (not yet dropped).
     #[must_use]
     pub fn in_use(&self) -> usize {
-        self.inner
-            .inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .in_use
+        self.inner.guard().in_use
     }
 
     /// Take an idle conn for `node`, or dial a new one. Waits when at cap and
@@ -142,11 +179,9 @@ impl<T: Send + 'static> ConnectionPool<T> {
         Fut: Future<Output = std::result::Result<T, E>>,
         E: Into<Error>,
     {
-        // `dial` is called at most once; wrap in Option so Wait loops compile.
-        let mut dial = Some(dial);
         loop {
             let action = {
-                let mut g = self.inner.inner.lock().unwrap_or_else(|e| e.into_inner());
+                let mut g = self.inner.guard();
                 if let Some(conn) = g.pop_idle(node) {
                     g.in_use += 1;
                     Checkout::Reuse(conn)
@@ -162,32 +197,14 @@ impl<T: Send + 'static> ConnectionPool<T> {
             };
             match action {
                 Checkout::Reuse(conn) => {
-                    return Ok(Pooled {
-                        conn: Some(conn),
-                        node,
-                        pool: Arc::clone(&self.inner),
-                    });
+                    return Ok(Slot::new(Arc::clone(&self.inner), node).into_pooled(conn));
                 }
                 Checkout::Dial => {
-                    let dial = dial.take().expect("dial invoked twice");
-                    match dial().await {
-                        Ok(conn) => {
-                            return Ok(Pooled {
-                                conn: Some(conn),
-                                node,
-                                pool: Arc::clone(&self.inner),
-                            });
-                        }
-                        Err(e) => {
-                            {
-                                let mut g =
-                                    self.inner.inner.lock().unwrap_or_else(|e| e.into_inner());
-                                g.in_use = g.in_use.saturating_sub(1);
-                            }
-                            self.inner.notify.notify_one();
-                            return Err(e.into());
-                        }
-                    }
+                    let slot = Slot::new(Arc::clone(&self.inner), node);
+                    return match dial().await {
+                        Ok(conn) => Ok(slot.into_pooled(conn)),
+                        Err(e) => Err(e.into()),
+                    };
                 }
                 Checkout::Wait => {
                     self.inner.notify.notified().await;
@@ -217,15 +234,15 @@ impl<T> Pooled<T> {
         self.node
     }
 
-    /// Borrow the transport.
+    /// Borrow the transport. `None` after the conn has been taken (drop).
     #[must_use]
-    pub fn get(&self) -> &T {
-        self.conn.as_ref().expect("pooled conn taken")
+    pub fn get(&self) -> Option<&T> {
+        self.conn.as_ref()
     }
 
-    /// Borrow the transport mutably.
-    pub fn get_mut(&mut self) -> &mut T {
-        self.conn.as_mut().expect("pooled conn taken")
+    /// Borrow the transport mutably. `None` after the conn has been taken (drop).
+    pub fn get_mut(&mut self) -> Option<&mut T> {
+        self.conn.as_mut()
     }
 }
 
@@ -233,7 +250,7 @@ impl<T> Drop for Pooled<T> {
     fn drop(&mut self) {
         if let Some(conn) = self.conn.take() {
             {
-                let mut g = self.pool.inner.lock().unwrap_or_else(|e| e.into_inner());
+                let mut g = self.pool.guard();
                 g.in_use = g.in_use.saturating_sub(1);
                 g.push_idle(self.node, conn);
             }
@@ -309,7 +326,7 @@ mod tests {
         .await
         .expect("slot freed")
         .unwrap();
-        assert_eq!(*got.get(), 99);
+        assert_eq!(*got.get().expect("conn"), 99);
         drop(got);
         drop(held);
 
@@ -321,7 +338,38 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(*reused.get(), 99);
+        assert_eq!(*reused.get().expect("conn"), 99);
         assert_eq!(dials.load(Ordering::SeqCst), before);
+    }
+
+    #[tokio::test]
+    async fn cancelled_dial_releases_slot() {
+        let pool = ConnectionPool::new(PoolConfig::for_redundancy_n(1));
+        let hang = tokio::spawn({
+            let pool = pool.clone();
+            async move {
+                pool.checkout(nid(1), std::future::pending::<Result<u32, Error>>)
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_millis(500), async {
+            while pool.in_use() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dial never started");
+        hang.abort();
+        let _ = hang.await;
+        assert_eq!(pool.in_use(), 0, "cancelled dial must not leak in_use");
+
+        let got = tokio::time::timeout(
+            Duration::from_millis(500),
+            pool.checkout(nid(1), || async { Ok::<u32, Error>(7) }),
+        )
+        .await
+        .expect("leaked slot")
+        .unwrap();
+        assert_eq!(*got.get().expect("conn"), 7);
     }
 }
