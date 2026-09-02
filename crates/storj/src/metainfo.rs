@@ -14,10 +14,10 @@ use tokio_rustls::client::TlsStream;
 use storj_proto::metainfo::{
     self, BatchRequest, BatchRequestItem, BeginDeleteObjectRequest, BeginObjectRequest,
     BeginSegmentRequest, CommitObjectRequest, CommitSegmentRequest, CompressedBatchResponse,
-    CreateBucketRequest, DeleteBucketRequest, FinishDeleteObjectRequest, GetBucketRequest,
-    ListBucketsRequest, MakeInlineSegmentRequest, ProjectInfoRequest, ProjectInfoResponse,
-    RequestHeader, RetryBeginSegmentPiecesRequest, SegmentPosition, batch_request_item,
-    batch_response_item,
+    CreateBucketRequest, DeleteBucketRequest, DownloadObjectRequest, FinishDeleteObjectRequest,
+    GetBucketRequest, ListBucketsRequest, MakeInlineSegmentRequest, ProjectInfoRequest,
+    ProjectInfoResponse, Range, RequestHeader, RetryBeginSegmentPiecesRequest, SegmentPosition,
+    batch_request_item, batch_response_item,
 };
 use storj_proto::rpc;
 use storj_rpc::tls::client_config;
@@ -494,6 +494,39 @@ impl MetainfoClient {
             _ => Err(Error::new(
                 ErrorKind::Protocol,
                 "unexpected MakeInlineSegment response",
+            )),
+        }
+    }
+
+    pub(crate) async fn download_object(
+        &self,
+        bucket: &str,
+        key: &str,
+        encrypted_object_key: Vec<u8>,
+        range: Option<Range>,
+    ) -> Result<metainfo::DownloadObjectResponse> {
+        let req = DownloadObjectRequest {
+            header: Some(self.header()),
+            bucket: bucket.as_bytes().to_vec(),
+            encrypted_object_key,
+            range,
+            limit: 1,
+            ..Default::default()
+        };
+        let items = self
+            .compressed_batch(
+                vec![BatchRequestItem {
+                    request: Some(batch_request_item::Request::ObjectDownload(req)),
+                }],
+                bucket,
+                key,
+            )
+            .await?;
+        match Self::expect_one(items, "DownloadObject")? {
+            batch_response_item::Response::ObjectDownload(r) => Ok(r),
+            _ => Err(Error::new(
+                ErrorKind::Protocol,
+                "unexpected DownloadObject response",
             )),
         }
     }

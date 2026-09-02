@@ -141,10 +141,43 @@ async fn retry_rotates_segment_id_for_commit() {
     );
 }
 
-#[test]
-#[ignore = "PR 14: reconstruction fails with k-1 pieces"]
-fn k_minus_one_pieces_fails_download() {
-    panic!("mock SN set of size k-1");
+#[tokio::test]
+async fn k_minus_one_pieces_fails_download() {
+    use tokio::io::AsyncWriteExt;
+
+    let mock = storj_test::MockSatellite::start().await;
+    let project = storj::Project::open(&mock.access()).await.expect("open");
+    let name = unique("k1");
+    project.ensure_bucket(&name).await.unwrap();
+    let mut upload = project
+        .upload_object(&name, "r", Default::default())
+        .await
+        .unwrap();
+    upload.write_all(&vec![9u8; 5000]).await.unwrap();
+    upload.commit().await.expect("commit");
+
+    // Mock RS is k=2, n=4. Fail 3 SNs so at most 1 piece remains.
+    for i in 1..4 {
+        mock.fail_sn_download(i).await;
+    }
+    let err = match project
+        .download_object(&name, "r", Default::default())
+        .await
+    {
+        Ok(_) => panic!("k-1 pieces must fail"),
+        Err(e) => e,
+    };
+    assert_eq!(err.kind(), storj::ErrorKind::Protocol);
+}
+
+fn unique(prefix: &str) -> String {
+    format!(
+        "{prefix}-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    )
 }
 
 #[test]

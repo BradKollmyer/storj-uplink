@@ -1,12 +1,15 @@
-//! In-process mock storage node (piecestore Upload).
+//! In-process mock storage node (piecestore Upload / Download).
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use prost::Message;
-use storj_proto::piecestore::{PieceUploadRequest, PieceUploadResponse};
-use storj_proto::rpc::PIECESTORE_UPLOAD;
+use storj_proto::piecestore::{
+    PieceDownloadRequest, PieceDownloadResponse, PieceUploadRequest, PieceUploadResponse,
+    piece_download_response,
+};
+use storj_proto::rpc::{PIECESTORE_DOWNLOAD, PIECESTORE_UPLOAD};
 use storj_rpc::tls::server_config;
 use storj_rpc::{Conn, Identity, Kind, Packet, read_tls_mux_prefix};
 use storj_uplink::orders::{
@@ -23,6 +26,7 @@ pub struct MockStorageNode {
     address: String,
     delay: Arc<Mutex<Duration>>,
     fail_next: Arc<Mutex<bool>>,
+    fail_next_download: Arc<Mutex<bool>>,
     #[allow(dead_code)]
     store: Arc<Mutex<HashMap<Vec<u8>, Vec<u8>>>>,
     join: JoinHandle<()>,
@@ -39,12 +43,14 @@ impl MockStorageNode {
         let address = addr.to_string();
         let delay = Arc::new(Mutex::new(Duration::ZERO));
         let fail_next = Arc::new(Mutex::new(false));
+        let fail_next_download = Arc::new(Mutex::new(false));
         let store = Arc::new(Mutex::new(HashMap::new()));
         let server_cfg = server_config(&identity).expect("mock SN tls");
         let acceptor = TlsAcceptor::from(Arc::new(server_cfg));
         let sn = identity.clone();
         let delay_c = Arc::clone(&delay);
         let fail_c = Arc::clone(&fail_next);
+        let fail_dl_c = Arc::clone(&fail_next_download);
         let store_c = Arc::clone(&store);
         let join = tokio::spawn(async move {
             loop {
@@ -57,9 +63,20 @@ impl MockStorageNode {
                 let sat_ca = satellite_ca.clone();
                 let delay = Arc::clone(&delay_c);
                 let fail_next = Arc::clone(&fail_c);
+                let fail_next_download = Arc::clone(&fail_dl_c);
                 let store = Arc::clone(&store_c);
                 tokio::spawn(async move {
-                    let _ = serve_conn(tcp, acceptor, sn, sat_ca, delay, fail_next, store).await;
+                    let _ = serve_conn(
+                        tcp,
+                        acceptor,
+                        sn,
+                        sat_ca,
+                        delay,
+                        fail_next,
+                        fail_next_download,
+                        store,
+                    )
+                    .await;
                 });
             }
         });
@@ -68,6 +85,7 @@ impl MockStorageNode {
             address,
             delay,
             fail_next,
+            fail_next_download,
             store,
             join,
         }
@@ -92,6 +110,11 @@ impl MockStorageNode {
     pub async fn fail_next_upload(&self) {
         *self.fail_next.lock().await = true;
     }
+
+    /// Next Download closes without piece data.
+    pub async fn fail_next_download(&self) {
+        *self.fail_next_download.lock().await = true;
+    }
 }
 
 impl Drop for MockStorageNode {
@@ -100,6 +123,7 @@ impl Drop for MockStorageNode {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn serve_conn(
     mut tcp: TcpStream,
     acceptor: TlsAcceptor,
@@ -107,6 +131,7 @@ async fn serve_conn(
     satellite_ca: Vec<u8>,
     delay: Arc<Mutex<Duration>>,
     fail_next: Arc<Mutex<bool>>,
+    fail_next_download: Arc<Mutex<bool>>,
     store: Arc<Mutex<HashMap<Vec<u8>, Vec<u8>>>>,
 ) -> Result<(), storj_rpc::Error> {
     read_tls_mux_prefix(&mut tcp).await?;
@@ -122,21 +147,32 @@ async fn serve_conn(
             }
         };
         let rpc = String::from_utf8_lossy(&invoke.data).into_owned();
-        if rpc != PIECESTORE_UPLOAD {
-            return Ok(());
-        }
-        if serve_upload(
-            &mut conn,
-            invoke.stream_id,
-            &sn,
-            &satellite_ca,
-            &delay,
-            &fail_next,
-            &store,
-        )
-        .await
-        .is_err()
-        {
+        let result = match rpc.as_str() {
+            PIECESTORE_UPLOAD => {
+                serve_upload(
+                    &mut conn,
+                    invoke.stream_id,
+                    &sn,
+                    &satellite_ca,
+                    &delay,
+                    &fail_next,
+                    &store,
+                )
+                .await
+            }
+            PIECESTORE_DOWNLOAD => {
+                serve_download(
+                    &mut conn,
+                    invoke.stream_id,
+                    &satellite_ca,
+                    &fail_next_download,
+                    &store,
+                )
+                .await
+            }
+            _ => return Ok(()),
+        };
+        if result.is_err() {
             return Ok(());
         }
     }
@@ -233,6 +269,95 @@ async fn serve_upload(
         kind: Kind::MESSAGE,
         control: false,
         data: resp.encode_to_vec(),
+    })
+    .await?;
+    Ok(())
+}
+
+async fn serve_download(
+    conn: &mut Conn<tokio_rustls::server::TlsStream<TcpStream>>,
+    stream_id: u64,
+    satellite_ca: &[u8],
+    fail_next: &Mutex<bool>,
+    store: &Mutex<HashMap<Vec<u8>, Vec<u8>>>,
+) -> Result<(), storj_uplink::Error> {
+    {
+        let mut g = fail_next.lock().await;
+        if *g {
+            *g = false;
+            return Err(storj_uplink::Error::protocol(
+                "injected piece download failure",
+            ));
+        }
+    }
+    let mut limit = None;
+    let mut chunk = None;
+    loop {
+        let pkt = conn.read_packet().await?;
+        if pkt.stream_id != stream_id {
+            continue;
+        }
+        match pkt.kind {
+            Kind::MESSAGE => {
+                let req = PieceDownloadRequest::decode(pkt.data.as_slice())?;
+                if let Some(l) = req.limit {
+                    verify_order_limit(&l, satellite_ca)?;
+                    limit = Some(l);
+                }
+                if let Some(c) = req.chunk {
+                    chunk = Some(c);
+                }
+                if limit.is_some() && chunk.is_some() {
+                    break;
+                }
+            }
+            Kind::CLOSE_SEND | Kind::CLOSE => break,
+            _ => {}
+        }
+    }
+    let limit = limit.ok_or_else(|| storj_uplink::Error::protocol("missing order limit"))?;
+    let chunk = chunk.ok_or_else(|| storj_uplink::Error::protocol("missing chunk"))?;
+    let data = store
+        .lock()
+        .await
+        .get(&limit.piece_id)
+        .cloned()
+        .ok_or_else(|| storj_uplink::Error::protocol("piece not found"))?;
+    let start = usize::try_from(chunk.offset).unwrap_or(0);
+    let want = usize::try_from(chunk.chunk_size).unwrap_or(0);
+    let slice = data.get(start..).unwrap_or(&[][..]);
+    let slice = &slice[..want.min(slice.len())];
+    const CHUNK: usize = 16 * 1024;
+    let mut off = start as i64;
+    let mut message_id = 0u64;
+    for part in slice.chunks(CHUNK) {
+        message_id += 1;
+        let resp = PieceDownloadResponse {
+            chunk: Some(piece_download_response::Chunk {
+                offset: off,
+                data: part.to_vec(),
+            }),
+            hash: None,
+            limit: None,
+            restored_from_trash: false,
+        };
+        conn.write_packet(&Packet {
+            stream_id,
+            message_id,
+            kind: Kind::MESSAGE,
+            control: false,
+            data: resp.encode_to_vec(),
+        })
+        .await?;
+        off += part.len() as i64;
+    }
+    message_id += 1;
+    conn.write_packet(&Packet {
+        stream_id,
+        message_id,
+        kind: Kind::CLOSE_SEND,
+        control: false,
+        data: Vec::new(),
     })
     .await?;
     Ok(())

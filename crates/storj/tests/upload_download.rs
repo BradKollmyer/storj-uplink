@@ -7,7 +7,7 @@ use std::time::Duration;
 use storj::constants::MAX_SEGMENT_SIZE;
 use storj::{DownloadOptions, ErrorKind, Project};
 use storj_test::{INTEROP_SIZES, MockSatellite, size_label};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[test]
 fn interop_sizes_are_the_exit_criterion() {
@@ -50,6 +50,17 @@ async fn upload_commit_then_info() {
     assert_eq!(mock.committed_count(), 1);
     assert_eq!(mock.inline_segment_count(), 1);
     assert_eq!(mock.remote_segment_count(), 0);
+
+    let mut download = project
+        .download_object(&bucket, "hello.txt", Default::default())
+        .await
+        .expect("download_object");
+    assert_eq!(download.info().key, "hello.txt");
+    assert_eq!(download.info().system.content_length, 11);
+    let mut got = Vec::new();
+    download.read_to_end(&mut got).await.expect("read");
+    assert_eq!(got, b"hello storj");
+    download.close().await.expect("close");
 }
 
 #[tokio::test]
@@ -71,14 +82,105 @@ async fn drop_upload_aborts() {
 }
 
 #[tokio::test]
-#[ignore = "PR 14: ranged download"]
 async fn ranged_download() {
+    let mock = MockSatellite::start().await;
+    let project = open_project(&mock).await;
+    let bucket = unique("range");
+    project.ensure_bucket(&bucket).await.unwrap();
+
+    let payload: Vec<u8> = (0u8..=255).collect();
+    let mut upload = project
+        .upload_object(&bucket, "bytes.bin", Default::default())
+        .await
+        .unwrap();
+    upload.write_all(&payload).await.unwrap();
+    upload.commit().await.unwrap();
+
     let opts = DownloadOptions {
         offset: 10,
-        length: 100,
+        length: 20,
     };
     assert!(opts.validate().is_ok());
-    panic!("needs download pipeline");
+    let mut download = project
+        .download_object(&bucket, "bytes.bin", opts)
+        .await
+        .expect("ranged download");
+    assert_eq!(download.info().system.content_length, payload.len() as i64);
+    let mut got = Vec::new();
+    download.read_to_end(&mut got).await.unwrap();
+    assert_eq!(got, &payload[10..30]);
+
+    let mut suffix = project
+        .download_object(
+            &bucket,
+            "bytes.bin",
+            DownloadOptions {
+                offset: -8,
+                length: -1,
+            },
+        )
+        .await
+        .expect("suffix download");
+    let mut tail = Vec::new();
+    suffix.read_to_end(&mut tail).await.unwrap();
+    assert_eq!(tail, &payload[payload.len() - 8..]);
+}
+
+#[tokio::test]
+async fn remote_segment_round_trip() {
+    let mock = MockSatellite::start().await;
+    let project = open_project(&mock).await;
+    let bucket = unique("remote");
+    project.ensure_bucket(&bucket).await.unwrap();
+
+    let payload = vec![0x5Au8; 5000];
+    let mut upload = project
+        .upload_object(&bucket, "big.bin", Default::default())
+        .await
+        .unwrap();
+    upload.write_all(&payload).await.unwrap();
+    upload.commit().await.unwrap();
+    assert_eq!(mock.remote_segment_count(), 1);
+
+    let mut download = project
+        .download_object(&bucket, "big.bin", Default::default())
+        .await
+        .expect("remote download");
+    assert_eq!(download.info().system.content_length, 5000);
+    let mut got = Vec::new();
+    download.read_to_end(&mut got).await.unwrap();
+    assert_eq!(got, payload);
+
+    let mut ranged = project
+        .download_object(
+            &bucket,
+            "big.bin",
+            DownloadOptions {
+                offset: 100,
+                length: 50,
+            },
+        )
+        .await
+        .unwrap();
+    let mut slice = Vec::new();
+    ranged.read_to_end(&mut slice).await.unwrap();
+    assert_eq!(slice, &payload[100..150]);
+}
+
+#[tokio::test]
+async fn download_missing_object() {
+    let mock = MockSatellite::start().await;
+    let project = open_project(&mock).await;
+    let bucket = unique("miss");
+    project.ensure_bucket(&bucket).await.unwrap();
+    let err = match project
+        .download_object(&bucket, "nope", Default::default())
+        .await
+    {
+        Ok(_) => panic!("missing object must fail"),
+        Err(e) => e,
+    };
+    assert_eq!(err.kind(), ErrorKind::ObjectNotFound);
 }
 
 #[tokio::test]
@@ -159,6 +261,14 @@ async fn empty_object_is_inline() {
     let obj = upload.commit().await.unwrap();
     assert_eq!(obj.system.content_length, 0);
     assert_eq!(mock.inline_segment_count(), 1);
+    let mut download = project
+        .download_object(&bucket, "zero", Default::default())
+        .await
+        .unwrap();
+    assert_eq!(download.info().system.content_length, 0);
+    let mut got = Vec::new();
+    download.read_to_end(&mut got).await.unwrap();
+    assert!(got.is_empty());
 }
 
 #[tokio::test]
@@ -190,6 +300,15 @@ async fn set_custom_metadata_at_commit() {
     upload.write_all(b"x").await.unwrap();
     let obj = upload.commit().await.unwrap();
     assert_eq!(obj.custom.get("app:title").map(String::as_str), Some("hi"));
+
+    let download = project
+        .download_object(&bucket, "m", Default::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        download.info().custom.get("app:title").map(String::as_str),
+        Some("hi")
+    );
 }
 
 #[tokio::test]

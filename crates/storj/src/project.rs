@@ -137,8 +137,20 @@ impl Project {
         opts: DownloadOptions,
     ) -> Result<Download> {
         opts.validate()?;
-        let _ = (bucket, key);
-        Err(Error::not_implemented("Project::download_object"))
+        require_bucket_name(bucket)?;
+        require_object_key(key)?;
+        let enc_path =
+            storj_encryption::encrypt_path(bucket, key, &self.inner.store).map_err(map_enc)?;
+        let content_key =
+            storj_encryption::derive_content_key(bucket, key.as_bytes(), &self.inner.store)
+                .map_err(map_enc)?;
+        let range = storj_uplink::download::proto_range(opts.offset, opts.length);
+        let resp = self
+            .inner
+            .metainfo
+            .download_object(bucket, key, enc_path, range)
+            .await?;
+        download_single_segment(&self.inner, key, content_key, opts, resp).await
     }
 
     /// Object metadata.
@@ -425,7 +437,12 @@ fn store_from_grant(grant: &storj_access::Grant) -> Result<storj_encryption::Sto
 fn encryption_from_begin(
     begin: &storj_proto::metainfo::BeginObjectResponse,
 ) -> (storj_encryption::CipherSuite, usize) {
-    let params = begin.encryption_parameters.as_ref();
+    encryption_from_params(begin.encryption_parameters.as_ref())
+}
+
+fn encryption_from_params(
+    params: Option<&storj_proto::encryption::EncryptionParameters>,
+) -> (storj_encryption::CipherSuite, usize) {
     let cipher = match params.map(|p| p.cipher_suite) {
         Some(2) | Some(0) | None => storj_encryption::CipherSuite::AES_GCM,
         Some(1) => storj_encryption::CipherSuite::NULL,
@@ -438,6 +455,162 @@ fn encryption_from_begin(
         .and_then(|b| usize::try_from(b).ok())
         .unwrap_or(crate::constants::ENCRYPTION_BLOCK_SIZE);
     (cipher, block)
+}
+
+fn map_uplink(e: storj_uplink::Error) -> Error {
+    match e {
+        storj_uplink::Error::Encryption(enc) => map_enc(enc),
+        other => Error::new(ErrorKind::Protocol, other.to_string()).with_source(other),
+    }
+}
+
+async fn download_single_segment(
+    project: &ProjectInner,
+    key: &str,
+    content_key: storj_encryption::Key,
+    opts: DownloadOptions,
+    resp: storj_proto::metainfo::DownloadObjectResponse,
+) -> Result<Download> {
+    use storj_uplink::download::{
+        LongTailDownload, RemoteDecrypt, decode_encrypted, decrypt_inline, decrypt_remote,
+        download_pieces_long_tail, piece_byte_range, resolve_range,
+    };
+    use storj_uplink::orders::PiecePrivateKey;
+    use storj_uplink::pipeline::{
+        Redundancy, content_nonce, decrypt_key, decrypt_user_data, nonce_from_slice,
+    };
+    use storj_uplink::segment::PieceAssignment;
+
+    if resp.segment_download.len() > 1 || resp.segment_list.as_ref().is_some_and(|l| l.more) {
+        return Err(Error::new(
+            ErrorKind::Protocol,
+            "multi-segment objects are not supported",
+        ));
+    }
+    let seg = resp
+        .segment_download
+        .into_iter()
+        .next()
+        .ok_or_else(|| Error::new(ErrorKind::Protocol, "DownloadObject missing segment"))?;
+
+    let mut info = object_from_proto(resp.object.clone(), key);
+    if seg.plain_size > 0 {
+        info.system.content_length = seg.plain_size;
+    }
+    let (mut cipher, mut block_size) = encryption_from_params(
+        resp.object
+            .as_ref()
+            .and_then(|o| o.encryption_parameters.as_ref()),
+    );
+    if let Some(obj) = &resp.object {
+        if !obj.encrypted_metadata.is_empty() {
+            if let Ok((meta, custom)) = decrypt_user_data(
+                &obj.encrypted_metadata,
+                &obj.encrypted_metadata_encrypted_key,
+                &obj.encrypted_metadata_nonce,
+                cipher,
+                &content_key,
+            ) {
+                if meta.number_of_segments > 1 {
+                    return Err(Error::new(
+                        ErrorKind::Protocol,
+                        "multi-segment objects are not supported",
+                    ));
+                }
+                if meta.encryption_type != 0 {
+                    cipher = storj_encryption::CipherSuite(meta.encryption_type);
+                }
+                if meta.encryption_block_size > 0 {
+                    if let Ok(b) = usize::try_from(meta.encryption_block_size) {
+                        block_size = b;
+                    }
+                }
+                info.custom = custom.user_defined.into_iter().collect();
+            }
+        }
+    }
+
+    let object_size = info.system.content_length;
+    let (plain_start, plain_len) =
+        resolve_range(opts.offset, opts.length, object_size).map_err(map_uplink)?;
+    if plain_len == 0 {
+        return Ok(Download::new(info, Vec::new()));
+    }
+    let position = seg.position.unwrap_or_default();
+    let nonce = content_nonce(position.part_number, position.index);
+    let enc_nonce = nonce_from_slice(&seg.encrypted_key_nonce).map_err(map_uplink)?;
+    let segment_key =
+        decrypt_key(&seg.encrypted_key, cipher, &content_key, &enc_nonce).map_err(map_uplink)?;
+
+    let plaintext = if !seg.encrypted_inline_data.is_empty() || seg.addressed_limits.is_empty() {
+        let full = decrypt_inline(&seg.encrypted_inline_data, cipher, &segment_key, &nonce)
+            .map_err(map_uplink)?;
+        slice_plain(&full, plain_start, plain_len)
+    } else {
+        let scheme = seg.redundancy_scheme.as_ref().ok_or_else(|| {
+            Error::new(ErrorKind::Protocol, "download response missing RS scheme")
+        })?;
+        let rs = Redundancy::from_scheme(scheme).map_err(map_uplink)?;
+        let decrypter = storj_encryption::new_decrypter(cipher, &segment_key, &nonce, block_size)
+            .map_err(map_enc)?;
+        let (piece_off, piece_size) = piece_byte_range(
+            plain_start,
+            plain_len,
+            decrypter.out_block_size(),
+            decrypter.in_block_size(),
+            &rs,
+        );
+        let mut assignments = Vec::new();
+        for (i, addressed) in seg.addressed_limits.into_iter().enumerate() {
+            if addressed.limit.is_none() {
+                continue;
+            }
+            assignments.push(PieceAssignment::from_addressed(i, addressed).map_err(map_uplink)?);
+        }
+        let piece_key = PiecePrivateKey::from_bytes(&seg.private_key).map_err(map_uplink)?;
+        let shares = download_pieces_long_tail(LongTailDownload {
+            assignments,
+            piece_key,
+            satellite_ca: project.satellite_ca.clone(),
+            identity: project.identity.clone(),
+            pool: project.pool.clone(),
+            rs,
+            offset: piece_off,
+            size: piece_size,
+            dial_timeout: project.dial_timeout,
+        })
+        .await
+        .map_err(map_uplink)?;
+        let decoded = decode_encrypted(&shares, &rs).map_err(map_uplink)?;
+        let decoded_offset = usize::try_from(piece_off.saturating_mul(rs.k as i64)).unwrap_or(0);
+        let encrypted_size = usize::try_from(seg.segment_size.max(0)).unwrap_or(0);
+        decrypt_remote(RemoteDecrypt {
+            decoded: &decoded,
+            decoded_offset,
+            encrypted_size,
+            cipher,
+            key: &segment_key,
+            nonce: &nonce,
+            encrypted_block_size: block_size,
+            plain_start,
+            plain_len,
+            plain_size: object_size,
+        })
+        .map_err(map_uplink)?
+    };
+
+    Ok(Download::new(info, plaintext))
+}
+
+fn slice_plain(full: &[u8], start: i64, len: i64) -> Vec<u8> {
+    if len <= 0 {
+        return Vec::new();
+    }
+    let start = usize::try_from(start).unwrap_or(0).min(full.len());
+    let end = start
+        .saturating_add(usize::try_from(len).unwrap_or(0))
+        .min(full.len());
+    full[start..end].to_vec()
 }
 
 pub(crate) async fn commit_upload(inner: UploadInner) -> Result<Object> {

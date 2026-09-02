@@ -10,12 +10,13 @@ use storj_proto::metainfo::{
     BeginObjectResponse, BeginSegmentRequest, BeginSegmentResponse, Bucket as ProtoBucket,
     BucketListItem, CohortRequirements, CommitObjectRequest, CommitObjectResponse,
     CommitSegmentRequest, CommitSegmentResponse, CompressedBatchRequest, CreateBucketRequest,
-    CreateBucketResponse, DeleteBucketRequest, DeleteBucketResponse, FinishDeleteObjectRequest,
+    CreateBucketResponse, DeleteBucketRequest, DeleteBucketResponse, DownloadObjectRequest,
+    DownloadObjectResponse, DownloadSegmentResponse, FinishDeleteObjectRequest,
     FinishDeleteObjectResponse, GetBucketRequest, GetBucketResponse, ListBucketsRequest,
-    ListBucketsResponse, ListDirection, MakeInlineSegmentRequest, MakeInlineSegmentResponse,
-    Object as ProtoObject, ProjectInfoRequest, ProjectInfoResponse, RequestHeader,
-    RetryBeginSegmentPiecesRequest, RetryBeginSegmentPiecesResponse, batch_request_item,
-    batch_response_item, cohort_requirements,
+    ListBucketsResponse, ListDirection, ListSegmentsResponse, MakeInlineSegmentRequest,
+    MakeInlineSegmentResponse, Object as ProtoObject, ProjectInfoRequest, ProjectInfoResponse,
+    RequestHeader, RetryBeginSegmentPiecesRequest, RetryBeginSegmentPiecesResponse,
+    SegmentListItem, SegmentPosition, batch_request_item, batch_response_item, cohort_requirements,
 };
 use storj_proto::node::NodeAddress;
 use storj_proto::orders::{OrderLimit, PieceAction};
@@ -51,6 +52,31 @@ struct PendingObject {
     bucket: String,
     enc_key: Vec<u8>,
     stream_id: Vec<u8>,
+    segment: Option<StoredSegment>,
+    piece_limits: HashMap<i32, AddressedOrderLimit>,
+}
+
+#[derive(Clone)]
+struct StoredPiece {
+    piece_num: i32,
+    piece_id: Vec<u8>,
+    node_id: Vec<u8>,
+}
+
+#[derive(Clone)]
+struct StoredSegment {
+    encrypted_key: Vec<u8>,
+    encrypted_key_nonce: Vec<u8>,
+    plain_size: i64,
+    encrypted_size: i64,
+    inline_data: Vec<u8>,
+    pieces: Vec<StoredPiece>,
+    scheme: RedundancyScheme,
+}
+
+struct CommittedObject {
+    object: ProtoObject,
+    segment: StoredSegment,
 }
 
 struct MockState {
@@ -59,8 +85,9 @@ struct MockState {
     buckets: BTreeMap<String, BucketRec>,
     get_bucket_denied: BTreeSet<String>,
     pending: BTreeMap<Vec<u8>, PendingObject>,
-    committed: BTreeMap<(String, Vec<u8>), ProtoObject>,
+    committed: BTreeMap<(String, Vec<u8>), CommittedObject>,
     aborted: BTreeSet<Vec<u8>>,
+    segment_to_stream: BTreeMap<Vec<u8>, Vec<u8>>,
     inline_segments: usize,
     remote_segments: usize,
     retry_begin: usize,
@@ -113,6 +140,7 @@ impl MockSatellite {
             pending: BTreeMap::new(),
             committed: BTreeMap::new(),
             aborted: BTreeSet::new(),
+            segment_to_stream: BTreeMap::new(),
             inline_segments: 0,
             remote_segments: 0,
             retry_begin: 0,
@@ -236,6 +264,13 @@ impl MockSatellite {
     /// Next `CommitObject` returns an error (then clears).
     pub fn fail_next_commit_object(&self) {
         self.state.lock().expect("mock state").fail_commit = true;
+    }
+
+    /// Next Download on storage node `idx` fails (k-1 reconstruction tests).
+    pub async fn fail_sn_download(&self, idx: usize) {
+        if let Some(sn) = self.sns.get(idx) {
+            sn.fail_next_download().await;
+        }
     }
 
     /// Segment id last sent on `CommitSegment`.
@@ -518,6 +553,9 @@ fn handle_batch_item(
                 req, state, sns, identity,
             )?)
         }
+        Some(Request::ObjectDownload(req)) => batch_response_item::Response::ObjectDownload(
+            download_object(req, state, sns, identity)?,
+        ),
         Some(Request::BucketCreate(req)) => {
             let body = handle_rpc(
                 rpc::CREATE_BUCKET,
@@ -562,6 +600,8 @@ fn begin_object(
             bucket: name,
             enc_key: req.encrypted_object_key.clone(),
             stream_id: stream_id.clone(),
+            segment: None,
+            piece_limits: HashMap::new(),
         },
     );
     Ok(BeginObjectResponse {
@@ -592,6 +632,15 @@ fn commit_object(
         .pending
         .remove(&req.stream_id)
         .ok_or_else(|| (RPC_NOT_FOUND, "object not found".into()))?;
+    let segment = pending.segment.unwrap_or_else(|| StoredSegment {
+        encrypted_key: Vec::new(),
+        encrypted_key_nonce: Vec::new(),
+        plain_size: 0,
+        encrypted_size: 0,
+        inline_data: Vec::new(),
+        pieces: Vec::new(),
+        scheme: test_scheme(),
+    });
     let obj = ProtoObject {
         bucket: pending.bucket.as_bytes().to_vec(),
         encrypted_object_key: pending.enc_key.clone(),
@@ -601,13 +650,24 @@ fn commit_object(
         encrypted_metadata: req.encrypted_metadata,
         encrypted_metadata_nonce: req.encrypted_metadata_nonce,
         encrypted_metadata_encrypted_key: req.encrypted_metadata_encrypted_key,
+        plain_size: segment.plain_size,
+        encryption_parameters: Some(storj_proto::encryption::EncryptionParameters {
+            cipher_suite: storj_proto::encryption::CipherSuite::EncAesgcm as i32,
+            block_size: 7424,
+        }),
+        redundancy_scheme: Some(segment.scheme),
         ..Default::default()
     };
     if let Some(rec) = st.buckets.get_mut(&pending.bucket) {
         rec.objects += 1;
     }
-    st.committed
-        .insert((pending.bucket, pending.enc_key), obj.clone());
+    st.committed.insert(
+        (pending.bucket, pending.enc_key),
+        CommittedObject {
+            object: obj.clone(),
+            segment,
+        },
+    );
     Ok(CommitObjectResponse { object: Some(obj) })
 }
 
@@ -648,6 +708,9 @@ fn begin_segment(
     st.remote_segments += 1;
     st.next_id += 1;
     let segment_id = st.next_id.to_be_bytes().to_vec();
+    let stream_id = req.stream_id.clone();
+    st.segment_to_stream
+        .insert(segment_id.clone(), stream_id.clone());
     let piece_key = st.piece_key.clone();
     let sn_tags = st.sn_tags.clone();
     drop(st);
@@ -663,9 +726,21 @@ fn begin_segment(
             &pk,
             i as i32,
             &segment_id,
+            None,
             req.max_order_limit.max(64 * 1024),
             tags,
+            PieceAction::Put,
         )?);
+    }
+    {
+        let mut st = state.lock().expect("mock state");
+        if let Some(pending) = st.pending.get_mut(&stream_id) {
+            pending.piece_limits = addressed_limits
+                .iter()
+                .enumerate()
+                .map(|(i, a)| (i as i32, a.clone()))
+                .collect();
+        }
     }
     Ok(BeginSegmentResponse {
         segment_id,
@@ -692,6 +767,10 @@ fn retry_pieces(
     st.next_id += 1;
     let new_id = st.next_id.to_be_bytes().to_vec();
     st.last_retry_segment_id = Some(new_id.clone());
+    let stream_id = st.segment_to_stream.remove(&req.segment_id);
+    if let Some(ref sid) = stream_id {
+        st.segment_to_stream.insert(new_id.clone(), sid.clone());
+    }
     let piece_key = st.piece_key.clone();
     let sn_tags = st.sn_tags.clone();
     drop(st);
@@ -711,9 +790,20 @@ fn retry_pieces(
             &pk,
             *num,
             &new_id,
+            None,
             64 * 1024,
             tags,
+            PieceAction::Put,
         )?);
+    }
+    if let Some(sid) = stream_id {
+        let mut st = state.lock().expect("mock state");
+        if let Some(pending) = st.pending.get_mut(&sid) {
+            for (i, limit) in addressed_limits.iter().enumerate() {
+                let num = req.retry_piece_numbers.get(i).copied().unwrap_or(i as i32);
+                pending.piece_limits.insert(num, limit.clone());
+            }
+        }
     }
     Ok(RetryBeginSegmentPiecesResponse {
         segment_id: new_id,
@@ -736,6 +826,33 @@ fn commit_segment(
         }
     }
     st.last_commit_segment_id = Some(req.segment_id.clone());
+    let stream_id = st.segment_to_stream.get(&req.segment_id).cloned();
+    if let Some(sid) = stream_id {
+        if let Some(pending) = st.pending.get_mut(&sid) {
+            let mut pieces = Vec::new();
+            for result in &req.upload_result {
+                if let Some(addr) = pending.piece_limits.get(&result.piece_num) {
+                    let limit = addr.limit.as_ref();
+                    pieces.push(StoredPiece {
+                        piece_num: result.piece_num,
+                        piece_id: limit.map(|l| l.piece_id.clone()).unwrap_or_default(),
+                        node_id: limit
+                            .map(|l| l.storage_node_id.clone())
+                            .unwrap_or_else(|| result.node_id.clone()),
+                    });
+                }
+            }
+            pending.segment = Some(StoredSegment {
+                encrypted_key: req.encrypted_key.clone(),
+                encrypted_key_nonce: req.encrypted_key_nonce.clone(),
+                plain_size: req.plain_size,
+                encrypted_size: req.size_encrypted_data,
+                inline_data: Vec::new(),
+                pieces,
+                scheme: test_scheme(),
+            });
+        }
+    }
     Ok(CommitSegmentResponse {
         successful_pieces: req.upload_result.len() as i32,
     })
@@ -754,7 +871,112 @@ fn make_inline(
         ));
     }
     st.inline_segments += 1;
+    if let Some(pending) = st.pending.get_mut(&req.stream_id) {
+        pending.segment = Some(StoredSegment {
+            encrypted_key: req.encrypted_key,
+            encrypted_key_nonce: req.encrypted_key_nonce,
+            plain_size: req.plain_size,
+            encrypted_size: req.encrypted_inline_data.len() as i64,
+            inline_data: req.encrypted_inline_data,
+            pieces: Vec::new(),
+            scheme: test_scheme(),
+        });
+    }
     Ok(MakeInlineSegmentResponse {})
+}
+
+fn download_object(
+    req: DownloadObjectRequest,
+    state: &Mutex<MockState>,
+    sns: &[Arc<MockStorageNode>],
+    identity: &Identity,
+) -> Result<DownloadObjectResponse, (u64, String)> {
+    let st = state.lock().expect("mock state");
+    check_key(&req.header, &st)?;
+    let name = utf8_name(&req.bucket)?;
+    if !st.buckets.contains_key(&name) {
+        return Err((RPC_NOT_FOUND, format!("bucket not found: {name}")));
+    }
+    let committed = st
+        .committed
+        .get(&(name, req.encrypted_object_key.clone()))
+        .ok_or_else(|| (RPC_NOT_FOUND, "object not found".into()))?;
+    let mut obj = committed.object.clone();
+    let seg = committed.segment.clone();
+    obj.plain_size = seg.plain_size;
+    let piece_key = st.piece_key.clone();
+    drop(st);
+
+    let pk = PiecePrivateKey::from_bytes(&piece_key)
+        .map_err(|e| (RPC_INVALID_ARGUMENT, e.to_string()))?;
+    let n = usize::try_from(seg.scheme.total)
+        .unwrap_or(0)
+        .max(seg.pieces.len());
+    let mut addressed_limits = vec![AddressedOrderLimit::default(); n];
+    if seg.inline_data.is_empty() {
+        for p in &seg.pieces {
+            let sn = sns
+                .iter()
+                .find(|sn| sn.identity().node_id().as_bytes().as_slice() == p.node_id.as_slice());
+            let Some(sn) = sn else {
+                continue;
+            };
+            let idx = usize::try_from(p.piece_num).unwrap_or(usize::MAX);
+            if idx >= addressed_limits.len() {
+                addressed_limits.resize(idx + 1, AddressedOrderLimit::default());
+            }
+            addressed_limits[idx] = signed_limit(
+                identity,
+                sn,
+                &pk,
+                p.piece_num,
+                &p.piece_id,
+                Some(p.piece_id.clone()),
+                seg.encrypted_size.max(64 * 1024),
+                HashMap::new(),
+                PieceAction::Get,
+            )?;
+        }
+    }
+
+    let position = SegmentPosition {
+        part_number: 0,
+        index: 0,
+    };
+    let dl = DownloadSegmentResponse {
+        segment_id: obj.stream_id.clone(),
+        addressed_limits: if seg.inline_data.is_empty() {
+            addressed_limits
+        } else {
+            Vec::new()
+        },
+        private_key: piece_key,
+        encrypted_inline_data: seg.inline_data.clone(),
+        plain_offset: 0,
+        plain_size: seg.plain_size,
+        segment_size: seg.encrypted_size,
+        encrypted_key_nonce: seg.encrypted_key_nonce.clone(),
+        encrypted_key: seg.encrypted_key.clone(),
+        redundancy_scheme: Some(seg.scheme),
+        next: None,
+        position: Some(position),
+    };
+    Ok(DownloadObjectResponse {
+        object: Some(obj.clone()),
+        segment_list: Some(ListSegmentsResponse {
+            items: vec![SegmentListItem {
+                position: Some(position),
+                plain_size: seg.plain_size,
+                plain_offset: 0,
+                encrypted_key_nonce: seg.encrypted_key_nonce,
+                encrypted_key: seg.encrypted_key,
+                ..Default::default()
+            }],
+            more: false,
+            encryption_parameters: obj.encryption_parameters,
+        }),
+        segment_download: vec![dl],
+    })
 }
 
 fn test_scheme() -> RedundancyScheme {
@@ -768,21 +990,27 @@ fn test_scheme() -> RedundancyScheme {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn signed_limit(
     satellite: &Identity,
     sn: &MockStorageNode,
     piece_key: &PiecePrivateKey,
     piece_num: i32,
     segment_id: &[u8],
+    piece_id: Option<Vec<u8>>,
     limit: i64,
     tags: HashMap<String, Vec<u8>>,
+    action: PieceAction,
 ) -> Result<AddressedOrderLimit, (u64, String)> {
     let now = timestamp(SystemTime::now());
-    let mut piece_id = [0u8; 32];
-    piece_id[0] = piece_num as u8;
-    if segment_id.len() >= 8 {
-        piece_id[1..9].copy_from_slice(&segment_id[..8.min(segment_id.len())]);
-    }
+    let piece_id = piece_id.unwrap_or_else(|| {
+        let mut id = [0u8; 32];
+        id[0] = piece_num as u8;
+        if segment_id.len() >= 8 {
+            id[1..9].copy_from_slice(&segment_id[..8.min(segment_id.len())]);
+        }
+        id.to_vec()
+    });
     let mut ol = OrderLimit {
         serial_number: {
             let mut s = vec![piece_num as u8];
@@ -794,9 +1022,9 @@ fn signed_limit(
         deprecated_uplink_id: Vec::new(),
         uplink_public_key: piece_key.public().to_bytes().to_vec(),
         storage_node_id: sn.identity().node_id().as_bytes().to_vec(),
-        piece_id: piece_id.to_vec(),
+        piece_id,
         limit: limit.max(1),
-        action: PieceAction::Put as i32,
+        action: action as i32,
         piece_expiration: Some(now),
         order_expiration: Some(now),
         order_creation: Some(now),

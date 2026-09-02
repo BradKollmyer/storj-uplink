@@ -141,15 +141,16 @@ impl AsyncWrite for Upload {
     }
 }
 
-/// Object download. Implements `AsyncRead`.
+/// Object download. Implements `AsyncRead`. `info()` is populated at start.
 pub struct Download {
     info: Object,
+    buf: Vec<u8>,
+    pos: usize,
 }
 
 impl Download {
-    #[allow(dead_code)]
-    pub(crate) fn stub(info: Object) -> Self {
-        Self { info }
+    pub(crate) fn new(info: Object, buf: Vec<u8>) -> Self {
+        Self { info, buf, pos: 0 }
     }
 
     /// Object info available immediately.
@@ -167,9 +168,16 @@ impl AsyncRead for Download {
     fn poll_read(
         self: Pin<&mut Self>,
         _cx: &mut Context<'_>,
-        _buf: &mut ReadBuf<'_>,
+        buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
-        Poll::Ready(Err(Error::not_implemented("Download::poll_read").into()))
+        let this = self.get_mut();
+        if this.pos >= this.buf.len() {
+            return Poll::Ready(Ok(()));
+        }
+        let n = buf.remaining().min(this.buf.len() - this.pos);
+        buf.put_slice(&this.buf[this.pos..this.pos + n]);
+        this.pos += n;
+        Poll::Ready(Ok(()))
     }
 }
 

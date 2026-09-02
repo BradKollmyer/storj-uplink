@@ -7,8 +7,8 @@ use prost::Message;
 use rand::RngCore;
 use storj_ec::ReedSolomon;
 use storj_encryption::{
-    CipherSuite, DEFAULT_ENCRYPTED_BLOCK_SIZE, Key, NONCE_SIZE, encrypt, increment, new_encrypter,
-    transform_padded,
+    CipherSuite, DEFAULT_ENCRYPTED_BLOCK_SIZE, Key, NONCE_SIZE, decrypt, encrypt, increment,
+    new_encrypter, transform_padded,
 };
 use storj_proto::pointerdb::RedundancyScheme;
 
@@ -170,6 +170,30 @@ pub fn encrypt_key(
     Ok(encrypt(key.as_bytes(), cipher, parent, nonce)?)
 }
 
+/// Decrypt a 32-byte key with `parent` (Go `DecryptKey`).
+pub fn decrypt_key(
+    encrypted: &[u8],
+    cipher: CipherSuite,
+    parent: &Key,
+    nonce: &[u8; NONCE_SIZE],
+) -> Result<Key> {
+    let raw = decrypt(encrypted, cipher, parent, nonce)?;
+    let bytes: [u8; 32] = raw
+        .try_into()
+        .map_err(|_| Error::protocol("decrypted key is not 32 bytes"))?;
+    Ok(Key::from_bytes(bytes))
+}
+
+/// Copy a Storj nonce from a protobuf bytes field (24 bytes, extra ignored).
+pub fn nonce_from_slice(b: &[u8]) -> Result<[u8; NONCE_SIZE]> {
+    if b.len() < NONCE_SIZE {
+        return Err(Error::protocol("nonce is shorter than 24 bytes"));
+    }
+    let mut n = [0u8; NONCE_SIZE];
+    n.copy_from_slice(&b[..NONCE_SIZE]);
+    Ok(n)
+}
+
 /// `pb.SerializableMeta` (custom metadata map).
 #[derive(Clone, PartialEq, Message)]
 pub struct SerializableMeta {
@@ -274,6 +298,37 @@ pub fn encrypt_user_data(
     })
 }
 
+/// Decrypt object `encrypted_metadata` (Go `DecryptUserData`).
+pub fn decrypt_user_data(
+    encrypted_metadata: &[u8],
+    encrypted_metadata_encrypted_key: &[u8],
+    encrypted_metadata_nonce: &[u8],
+    cipher: CipherSuite,
+    derived_content_key: &Key,
+) -> Result<(StreamMeta, SerializableMeta)> {
+    let meta = StreamMeta::decode(encrypted_metadata)?;
+    let nonce = nonce_from_slice(encrypted_metadata_nonce)?;
+    let metadata_key = decrypt_key(
+        encrypted_metadata_encrypted_key,
+        cipher,
+        derived_content_key,
+        &nonce,
+    )?;
+    let stream_info = decrypt(
+        &meta.encrypted_stream_info,
+        cipher,
+        &metadata_key,
+        &[0u8; NONCE_SIZE],
+    )?;
+    let info = StreamInfo::decode(stream_info.as_slice())?;
+    let custom = if info.metadata.is_empty() {
+        SerializableMeta::default()
+    } else {
+        SerializableMeta::decode(info.metadata.as_slice())?
+    };
+    Ok((meta, custom))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -362,6 +417,33 @@ mod tests {
         .unwrap();
         let meta = StreamMeta::decode(user.encrypted_metadata.as_slice()).unwrap();
         assert_eq!(meta.encryption_block_size, 7424);
+    }
+
+    #[test]
+    fn user_data_round_trips() {
+        let key = Key::from_bytes([9u8; 32]);
+        let user = encrypt_user_data(
+            &[("app:title".into(), "hi".into())],
+            64 * 1024 * 1024,
+            11,
+            CipherSuite::AES_GCM,
+            &key,
+            0,
+        )
+        .unwrap();
+        let (meta, custom) = decrypt_user_data(
+            &user.encrypted_metadata,
+            &user.encrypted_metadata_encrypted_key,
+            &user.encrypted_metadata_nonce,
+            CipherSuite::AES_GCM,
+            &key,
+        )
+        .unwrap();
+        assert_eq!(meta.number_of_segments, 1);
+        assert_eq!(
+            custom.user_defined.get("app:title").map(String::as_str),
+            Some("hi")
+        );
     }
 
     #[test]
