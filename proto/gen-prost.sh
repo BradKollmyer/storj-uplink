@@ -14,11 +14,14 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-prost-build = "0.13"
+prost-build = "=0.13.5"
+protoc-bin-vendored = "3"
 EOF
 
 cat > "$TMP/gen-prost/src/main.rs" << 'EOF'
 fn main() {
+    let protoc = protoc_bin_vendored::protoc_bin_path().expect("vendored protoc");
+    std::env::set_var("PROTOC", &protoc);
     let root = std::env::var("STORJ_ROOT").expect("STORJ_ROOT");
     let proto_dir = format!("{root}/proto");
     let out = format!("{root}/crates/storj-proto/src/gen");

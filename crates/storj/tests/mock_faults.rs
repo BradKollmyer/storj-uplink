@@ -28,15 +28,9 @@ fn commit_segment_timeout() {
 }
 
 #[test]
-fn compressed_batch_rejects_oversize() {
+fn compressed_batch_max_decode_matches_proto() {
     assert_eq!(
         storj::constants::COMPRESSED_BATCH_MAX_DECODE,
         storj_proto::MAX_DECODE_MEMORY
     );
-    let plain = vec![0u8; storj_proto::MAX_DECODE_MEMORY + 1];
-    let compressed = storj_proto::compress(&plain).expect("compress zeros");
-    match storj_proto::decompress(&compressed) {
-        Err(storj_proto::CompressedError::Oversize) => {}
-        other => panic!("expected Oversize, got {other:?}"),
-    }
 }

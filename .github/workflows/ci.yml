@@ -25,8 +25,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
       - name: checksum vendored protos against pin
         run: bash proto/check-pin.sh
+      - name: checked-in prost matches protos
+        run: |
+          bash proto/gen-prost.sh
+          cargo fmt --all
+          git diff --exit-code crates/storj-proto/src/gen
 
   deny:
     runs-on: ubuntu-latest
