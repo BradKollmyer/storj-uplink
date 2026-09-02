@@ -15,14 +15,20 @@ use storj_proto::metainfo::{
     DownloadObjectResponse, DownloadSegmentRequest, DownloadSegmentResponse, EncryptedKeyAndNonce,
     FinishCopyObjectRequest, FinishCopyObjectResponse, FinishDeleteObjectRequest,
     FinishDeleteObjectResponse, FinishMoveObjectRequest, FinishMoveObjectResponse,
-    GetBucketRequest, GetBucketResponse, GetObjectRequest, GetObjectResponse, ListBucketsRequest,
-    ListBucketsResponse, ListDirection, ListObjectsRequest, ListObjectsResponse,
-    ListSegmentsRequest, ListSegmentsResponse, MakeInlineSegmentRequest, MakeInlineSegmentResponse,
-    Object as ProtoObject, ObjectListItem, ProjectInfoRequest, ProjectInfoResponse, Range,
-    RequestHeader, RetryBeginSegmentPiecesRequest, RetryBeginSegmentPiecesResponse,
-    RevokeApiKeyRequest, RevokeApiKeyResponse, SegmentListItem, SegmentPosition,
-    UpdateObjectMetadataRequest, UpdateObjectMetadataResponse, batch_request_item,
-    batch_response_item, cohort_requirements, object::Status as ObjectStatus, range,
+    GetBucketObjectLockConfigurationRequest, GetBucketObjectLockConfigurationResponse,
+    GetBucketRequest, GetBucketResponse, GetObjectLegalHoldRequest, GetObjectLegalHoldResponse,
+    GetObjectRequest, GetObjectResponse, GetObjectRetentionRequest, GetObjectRetentionResponse,
+    ListBucketsRequest, ListBucketsResponse, ListDirection, ListObjectsRequest,
+    ListObjectsResponse, ListSegmentsRequest, ListSegmentsResponse, MakeInlineSegmentRequest,
+    MakeInlineSegmentResponse, Object as ProtoObject, ObjectListItem, ObjectLockConfiguration,
+    ProjectInfoRequest, ProjectInfoResponse, Range, RequestHeader, Retention,
+    RetryBeginSegmentPiecesRequest, RetryBeginSegmentPiecesResponse, RevokeApiKeyRequest,
+    RevokeApiKeyResponse, SegmentListItem, SegmentPosition,
+    SetBucketObjectLockConfigurationRequest, SetBucketObjectLockConfigurationResponse,
+    SetObjectLegalHoldRequest, SetObjectLegalHoldResponse, SetObjectRetentionRequest,
+    SetObjectRetentionResponse, UpdateObjectMetadataRequest, UpdateObjectMetadataResponse,
+    batch_request_item, batch_response_item, cohort_requirements, object::Status as ObjectStatus,
+    range,
 };
 use storj_proto::node::NodeAddress;
 use storj_proto::orders::{OrderLimit, PieceAction};
@@ -46,6 +52,9 @@ const RPC_PERMISSION_DENIED: u64 = 7;
 const RPC_FAILED_PRECONDITION: u64 = 9;
 const RPC_INTERNAL: u64 = 13;
 const RPC_UNIMPLEMENTED: u64 = 12;
+const RPC_OBJECT_LOCK_BUCKET_CONFIG_MISSING: u64 = 10003;
+const RPC_OBJECT_LOCK_OBJECT_RETENTION_MISSING: u64 = 10004;
+const RPC_OBJECT_LOCK_INVALID_BUCKET_CONFIG: u64 = 10007;
 
 const PROJECT_SALT: &[u8] = b"0123456789abcdef";
 
@@ -53,6 +62,14 @@ const PROJECT_SALT: &[u8] = b"0123456789abcdef";
 struct BucketRec {
     created: SystemTime,
     objects: usize,
+    lock_config: Option<ObjectLockConfiguration>,
+    object_locks: BTreeMap<(Vec<u8>, Vec<u8>), ObjectLockRec>,
+}
+
+#[derive(Clone, Default)]
+struct ObjectLockRec {
+    retention: Option<Retention>,
+    legal_hold: bool,
 }
 
 struct PendingObject {
@@ -343,6 +360,8 @@ impl MockSatellite {
             .or_insert_with(|| BucketRec {
                 created: SystemTime::now(),
                 objects: 0,
+                lock_config: None,
+                object_locks: BTreeMap::new(),
             })
             .objects += 1;
     }
@@ -357,6 +376,8 @@ impl MockSatellite {
             .or_insert_with(|| BucketRec {
                 created: SystemTime::now(),
                 objects: 0,
+                lock_config: None,
+                object_locks: BTreeMap::new(),
             })
             .objects += 1;
         st.committed.insert(
@@ -492,6 +513,8 @@ fn handle_rpc(
                 BucketRec {
                     created,
                     objects: 0,
+                    lock_config: None,
+                    object_locks: BTreeMap::new(),
                 },
             );
             Ok(CreateBucketResponse {
@@ -580,6 +603,106 @@ fn handle_rpc(
             let req = UpdateObjectMetadataRequest::decode(body).map_err(decode_err)?;
             update_object_metadata(req, state)?;
             Ok(UpdateObjectMetadataResponse {}.encode_to_vec())
+        }
+        rpc::GET_BUCKET_OBJECT_LOCK_CONFIGURATION => {
+            let req = GetBucketObjectLockConfigurationRequest::decode(body).map_err(decode_err)?;
+            let state = state.lock().expect("mock state");
+            check_key(&req.header, &state)?;
+            let name = utf8_name(&req.name)?;
+            let rec = state
+                .buckets
+                .get(&name)
+                .ok_or_else(|| (RPC_NOT_FOUND, format!("bucket not found: {name}")))?;
+            let configuration = rec.lock_config.ok_or_else(|| {
+                (
+                    RPC_OBJECT_LOCK_BUCKET_CONFIG_MISSING,
+                    "object lock is not enabled for this bucket".into(),
+                )
+            })?;
+            Ok(GetBucketObjectLockConfigurationResponse {
+                configuration: Some(configuration),
+            }
+            .encode_to_vec())
+        }
+        rpc::SET_BUCKET_OBJECT_LOCK_CONFIGURATION => {
+            let req = SetBucketObjectLockConfigurationRequest::decode(body).map_err(decode_err)?;
+            let mut state = state.lock().expect("mock state");
+            check_key(&req.header, &state)?;
+            let name = utf8_name(&req.name)?;
+            let rec = state
+                .buckets
+                .get_mut(&name)
+                .ok_or_else(|| (RPC_NOT_FOUND, format!("bucket not found: {name}")))?;
+            let configuration = req.configuration.ok_or_else(|| {
+                (
+                    RPC_OBJECT_LOCK_INVALID_BUCKET_CONFIG,
+                    "bucket object lock configuration is invalid".into(),
+                )
+            })?;
+            rec.lock_config = Some(configuration);
+            Ok(SetBucketObjectLockConfigurationResponse {}.encode_to_vec())
+        }
+        rpc::GET_OBJECT_RETENTION => {
+            let req = GetObjectRetentionRequest::decode(body).map_err(decode_err)?;
+            let state = state.lock().expect("mock state");
+            check_key(&req.header, &state)?;
+            let rec = object_lock_rec(
+                &state,
+                &req.bucket,
+                &req.encrypted_object_key,
+                &req.object_version,
+            )?;
+            let retention = rec.retention.ok_or_else(|| {
+                (
+                    RPC_OBJECT_LOCK_OBJECT_RETENTION_MISSING,
+                    "object has no retention configuration".into(),
+                )
+            })?;
+            Ok(GetObjectRetentionResponse {
+                retention: Some(retention),
+            }
+            .encode_to_vec())
+        }
+        rpc::SET_OBJECT_RETENTION => {
+            let req = SetObjectRetentionRequest::decode(body).map_err(decode_err)?;
+            let mut state = state.lock().expect("mock state");
+            check_key(&req.header, &state)?;
+            let rec = object_lock_rec_mut(
+                &mut state,
+                &req.bucket,
+                &req.encrypted_object_key,
+                &req.object_version,
+            )?;
+            rec.retention = req.retention;
+            Ok(SetObjectRetentionResponse {}.encode_to_vec())
+        }
+        rpc::GET_OBJECT_LEGAL_HOLD => {
+            let req = GetObjectLegalHoldRequest::decode(body).map_err(decode_err)?;
+            let state = state.lock().expect("mock state");
+            check_key(&req.header, &state)?;
+            let rec = object_lock_rec(
+                &state,
+                &req.bucket,
+                &req.encrypted_object_key,
+                &req.object_version,
+            )?;
+            Ok(GetObjectLegalHoldResponse {
+                enabled: rec.legal_hold,
+            }
+            .encode_to_vec())
+        }
+        rpc::SET_OBJECT_LEGAL_HOLD => {
+            let req = SetObjectLegalHoldRequest::decode(body).map_err(decode_err)?;
+            let mut state = state.lock().expect("mock state");
+            check_key(&req.header, &state)?;
+            let rec = object_lock_rec_mut(
+                &mut state,
+                &req.bucket,
+                &req.encrypted_object_key,
+                &req.object_version,
+            )?;
+            rec.legal_hold = req.enabled;
+            Ok(SetObjectLegalHoldResponse {}.encode_to_vec())
         }
         rpc::COMPRESSED_BATCH => {
             let req = CompressedBatchRequest::decode(body).map_err(decode_err)?;
@@ -1773,6 +1896,39 @@ fn signed_limit(
         }),
         tags,
     })
+}
+
+fn object_lock_rec<'a>(
+    state: &'a MockState,
+    bucket: &[u8],
+    encrypted_key: &[u8],
+    version: &[u8],
+) -> Result<&'a ObjectLockRec, (u64, String)> {
+    let name = utf8_name(bucket)?;
+    let rec = state
+        .buckets
+        .get(&name)
+        .ok_or_else(|| (RPC_NOT_FOUND, format!("bucket not found: {name}")))?;
+    rec.object_locks
+        .get(&(encrypted_key.to_vec(), version.to_vec()))
+        .ok_or_else(|| (RPC_NOT_FOUND, "object not found".into()))
+}
+
+fn object_lock_rec_mut<'a>(
+    state: &'a mut MockState,
+    bucket: &[u8],
+    encrypted_key: &[u8],
+    version: &[u8],
+) -> Result<&'a mut ObjectLockRec, (u64, String)> {
+    let name = utf8_name(bucket)?;
+    let rec = state
+        .buckets
+        .get_mut(&name)
+        .ok_or_else(|| (RPC_NOT_FOUND, format!("bucket not found: {name}")))?;
+    Ok(rec
+        .object_locks
+        .entry((encrypted_key.to_vec(), version.to_vec()))
+        .or_default())
 }
 
 fn check_key(header: &Option<RequestHeader>, state: &MockState) -> Result<(), (u64, String)> {

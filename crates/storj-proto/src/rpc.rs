@@ -34,6 +34,20 @@ pub const RETRY_BEGIN_SEGMENT_PIECES: &str = "/metainfo.Metainfo/RetryBeginSegme
 pub const BEGIN_DELETE_OBJECT: &str = "/metainfo.Metainfo/BeginDeleteObject";
 /// Finish object delete (`FinishDeleteObject`).
 pub const FINISH_DELETE_OBJECT: &str = "/metainfo.Metainfo/FinishDeleteObject";
+/// Get object Object Lock retention.
+pub const GET_OBJECT_RETENTION: &str = "/metainfo.Metainfo/GetObjectRetention";
+/// Set object Object Lock retention.
+pub const SET_OBJECT_RETENTION: &str = "/metainfo.Metainfo/SetObjectRetention";
+/// Get object Object Lock legal hold.
+pub const GET_OBJECT_LEGAL_HOLD: &str = "/metainfo.Metainfo/GetObjectLegalHold";
+/// Set object Object Lock legal hold.
+pub const SET_OBJECT_LEGAL_HOLD: &str = "/metainfo.Metainfo/SetObjectLegalHold";
+/// Get bucket Object Lock configuration.
+pub const GET_BUCKET_OBJECT_LOCK_CONFIGURATION: &str =
+    "/metainfo.Metainfo/GetBucketObjectLockConfiguration";
+/// Set bucket Object Lock configuration.
+pub const SET_BUCKET_OBJECT_LOCK_CONFIGURATION: &str =
+    "/metainfo.Metainfo/SetBucketObjectLockConfiguration";
 
 /// Storage-node piece upload (client stream).
 pub const PIECESTORE_UPLOAD: &str = "/piecestore.Piecestore/Upload";

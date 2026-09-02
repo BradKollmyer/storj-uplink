@@ -29,7 +29,7 @@ fn matrix_is_complete() {
     assert_eq!(
         INTEROP_SIZES[INTEROP_SIZES.len() - 1],
         MAX_SEGMENT_SIZE + 1,
-        "64MiB+1 stays in INTEROP_SIZES for PR 26; this job skips it"
+        "64MiB+1 is part of the 1.0 interop matrix"
     );
 }
 
@@ -100,7 +100,7 @@ fn rust_share_then_go_parse() {
 }
 
 #[tokio::test]
-#[ignore = "STORJ_INTEROP=1 + live satellite; 64MiB+1 is PR 26"]
+#[ignore = "STORJ_INTEROP=1 + live satellite"]
 async fn writer_reader_size_matrix() {
     if !storj_test::interop_enabled() {
         return;
@@ -125,15 +125,6 @@ async fn writer_reader_size_matrix() {
 
     for &(writer, reader) in INTEROP_SIDES {
         for &size in INTEROP_SIZES {
-            if size > MAX_SEGMENT_SIZE {
-                eprintln!(
-                    "skip {}->{} / {} until PR 26 (multi-segment)",
-                    writer.as_str(),
-                    reader.as_str(),
-                    size_label(size)
-                );
-                continue;
-            }
             let name = format!(
                 "{}->{}/{}",
                 writer.as_str(),

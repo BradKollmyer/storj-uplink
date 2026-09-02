@@ -10,7 +10,7 @@ use storj_proto::metainfo::{
 
 use crate::bucket::{proto_timestamp, require_bucket_name};
 use crate::error::{Error, ErrorKind, Result};
-use crate::project::Project;
+use crate::project::{Project, require_object_key};
 use crate::types::{
     BucketObjectLockConfiguration, DefaultRetention, Retention, RetentionMode,
     SetObjectRetentionOptions,
@@ -126,19 +126,8 @@ impl Project {
     }
 
     fn encrypt_object_key(&self, bucket: &str, key: &str) -> Result<Vec<u8>> {
-        encrypt_path(bucket, key, &self.inner.enc_store).map_err(map_enc_err)
+        encrypt_path(bucket, key, &self.inner.store).map_err(map_enc_err)
     }
-}
-
-/// Empty object key is invalid (Go `metaclient.ErrNoPath`).
-fn require_object_key(key: &str) -> Result<()> {
-    if key.is_empty() {
-        return Err(Error::new(
-            ErrorKind::ObjectKeyInvalid,
-            r#"object key invalid ("")"#,
-        ));
-    }
-    Ok(())
 }
 
 pub(crate) fn retention_to_proto(r: &Retention) -> ProtoRetention {
@@ -304,9 +293,9 @@ mod tests {
 
     #[test]
     fn empty_object_key_is_invalid() {
-        let e = require_object_key("").unwrap_err();
+        let e = crate::project::require_object_key("").unwrap_err();
         assert_eq!(e.kind(), ErrorKind::ObjectKeyInvalid);
         assert!(e.to_string().contains(r#"("")"#), "{e}");
-        require_object_key("k").unwrap();
+        crate::project::require_object_key("k").unwrap();
     }
 }

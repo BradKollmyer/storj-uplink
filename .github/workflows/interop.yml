@@ -9,7 +9,9 @@ on:
   workflow_dispatch:
 
 jobs:
-  # 0.1.0 gate: grant parse/serialize/share vs Go uplink. No satellite.
+  # Grant parse/serialize/share vs Go uplink. No satellite.
+  # The 1.0 object matrix (including 64MiB+1) needs a live satellite and is
+  # skipped here; run it with STORJ_INTEROP=1 + STORJ_INTEROP_ACCESS / STORJ_SIM_ACCESS.
   grant-roundtrip:
     if: github.event_name == 'push' || github.event_name == 'pull_request'
     runs-on: ubuntu-latest
@@ -34,6 +36,9 @@ jobs:
           --skip writer_reader_size_matrix
 
   # Nightly / manual only. Does not fail default PR CI when sim is unavailable.
+  # 64MiB+1 is part of the 1.0 Go↔Rust size matrix when a satellite is available:
+  #   STORJ_INTEROP=1 STORJ_INTEROP_ACCESS=... cargo test -p storj --test interop \
+  #     writer_reader_size_matrix -- --ignored
   sim:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest

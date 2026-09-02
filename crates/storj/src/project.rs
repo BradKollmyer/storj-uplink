@@ -15,9 +15,8 @@ use crate::bucket::{proto_timestamp, require_bucket_name};
 use crate::error::{Error, ErrorKind, Result};
 use crate::metainfo::{MetainfoClient, object_from_proto, parse_satellite_url};
 use crate::types::{
-    Bucket, BucketObjectLockConfiguration, CommitUploadOptions, Config, CustomMetadata,
-    DownloadOptions, ListUploadPartsOptions, ListUploadsOptions, Object, Part,
-    Retention, SetObjectRetentionOptions, SystemMetadata, UploadInfo, UploadOptions,
+    Bucket, CommitUploadOptions, Config, CustomMetadata, DownloadOptions, ListUploadPartsOptions,
+    ListUploadsOptions, Object, Part, SystemMetadata, UploadInfo, UploadOptions,
 };
 use crate::upload::{Download, FlushedSegment, PartUpload, Upload, UploadInner};
 
@@ -241,76 +240,6 @@ impl Project {
             ));
         }
         self.inner.metainfo.revoke_api_key(raw.to_vec()).await
-    }
-
-    /// Get object retention (Object Lock).
-    pub async fn get_object_retention(
-        &self,
-        bucket: &str,
-        key: &str,
-        version: Option<&[u8]>,
-    ) -> Result<Option<Retention>> {
-        let _ = (bucket, key, version);
-        Err(Error::not_implemented("Project::get_object_retention"))
-    }
-
-    /// Set object retention (Object Lock).
-    pub async fn set_object_retention(
-        &self,
-        bucket: &str,
-        key: &str,
-        version: Option<&[u8]>,
-        retention: Retention,
-        opts: SetObjectRetentionOptions,
-    ) -> Result<()> {
-        let _ = (bucket, key, version, retention, opts);
-        Err(Error::not_implemented("Project::set_object_retention"))
-    }
-
-    /// Get object legal hold.
-    pub async fn get_object_legal_hold(
-        &self,
-        bucket: &str,
-        key: &str,
-        version: Option<&[u8]>,
-    ) -> Result<bool> {
-        let _ = (bucket, key, version);
-        Err(Error::not_implemented("Project::get_object_legal_hold"))
-    }
-
-    /// Set object legal hold.
-    pub async fn set_object_legal_hold(
-        &self,
-        bucket: &str,
-        key: &str,
-        version: Option<&[u8]>,
-        enabled: bool,
-    ) -> Result<()> {
-        let _ = (bucket, key, version, enabled);
-        Err(Error::not_implemented("Project::set_object_legal_hold"))
-    }
-
-    /// Get bucket Object Lock configuration.
-    pub async fn get_bucket_object_lock_configuration(
-        &self,
-        bucket: &str,
-    ) -> Result<BucketObjectLockConfiguration> {
-        let _ = bucket;
-        Err(Error::not_implemented(
-            "Project::get_bucket_object_lock_configuration",
-        ))
-    }
-
-    /// Set bucket Object Lock configuration.
-    pub async fn set_bucket_object_lock_configuration(
-        &self,
-        bucket: &str,
-        config: BucketObjectLockConfiguration,
-    ) -> Result<()> {
-        let _ = (bucket, config);
-        Err(Error::not_implemented(
-            "Project::set_bucket_object_lock_configuration",
-        ))
     }
 
     /// Begin a multipart upload.

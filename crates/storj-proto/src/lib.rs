@@ -1,6 +1,6 @@
 //! Vendored Storj protobuf types and CompressedBatch zstd codec.
 //!
-//! Workspace-internal (`publish = false`) until 1.0. Types are generated from
+//! Workspace-internal (`publish = false`). Types are generated from
 //! `proto/*.proto` (pin in `proto/README.md`) and checked in under `gen/`.
 
 #![deny(clippy::undocumented_unsafe_blocks)]
@@ -90,5 +90,13 @@ mod tests {
             "satellite RPC is ProjectInfo (K15)"
         );
         assert_eq!(rpc::COMPRESSED_BATCH, "/metainfo.Metainfo/CompressedBatch");
+        assert_eq!(
+            rpc::GET_OBJECT_RETENTION,
+            "/metainfo.Metainfo/GetObjectRetention"
+        );
+        assert_eq!(
+            rpc::SET_BUCKET_OBJECT_LOCK_CONFIGURATION,
+            "/metainfo.Metainfo/SetBucketObjectLockConfiguration"
+        );
     }
 }

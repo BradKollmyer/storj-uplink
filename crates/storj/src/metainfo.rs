@@ -16,10 +16,12 @@ use storj_proto::metainfo::{
     BeginMoveObjectRequest, BeginObjectRequest, BeginSegmentRequest, CommitObjectRequest,
     CommitSegmentRequest, CompressedBatchResponse, CreateBucketRequest, DeleteBucketRequest,
     DownloadObjectRequest, DownloadSegmentRequest, FinishCopyObjectRequest,
-    FinishDeleteObjectRequest, FinishMoveObjectRequest, GetBucketRequest, GetObjectRequest,
+    FinishDeleteObjectRequest, FinishMoveObjectRequest, GetBucketObjectLockConfigurationRequest,
+    GetBucketRequest, GetObjectLegalHoldRequest, GetObjectRequest, GetObjectRetentionRequest,
     ListBucketsRequest, ListObjectsRequest, ListSegmentsRequest, MakeInlineSegmentRequest,
     ObjectListItemIncludes, ProjectInfoRequest, ProjectInfoResponse, Range, RequestHeader,
     RetryBeginSegmentPiecesRequest, RevokeApiKeyRequest, SegmentPosition,
+    SetBucketObjectLockConfigurationRequest, SetObjectLegalHoldRequest, SetObjectRetentionRequest,
     UpdateObjectMetadataRequest, batch_request_item, batch_response_item,
 };
 use storj_proto::rpc;
@@ -28,7 +30,13 @@ use storj_rpc::{Conn, Identity, NodeUrl, parse_node_url, write_tls_mux_prefix};
 
 use crate::bucket::{bucket_from_list_item, bucket_from_proto, proto_timestamp};
 use crate::error::{Error, ErrorKind, Result};
-use crate::types::{Bucket, Config, CustomMetadata, Object, SystemMetadata};
+use crate::object_lock::{
+    lock_config_from_proto, lock_config_to_proto, retention_from_proto, retention_to_proto,
+};
+use crate::types::{
+    Bucket, BucketObjectLockConfiguration, Config, CustomMetadata, Object, Retention,
+    SystemMetadata,
+};
 
 use storj_proto::{decode_batch_response, encode_batch_request};
 
@@ -41,6 +49,25 @@ pub(crate) const RPC_PERMISSION_DENIED: u64 = 7;
 pub(crate) const RPC_RESOURCE_EXHAUSTED: u64 = 8;
 pub(crate) const RPC_FAILED_PRECONDITION: u64 = 9;
 pub(crate) const RPC_UNAVAILABLE: u64 = 14;
+
+/// `rpcstatus.ObjectLockEndpointsDisabled`.
+pub(crate) const RPC_OBJECT_LOCK_ENDPOINTS_DISABLED: u64 = 10000;
+/// `rpcstatus.ObjectLockDisabledForProject`.
+pub(crate) const RPC_OBJECT_LOCK_DISABLED_FOR_PROJECT: u64 = 10001;
+/// `rpcstatus.ObjectLockInvalidBucketState`.
+pub(crate) const RPC_OBJECT_LOCK_INVALID_BUCKET_STATE: u64 = 10002;
+/// `rpcstatus.ObjectLockBucketRetentionConfigurationMissing`.
+pub(crate) const RPC_OBJECT_LOCK_BUCKET_CONFIG_MISSING: u64 = 10003;
+/// `rpcstatus.ObjectLockObjectRetentionConfigurationMissing`.
+pub(crate) const RPC_OBJECT_LOCK_OBJECT_RETENTION_MISSING: u64 = 10004;
+/// `rpcstatus.ObjectLockObjectProtected`.
+pub(crate) const RPC_OBJECT_LOCK_OBJECT_PROTECTED: u64 = 10005;
+/// `rpcstatus.ObjectLockInvalidObjectState`.
+pub(crate) const RPC_OBJECT_LOCK_INVALID_OBJECT_STATE: u64 = 10006;
+/// `rpcstatus.ObjectLockInvalidBucketRetentionConfiguration`.
+pub(crate) const RPC_OBJECT_LOCK_INVALID_BUCKET_CONFIG: u64 = 10007;
+
+const RETENTION_NOT_FOUND_MSG: &str = "object has no retention configuration";
 
 const SATELLITE_ATTEMPTS: u32 = 3;
 const LIST_BUCKETS_LIMIT: i32 = 1000;
@@ -980,6 +1007,156 @@ impl MetainfoClient {
         let _ = metainfo::RevokeApiKeyResponse::decode(body.as_slice()).map_err(map_decode)?;
         Ok(())
     }
+
+    pub(crate) async fn get_object_retention(
+        &self,
+        bucket: &str,
+        encrypted_object_key: &[u8],
+        object_version: &[u8],
+        key: &str,
+    ) -> Result<Option<Retention>> {
+        let req = GetObjectRetentionRequest {
+            header: Some(self.header()),
+            bucket: bucket.as_bytes().to_vec(),
+            encrypted_object_key: encrypted_object_key.to_vec(),
+            object_version: object_version.to_vec(),
+        };
+        match self
+            .invoke(rpc::GET_OBJECT_RETENTION, &req.encode_to_vec(), bucket, key)
+            .await
+        {
+            Ok(body) => {
+                let resp = metainfo::GetObjectRetentionResponse::decode(body.as_slice())
+                    .map_err(map_decode)?;
+                match resp.retention {
+                    Some(r) => Ok(Some(retention_from_proto(r)?)),
+                    None => Ok(None),
+                }
+            }
+            Err(e) if is_retention_not_found(&e) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    pub(crate) async fn set_object_retention(
+        &self,
+        bucket: &str,
+        encrypted_object_key: &[u8],
+        object_version: &[u8],
+        retention: &Retention,
+        bypass_governance_retention: bool,
+        key: &str,
+    ) -> Result<()> {
+        let req = SetObjectRetentionRequest {
+            header: Some(self.header()),
+            bucket: bucket.as_bytes().to_vec(),
+            encrypted_object_key: encrypted_object_key.to_vec(),
+            object_version: object_version.to_vec(),
+            retention: Some(retention_to_proto(retention)),
+            bypass_governance_retention,
+        };
+        self.invoke(rpc::SET_OBJECT_RETENTION, &req.encode_to_vec(), bucket, key)
+            .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn get_object_legal_hold(
+        &self,
+        bucket: &str,
+        encrypted_object_key: &[u8],
+        object_version: &[u8],
+        key: &str,
+    ) -> Result<bool> {
+        let req = GetObjectLegalHoldRequest {
+            header: Some(self.header()),
+            bucket: bucket.as_bytes().to_vec(),
+            encrypted_object_key: encrypted_object_key.to_vec(),
+            object_version: object_version.to_vec(),
+        };
+        let body = self
+            .invoke(
+                rpc::GET_OBJECT_LEGAL_HOLD,
+                &req.encode_to_vec(),
+                bucket,
+                key,
+            )
+            .await?;
+        let resp =
+            metainfo::GetObjectLegalHoldResponse::decode(body.as_slice()).map_err(map_decode)?;
+        Ok(resp.enabled)
+    }
+
+    pub(crate) async fn set_object_legal_hold(
+        &self,
+        bucket: &str,
+        encrypted_object_key: &[u8],
+        object_version: &[u8],
+        enabled: bool,
+        key: &str,
+    ) -> Result<()> {
+        let req = SetObjectLegalHoldRequest {
+            header: Some(self.header()),
+            bucket: bucket.as_bytes().to_vec(),
+            encrypted_object_key: encrypted_object_key.to_vec(),
+            object_version: object_version.to_vec(),
+            enabled,
+        };
+        self.invoke(
+            rpc::SET_OBJECT_LEGAL_HOLD,
+            &req.encode_to_vec(),
+            bucket,
+            key,
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn get_bucket_object_lock_configuration(
+        &self,
+        bucket: &str,
+    ) -> Result<BucketObjectLockConfiguration> {
+        let req = GetBucketObjectLockConfigurationRequest {
+            header: Some(self.header()),
+            name: bucket.as_bytes().to_vec(),
+        };
+        let body = self
+            .invoke(
+                rpc::GET_BUCKET_OBJECT_LOCK_CONFIGURATION,
+                &req.encode_to_vec(),
+                bucket,
+                "",
+            )
+            .await?;
+        let resp = metainfo::GetBucketObjectLockConfigurationResponse::decode(body.as_slice())
+            .map_err(map_decode)?;
+        let Some(cfg) = resp.configuration else {
+            return Err(Error::new(
+                ErrorKind::Protocol,
+                "satellite returned no Object Lock configuration",
+            ));
+        };
+        lock_config_from_proto(cfg)
+    }
+
+    pub(crate) async fn set_bucket_object_lock_configuration(
+        &self,
+        bucket: &str,
+        config: &BucketObjectLockConfiguration,
+    ) -> Result<()> {
+        let req = SetBucketObjectLockConfigurationRequest {
+            header: Some(self.header()),
+            name: bucket.as_bytes().to_vec(),
+            configuration: Some(lock_config_to_proto(config)),
+        };
+        self.invoke(
+            rpc::SET_BUCKET_OBJECT_LOCK_CONFIGURATION,
+            &req.encode_to_vec(),
+            bucket,
+            "",
+        )
+        .await?;
+        Ok(())
+    }
 }
 
 fn system_time_to_proto(t: std::time::SystemTime) -> prost_types::Timestamp {
@@ -1145,11 +1322,45 @@ fn map_remote(code: u64, message: &str, bucket: &str, key: &str) -> Error {
             ErrorKind::BucketNotEmpty,
             format!("bucket not empty ({bucket:?})"),
         ),
+        RPC_OBJECT_LOCK_ENDPOINTS_DISABLED => {
+            Error::new(ErrorKind::Protocol, "object lock is not enabled")
+        }
+        RPC_OBJECT_LOCK_DISABLED_FOR_PROJECT => Error::new(
+            ErrorKind::Protocol,
+            "object lock is not enabled for this project",
+        ),
+        RPC_OBJECT_LOCK_INVALID_BUCKET_STATE => Error::new(
+            ErrorKind::Protocol,
+            "object lock requires bucket versioning to be enabled",
+        ),
+        RPC_OBJECT_LOCK_BUCKET_CONFIG_MISSING => Error::new(
+            ErrorKind::Protocol,
+            "object lock is not enabled for this bucket",
+        ),
+        RPC_OBJECT_LOCK_OBJECT_RETENTION_MISSING => {
+            Error::new(ErrorKind::Protocol, RETENTION_NOT_FOUND_MSG)
+        }
+        RPC_OBJECT_LOCK_OBJECT_PROTECTED => Error::new(
+            ErrorKind::Protocol,
+            "object is protected by Object Lock settings",
+        ),
+        RPC_OBJECT_LOCK_INVALID_OBJECT_STATE => Error::new(
+            ErrorKind::Protocol,
+            "object state is invalid for Object Lock",
+        ),
+        RPC_OBJECT_LOCK_INVALID_BUCKET_CONFIG => Error::new(
+            ErrorKind::Protocol,
+            "bucket object lock configuration is invalid",
+        ),
         _ => Error::new(
             ErrorKind::Protocol,
             format!("DRPC remote error (code {code}): {message}"),
         ),
     }
+}
+
+fn is_retention_not_found(err: &Error) -> bool {
+    err.kind() == ErrorKind::Protocol && err.to_string().ends_with(RETENTION_NOT_FOUND_MSG)
 }
 
 fn bucket_from_not_found(message: &str) -> Option<&str> {
@@ -1239,6 +1450,28 @@ mod tests {
         assert_eq!(
             url.id.to_string(),
             "12EayRS2V1kEsWESU9QMRseFhdxYxKicsiFmxrsLZHeLUtdps3S"
+        );
+    }
+
+    #[test]
+    fn object_lock_rpc_codes() {
+        assert_eq!(
+            map_remote(RPC_OBJECT_LOCK_OBJECT_RETENTION_MISSING, "", "b", "k").kind(),
+            ErrorKind::Protocol
+        );
+        let e = map_remote(RPC_OBJECT_LOCK_OBJECT_RETENTION_MISSING, "", "b", "k");
+        assert!(is_retention_not_found(&e), "{e}");
+        assert_eq!(
+            map_remote(RPC_OBJECT_LOCK_BUCKET_CONFIG_MISSING, "", "b", "").to_string(),
+            "protocol: object lock is not enabled for this bucket"
+        );
+        assert_eq!(
+            map_remote(RPC_OBJECT_LOCK_INVALID_BUCKET_CONFIG, "", "b", "").kind(),
+            ErrorKind::Protocol
+        );
+        assert_eq!(
+            map_remote(RPC_OBJECT_LOCK_OBJECT_PROTECTED, "", "b", "k").kind(),
+            ErrorKind::Protocol
         );
     }
 }

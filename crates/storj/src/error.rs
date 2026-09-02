@@ -80,11 +80,6 @@ impl Error {
     pub fn object(&self) -> Option<&Object> {
         self.inner.object.as_ref()
     }
-
-    /// Placeholder for APIs that are specified but not yet implemented.
-    pub(crate) fn not_implemented(op: &str) -> Self {
-        Self::new(ErrorKind::Protocol, format!("{op} is not implemented yet"))
-    }
 }
 
 impl fmt::Display for Error {
