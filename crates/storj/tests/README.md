@@ -22,18 +22,21 @@ Maps to `docs/design-native-uplink.md` § Testing Strategy.
 | `upload_download.rs` (I/O) | Pipeline | PR 13–14, 22 | ignore |
 | `multipart.rs` (RPCs) | Begin/Part/Commit | PR 24 | ignore |
 | `object_lock.rs` (RPCs) | Lock RPCs | PR 25a | ignore |
-| `interop.rs` | Go↔Rust matrix | PR 20 / 26 | ignore + `STORJ_INTEROP=1` |
-| `sim.rs` | `storj-sim` | nightly | ignore + `STORJ_SIM=1` |
+| `interop.rs` | Go↔Rust grant round-trip; object matrix up to one segment | PR 20 / 26 | ignore + `STORJ_INTEROP=1` (objects also need `STORJ_INTEROP_ACCESS` / `STORJ_SIM_ACCESS`; `64MiB+1` skipped until PR 26) |
+| `sim.rs` | `storj-sim` walkthrough | nightly | ignore + `STORJ_SIM=1` |
 
 ## Commands
 
 ```bash
 cargo test -p storj                  # contract suite
-cargo test -p storj -- --ignored     # full (expected fail until impl)
+cargo test -p storj -- --ignored     # protocol/interop (grant/object cells skip without env)
 go run -C scripts .                  # KDF + path HMAC + infectious RS + synthetic grant fixtures
+go run -C scripts/interop . parse "$(tr -d '\n' < crates/storj/tests/fixtures/grant_go.txt)"
+STORJ_INTEROP=1 cargo test -p storj --test interop -- --ignored
+STORJ_SIM=1 STORJ_SIM_ACCESS=... cargo test -p storj --test sim -- --ignored
 cargo test -p storj --test encryption_golden --test grant_golden
 ```
 
 ## Interop matrix (v1.0 exit criterion)
 
-`{go,rust} writer × {go,rust} reader × {empty, 1B, inline-1, inline+1, 1seg, 64MiB+1}` plus ranged read, prefix list, and `Share` restriction. Defined in `storj-test::INTEROP_SIZES` / `INTEROP_SIDES`.
+`{go,rust} writer × {go,rust} reader × {empty, 1B, inline-1, inline+1, 1seg, 64MiB+1}` plus ranged read, prefix list, and `Share` restriction. Defined in `storj-test::INTEROP_SIZES` / `INTEROP_SIDES`. PR 20 runs grant round-trip on every PR and the object matrix up to one segment (`64MiB+1` is skipped until PR 26). Object cells need a satellite grant; grant parse/serialize/share do not.

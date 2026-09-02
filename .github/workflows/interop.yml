@@ -1,0 +1,68 @@
+name: interop
+
+on:
+  push:
+  pull_request:
+  schedule:
+    # Nightly storj-sim walkthrough (heavy; not part of default PR CI).
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+jobs:
+  # 0.1.0 gate: grant parse/serialize/share vs Go uplink. No satellite.
+  grant-roundtrip:
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache-dependency-path: scripts/interop/go.sum
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Go helper parse/serialize fixture
+        run: |
+          grant=$(tr -d '\n' < crates/storj/tests/fixtures/grant_go.txt)
+          go run -C scripts/interop . parse "$grant"
+          go run -C scripts/interop . serialize "$grant" >/tmp/grant-roundtrip.txt
+          test -s /tmp/grant-roundtrip.txt
+      - name: Grant/share interop tests
+        env:
+          STORJ_INTEROP: "1"
+        run: >
+          cargo test -p storj --test interop -- --ignored
+          --skip writer_reader_size_matrix
+
+  # Nightly / manual only. Does not fail default PR CI when sim is unavailable.
+  sim:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: storj-sim instructions
+        run: |
+          cat <<'EOF'
+          storj-sim is heavy (Postgres, Go) and is not brought up in this job.
+          https://github.com/storj/storj/wiki/Test-network
+
+          Local walkthrough:
+            storj-sim network setup && storj-sim network run
+            export STORJ_SIM=1
+            export STORJ_SIM_ACCESS="$(storj-sim network env GATEWAY_0_ACCESS)"
+            cargo test -p storj --test sim -- --ignored
+
+          To run this job against a live network, set the STORJ_SIM_ACCESS
+          repository secret (serialized grant from GATEWAY_0_ACCESS) and
+          dispatch this workflow.
+          EOF
+      - name: Walkthrough if STORJ_SIM_ACCESS secret is present
+        env:
+          STORJ_SIM: "1"
+          STORJ_SIM_ACCESS: ${{ secrets.STORJ_SIM_ACCESS }}
+        run: |
+          if [ -z "$STORJ_SIM_ACCESS" ]; then
+            echo "STORJ_SIM_ACCESS secret is not set; skipping walkthrough."
+            exit 0
+          fi
+          cargo test -p storj --test sim -- --ignored
