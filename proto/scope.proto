@@ -1,8 +1,5 @@
 // Copyright (C) 2019 Storj Labs, Inc.
 // See LICENSE for copying information.
-//
-// Vendored from storj.io/common/pb/scope.proto
-// (same layout as storj.io/common/grant/internal/pb). Do not invent fields.
 
 syntax = "proto3";
 

@@ -21,6 +21,7 @@ jobs:
       - name: compile all tests including ignored
         run: cargo test --workspace --no-run
 
+  # Mitigation 3 / R1: fail if vendored proto drifts from the pin without a PR.
   proto:
     runs-on: ubuntu-latest
     steps:
@@ -48,17 +49,18 @@ jobs:
       - name: cargo deny
         run: cargo deny check
 
+  # Go generator vs checked-in fixtures (Argon2 p=1/p=8, path HMAC, grant).
   vectors:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.22"
+          go-version: "1.25"
       - uses: dtolnay/rust-toolchain@stable
       - name: generate goldens
         run: go run -C scripts .
       - name: fixtures are not stale
-        run: git diff --exit-code crates/storj/tests/fixtures/derive_root_key.jsonl crates/storj/tests/fixtures/path_hmac.jsonl
-      - name: kdf and path HMAC match Go
-        run: cargo test -p storj --test encryption_kdf --test encryption_golden
+        run: git diff --exit-code crates/storj/tests/fixtures/derive_root_key.jsonl crates/storj/tests/fixtures/path_hmac.jsonl crates/storj/tests/fixtures/grant_go.txt
+      - name: kdf, path HMAC, and grant goldens match Go
+        run: cargo test -p storj --test encryption_kdf --test encryption_golden --test grant_golden

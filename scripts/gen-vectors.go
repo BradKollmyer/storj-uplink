@@ -1,46 +1,27 @@
 // Generate golden vectors for the native Rust uplink tests.
 //
-//	cd repo-root && go run -C scripts .
+//	go run -C scripts .
 //
-// Implements storj.io/common/encryption.DeriveRootKey and the path HMAC
-// using the same primitives (HMAC-SHA256 mix, Argon2id, HMAC-SHA512 "path:").
+// Calls storj.io/common encryption.DeriveRootKey, encryption.DeriveKey, and
+// grant.Serialize / ParseAccess so fixtures track the pinned Go implementation.
 // Also emits infectious Reed-Solomon goldens (`rs_shares.jsonl`, `rs_stripe.bin`).
-// Optional: if storj.io/uplink is available, also emit a synthetic grant.
 package main
 
 import (
-	"crypto/hmac"
-	"crypto/sha256"
-	"crypto/sha512"
+	"bytes"
 	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 
-	"golang.org/x/crypto/argon2"
+	"storj.io/common/encryption"
+	"storj.io/common/grant"
+	"storj.io/common/macaroon"
+	"storj.io/common/paths"
+	"storj.io/common/storj"
 	"storj.io/infectious"
 )
-
-func hmacSHA256(key, data []byte) []byte {
-	h := hmac.New(sha256.New, key)
-	h.Write(data)
-	return h.Sum(nil)
-}
-
-func deriveRootKey(password, salt, path []byte, threads uint8) []byte {
-	mixed := hmacSHA256(password, salt)
-	pathSalt := hmacSHA256(mixed, path)
-	return argon2.IDKey(password, pathSalt, 1, 64*1024, threads, 32)
-}
-
-func pathComponent(key []byte, component string) []byte {
-	h := hmac.New(sha512.New, key)
-	h.Write([]byte("path:"))
-	h.Write([]byte(component))
-	sum := h.Sum(nil)
-	return sum[:32]
-}
 
 func mustWrite(path, body string) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -58,7 +39,57 @@ func repoRoot() string {
 			return c
 		}
 	}
-	panic("run from the storj-rust repo root or scripts/")
+	panic("run from the storj-rust repo root or scripts/ via go run -C scripts .")
+}
+
+func must[T any](v T, err error) T {
+	if err != nil {
+		panic(err)
+	}
+	return v
+}
+
+func mustErr(err error) {
+	if err != nil {
+		panic(err)
+	}
+}
+
+func keyByte(b byte) storj.Key {
+	var k storj.Key
+	for i := range k {
+		k[i] = b
+	}
+	return k
+}
+
+// Synthetic grant: deterministic test macaroon + keys, not a production secret.
+func encodeSyntheticGrant() string {
+	apiKey := must(macaroon.FromParts(bytes.Repeat([]byte{0x11}, 32), bytes.Repeat([]byte{0xaa}, 32)))
+
+	defaultKey := keyByte(0x33)
+	enc := grant.NewEncryptionAccessWithDefaultKey(&defaultKey)
+	enc.SetDefaultPathCipher(storj.EncAESGCM)
+	mustErr(enc.Store.AddWithCipher(
+		"app",
+		paths.NewUnencrypted("user1"),
+		paths.NewEncrypted("enc-user1"),
+		keyByte(0x44),
+		storj.EncAESGCM,
+	))
+
+	access := &grant.Access{
+		SatelliteAddress: "12edKaxTestSatelliteId@127.0.0.1:7777",
+		APIKey:           apiKey,
+		EncAccess:        enc,
+	}
+	serialized := must(access.Serialize())
+	parsed := must(grant.ParseAccess(serialized))
+	round := must(parsed.Serialize())
+	if round != serialized {
+		panic("grant.ParseAccess/Serialize is not identity")
+	}
+	return serialized
 }
 
 func main() {
@@ -70,33 +101,30 @@ func main() {
 	var deriveLines string
 	for _, p := range []uint8{1, 8} {
 		for _, path := range []string{"", "logs"} {
-			key := deriveRootKey([]byte(pass), salt, []byte(path), p)
+			key := must(encryption.DeriveRootKey([]byte(pass), salt, path, p))
 			deriveLines += fmt.Sprintf(
 				`{"passphrase":%q,"salt_hex":%q,"path":%q,"parallelism":%d,"key_hex":%q}`+"\n",
-				pass, hex.EncodeToString(salt), path, p, hex.EncodeToString(key),
+				pass, hex.EncodeToString(salt), path, p, hex.EncodeToString(key[:]),
 			)
 		}
 	}
 	mustWrite(filepath.Join(root, "derive_root_key.jsonl"), deriveLines)
 
-	key := make([]byte, 32)
-	for i := range key {
-		key[i] = 7
-	}
+	key := keyByte(7)
 	var pathLines string
 	for _, c := range []string{"", "logs", "café", "user1"} {
-		out := pathComponent(key, c)
+		out := must(encryption.DeriveKey(&key, "path:"+c))
 		pathLines += fmt.Sprintf(
 			`{"key_hex":%q,"component":%q,"out_hex":%q}`+"\n",
-			hex.EncodeToString(key), c, hex.EncodeToString(out),
+			hex.EncodeToString(key[:]), c, hex.EncodeToString(out[:]),
 		)
 	}
 	mustWrite(filepath.Join(root, "path_hmac.jsonl"), pathLines)
 
+	mustWrite(filepath.Join(root, "grant_go.txt"), encodeSyntheticGrant()+"\n")
 	writeRSGoldens(root)
 
-	fmt.Println("KDF + path HMAC goldens ready.")
-	fmt.Println("Grant fixture: replace grant_go.txt with output from uplink.Share of a testplanet/sim grant (never production).")
+	fmt.Println("KDF + path HMAC + infectious RS + synthetic grant goldens ready.")
 }
 
 func fillStripe(n int) []byte {

@@ -12,6 +12,9 @@ pub mod rpc;
 #[path = "gen/encryption.rs"]
 pub mod encryption;
 #[allow(clippy::all, dead_code, unused_imports)]
+#[path = "gen/encryption_access.rs"]
+pub mod encryption_access;
+#[allow(clippy::all, dead_code, unused_imports)]
 #[path = "gen/metainfo.rs"]
 pub mod metainfo;
 #[allow(clippy::all, dead_code, unused_imports)]
@@ -29,6 +32,9 @@ pub mod piecestore;
 #[allow(clippy::all, dead_code, unused_imports)]
 #[path = "gen/pointerdb.rs"]
 pub mod pointerdb;
+#[allow(clippy::all, dead_code, unused_imports)]
+#[path = "gen/scope.rs"]
+pub mod scope;
 
 pub use compressed::{
     Error as CompressedError, MAX_DECODE_MEMORY, compress, decode_batch_request,
