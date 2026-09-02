@@ -99,7 +99,16 @@ impl Project {
         let begin = self
             .inner
             .metainfo
-            .begin_object(bucket, enc_path.clone(), opts.expires, Some(enc_params))
+            .begin_object(
+                bucket,
+                enc_path.clone(),
+                opts.expires,
+                Some(enc_params),
+                opts.retention
+                    .as_ref()
+                    .map(crate::object_lock::retention_to_proto),
+                opts.legal_hold,
+            )
             .await?;
         let content_key =
             storj_encryption::derive_content_key(bucket, key.as_bytes(), &self.inner.store)
@@ -272,7 +281,16 @@ impl Project {
         let begin = self
             .inner
             .metainfo
-            .begin_object(bucket, enc_path, opts.expires, Some(enc_params))
+            .begin_object(
+                bucket,
+                enc_path,
+                opts.expires,
+                Some(enc_params),
+                opts.retention
+                    .as_ref()
+                    .map(crate::object_lock::retention_to_proto),
+                opts.legal_hold,
+            )
             .await?;
         Ok(UploadInfo {
             key: key.to_owned(),

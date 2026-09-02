@@ -84,6 +84,11 @@ impl ListObjectsOptions {
 pub struct UploadOptions {
     /// Optional object expiry.
     pub expires: Option<SystemTime>,
+    /// Object Lock retention to apply at creation (Go `UploadOptions.Retention`).
+    /// Requires Object Lock enabled on the bucket.
+    pub retention: Option<Retention>,
+    /// Place a legal hold at creation (Go `UploadOptions.LegalHold`).
+    pub legal_hold: bool,
 }
 
 /// Options for `Project::download_object`.

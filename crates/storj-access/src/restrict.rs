@@ -105,17 +105,19 @@ fn map_enc(err: storj_encryption::Error) -> Error {
     Error::new(err.to_string())
 }
 
-fn store_from_enc(enc: &EncryptionAccess) -> Result<Store, Error> {
+pub(crate) fn store_from_enc(enc: &EncryptionAccess) -> Result<Store, Error> {
     let mut store = Store::new();
     if let Some(key) = enc.default_key {
         store.set_default_key(Key::from_bytes(key));
     }
     store.set_default_path_cipher(EncCipher(enc.default_path_cipher.0));
     for entry in &enc.store_entries {
-        let bucket = String::from_utf8_lossy(&entry.bucket);
+        // Bucket names are UTF-8 on the satellite; never rewrite bytes.
+        let bucket = std::str::from_utf8(&entry.bucket)
+            .map_err(|_| Error::new("encryption access entry bucket is not utf-8"))?;
         store
             .add_with_cipher(
-                &bucket,
+                bucket,
                 &entry.unencrypted_path,
                 &entry.encrypted_path,
                 Key::from_bytes(entry.key),
@@ -169,18 +171,21 @@ fn limit_to(enc: &EncryptionAccess, api_key: &ApiKey) -> Result<EncryptionAccess
     store.set_default_path_cipher(src.default_path_cipher());
 
     for prefix in prefixes {
-        let bucket = String::from_utf8_lossy(&prefix.bucket);
+        // A non-UTF-8 bucket cannot match any store entry: skip, don't rewrite.
+        let Ok(bucket) = std::str::from_utf8(&prefix.bucket) else {
+            continue;
+        };
         let enc_path = prefix.encrypted_path_prefix;
-        let Ok(unenc) = decrypt_path(&bucket, &enc_path, &src) else {
+        let Ok(unenc) = decrypt_path(bucket, &enc_path, &src) else {
             continue;
         };
-        let Ok(key) = derive_path_key(&bucket, &unenc, &src) else {
+        let Ok(key) = derive_path_key(bucket, &unenc, &src) else {
             continue;
         };
-        let Some(base) = src.lookup_encrypted(&bucket, &enc_path).base else {
+        let Some(base) = src.lookup_encrypted(bucket, &enc_path).base else {
             continue;
         };
-        let _ = store.add_with_cipher(&bucket, &unenc, &enc_path, key, base.path_cipher);
+        let _ = store.add_with_cipher(bucket, &unenc, &enc_path, key, base.path_cipher);
     }
 
     Ok(enc_from_store(&store))

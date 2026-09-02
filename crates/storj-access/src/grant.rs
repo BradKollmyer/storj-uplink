@@ -187,12 +187,16 @@ impl Grant {
         if scope.api_key.is_empty() {
             return Err(Error::new("access grant is missing api key"));
         }
-        crate::macaroon::Macaroon::parse(&scope.api_key).map_err(|e| {
-            Error::new(format!(
-                "access grant has malformed api key: {}",
-                e.message()
-            ))
-        })?;
+        // Go stores the parsed macaroon and re-serializes it canonically
+        // (location / verification-id packets stripped, no trailing bytes).
+        let canonical_api_key = crate::macaroon::Macaroon::parse(&scope.api_key)
+            .map_err(|e| {
+                Error::new(format!(
+                    "access grant has malformed api key: {}",
+                    e.message()
+                ))
+            })?
+            .serialize();
         let Some(enc_pb) = scope.encryption_access else {
             return Err(Error::new("access grant is missing encryption access"));
         };
@@ -217,7 +221,7 @@ impl Grant {
 
         Ok(Self {
             satellite_addr: scope.satellite_addr,
-            api_key: scope.api_key,
+            api_key: canonical_api_key,
             enc_access: limited,
             original,
         })
@@ -321,12 +325,17 @@ impl EncryptionAccess {
             store_entries.push(StoreEntry::from_proto(entry)?);
         }
 
-        Ok(Self {
+        let access = Self {
             default_key,
             default_path_cipher,
             store_entries,
             default_encryption_parameters: p.default_encryption_parameters.map(Into::into),
-        })
+        };
+        // Go `parseEncryptionAccessFromProto` inserts every entry into a store
+        // and fails on conflicts ("invalid encryption access entry").
+        crate::restrict::store_from_enc(&access)
+            .map_err(|e| Error::new(format!("invalid encryption access entry: {e}")))?;
+        Ok(access)
     }
 
     fn to_proto(&self) -> pb::EncryptionAccess {

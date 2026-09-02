@@ -423,6 +423,8 @@ impl MetainfoClient {
         encrypted_object_key: Vec<u8>,
         expires: Option<std::time::SystemTime>,
         encryption_parameters: Option<storj_proto::encryption::EncryptionParameters>,
+        retention: Option<metainfo::Retention>,
+        legal_hold: bool,
     ) -> Result<metainfo::BeginObjectResponse> {
         let req = BeginObjectRequest {
             header: Some(self.header()),
@@ -430,6 +432,8 @@ impl MetainfoClient {
             encrypted_object_key,
             expires_at: expires.map(system_time_to_proto),
             encryption_parameters,
+            retention,
+            legal_hold,
             ..Default::default()
         };
         let items = self
