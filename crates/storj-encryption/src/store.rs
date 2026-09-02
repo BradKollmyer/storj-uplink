@@ -26,7 +26,7 @@ pub struct Base {
 }
 
 /// Result of [`Store::lookup_unencrypted`] / [`Store::lookup_encrypted`].
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Lookup {
     /// Child component mappings at the matched node.
     ///
@@ -40,7 +40,7 @@ pub struct Lookup {
 }
 
 /// In-memory trie of encryption bases, plus an optional default key.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct Store {
     roots: HashMap<String, Node>,
     default_key: Option<Key>,
@@ -49,7 +49,30 @@ pub struct Store {
     pub encryption_bypass: bool,
 }
 
-#[derive(Clone, Debug, Default)]
+/// `Debug` prints counts only: the store maps plaintext object keys, which
+/// path encryption exists to hide from logs.
+impl std::fmt::Debug for Store {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Store")
+            .field("buckets", &self.roots.len())
+            .field("default_key", &self.default_key.is_some())
+            .field("default_path_cipher", &self.default_path_cipher)
+            .field("encryption_bypass", &self.encryption_bypass)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for Lookup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Lookup")
+            .field("revealed", &self.revealed.as_ref().map(HashMap::len))
+            .field("remaining_components", &self.remaining.clone().count())
+            .field("base", &self.base.as_ref().map(|b| b.path_cipher))
+            .finish()
+    }
+}
+
+#[derive(Clone, Default)]
 struct Node {
     /// Children keyed by unencrypted component.
     unenc: HashMap<Vec<u8>, Node>,
@@ -227,12 +250,20 @@ impl Node {
             ));
         }
 
-        // Clone-and-swap so a failed recursive add cannot leave a partial child.
-        let mut child = self.unenc.get(&unenc_part).cloned().unwrap_or_default();
-        child.add(unenc, enc, base)?;
+        // Mutate in place (Go does too): every check at every level runs
+        // before the only mutation, which is at the leaf, so a failed
+        // recursive add cannot leave partial state. A *new* child is inserted
+        // only after its subtree was added successfully.
+        match self.unenc.get_mut(&unenc_part) {
+            Some(child) => child.add(unenc, enc, base)?,
+            None => {
+                let mut child = Node::default();
+                child.add(unenc, enc, base)?;
+                self.unenc.insert(unenc_part.clone(), child);
+            }
+        }
         self.unenc_map.insert(unenc_part.clone(), enc_part.clone());
-        self.enc_map.insert(enc_part, unenc_part.clone());
-        self.unenc.insert(unenc_part, child);
+        self.enc_map.insert(enc_part, unenc_part);
         Ok(())
     }
 
@@ -248,14 +279,15 @@ impl Node {
             best_base = self.base.clone();
         }
 
-        let revealed = if unenc {
-            self.enc_map.clone()
-        } else {
-            // LookupEncrypted reveals unenc → enc.
-            self.unenc_map.clone()
-        };
-
         if iter.done() {
+            // Only the terminal node's map is revealed; intermediate nodes
+            // never clone theirs.
+            let revealed = if unenc {
+                self.enc_map.clone()
+            } else {
+                // LookupEncrypted reveals unenc → enc.
+                self.unenc_map.clone()
+            };
             return Lookup {
                 revealed: Some(revealed),
                 remaining: best_remaining,

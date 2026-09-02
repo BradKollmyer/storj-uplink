@@ -23,6 +23,15 @@ pub trait Transformer: Send + Sync + std::fmt::Debug {
     fn out_block_size(&self) -> usize;
     /// Transform one block. `block_num` is added to the starting nonce.
     fn transform(&self, input: &[u8], block_num: i64) -> Result<Vec<u8>>;
+
+    /// Transform one block, appending the output to `out` (Go
+    /// `Transformer.Transform(out, in, ...)`). The default delegates to
+    /// [`Self::transform`]; cipher transformers override it to work in place
+    /// without an intermediate allocation.
+    fn transform_into(&self, input: &[u8], block_num: i64, out: &mut Vec<u8>) -> Result<()> {
+        out.extend_from_slice(&self.transform(input, block_num)?);
+        Ok(())
+    }
 }
 
 /// Pass-through transformer (`EncNull`). In/out block size is 1.
@@ -210,7 +219,7 @@ pub fn transform_blocks(
     }
     let mut out = Vec::with_capacity((data.len() / in_size) * transformer.out_block_size());
     for (block_num, chunk) in (starting_block..).zip(data.chunks(in_size)) {
-        out.extend_from_slice(&transformer.transform(chunk, block_num)?);
+        transformer.transform_into(chunk, block_num, &mut out)?;
     }
     Ok(out)
 }
