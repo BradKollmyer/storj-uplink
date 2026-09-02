@@ -14,8 +14,8 @@ use crate::error::{Error, ErrorKind, Result};
 use crate::metainfo::{MetainfoClient, object_from_proto, parse_satellite_url};
 use crate::types::{
     Bucket, BucketObjectLockConfiguration, CommitUploadOptions, Config, CustomMetadata,
-    DownloadOptions, ListObjectsOptions, ListUploadPartsOptions, ListUploadsOptions, Object,
-    Retention, SetObjectRetentionOptions, SystemMetadata, UploadInfo, UploadOptions,
+    DownloadOptions, ListUploadPartsOptions, ListUploadsOptions, Object, Retention,
+    SetObjectRetentionOptions, SystemMetadata, UploadInfo, UploadOptions,
 };
 use crate::upload::{Download, FlushedSegment, PartUpload, Upload, UploadInner};
 
@@ -155,58 +155,6 @@ impl Project {
             .download_object(bucket, key, enc_path, range)
             .await?;
         download_segments(&self.inner, bucket, key, content_key, opts, resp).await
-    }
-
-    /// Object metadata.
-    pub async fn stat_object(&self, bucket: &str, key: &str) -> Result<Object> {
-        let _ = (bucket, key);
-        Err(Error::not_implemented("Project::stat_object"))
-    }
-
-    /// Delete an object.
-    ///
-    /// `Ok(Some(obj))` = deleted and metadata visible;
-    /// `Ok(None)` = deleted (or no-op) without metadata;
-    /// `Err(ObjectNotFound)` only when the satellite reports not found *and*
-    /// the grant can observe that.
-    pub async fn delete_object(&self, bucket: &str, key: &str) -> Result<Option<Object>> {
-        let _ = (bucket, key);
-        Err(Error::not_implemented("Project::delete_object"))
-    }
-
-    /// List objects. `opts.prefix` must be empty or end with `/`.
-    pub fn list_objects(&self, bucket: &str, opts: ListObjectsOptions) -> ObjectStream {
-        let _ = bucket;
-        if let Err(e) = opts.validate() {
-            return Box::pin(stream::once(async move { Err(e) }));
-        }
-        Box::pin(stream::once(async {
-            Err(Error::not_implemented("Project::list_objects"))
-        }))
-    }
-
-    /// Atomic copy without downloading.
-    pub async fn copy_object(
-        &self,
-        src_bucket: &str,
-        src_key: &str,
-        dst_bucket: &str,
-        dst_key: &str,
-    ) -> Result<Object> {
-        let _ = (src_bucket, src_key, dst_bucket, dst_key);
-        Err(Error::not_implemented("Project::copy_object"))
-    }
-
-    /// Move (server-side rename).
-    pub async fn move_object(
-        &self,
-        src_bucket: &str,
-        src_key: &str,
-        dst_bucket: &str,
-        dst_key: &str,
-    ) -> Result<()> {
-        let _ = (src_bucket, src_key, dst_bucket, dst_key);
-        Err(Error::not_implemented("Project::move_object"))
     }
 
     /// Replace custom metadata. Existing custom metadata is deleted.
@@ -388,7 +336,7 @@ impl Project {
     }
 }
 
-fn require_object_key(key: &str) -> Result<()> {
+pub(crate) fn require_object_key(key: &str) -> Result<()> {
     if key.is_empty() {
         return Err(Error::new(
             ErrorKind::ObjectKeyInvalid,
@@ -398,7 +346,7 @@ fn require_object_key(key: &str) -> Result<()> {
     Ok(())
 }
 
-fn map_enc(e: storj_encryption::Error) -> Error {
+pub(crate) fn map_enc(e: storj_encryption::Error) -> Error {
     let kind = match e.kind() {
         storj_encryption::ErrorKind::DecryptionFailed => ErrorKind::DecryptionFailed,
         storj_encryption::ErrorKind::MissingEncryptionBase
@@ -444,7 +392,7 @@ fn encryption_from_begin(
     encryption_from_params(begin.encryption_parameters.as_ref())
 }
 
-fn encryption_from_params(
+pub(crate) fn encryption_from_params(
     params: Option<&storj_proto::encryption::EncryptionParameters>,
 ) -> (storj_encryption::CipherSuite, usize) {
     let cipher = match params.map(|p| p.cipher_suite) {
@@ -461,7 +409,7 @@ fn encryption_from_params(
     (cipher, block)
 }
 
-fn map_uplink(e: storj_uplink::Error) -> Error {
+pub(crate) fn map_uplink(e: storj_uplink::Error) -> Error {
     match e {
         storj_uplink::Error::Encryption(enc) => map_enc(enc),
         other => Error::new(ErrorKind::Protocol, other.to_string()).with_source(other),
@@ -983,7 +931,12 @@ pub(crate) async fn abort_upload(inner: UploadInner) -> Result<()> {
     }
     let _ = project
         .metainfo
-        .begin_delete_object(&bucket, encrypted_object_key, stream_id.clone())
+        .begin_delete_object(
+            &bucket,
+            encrypted_object_key,
+            stream_id.clone(),
+            storj_proto::metainfo::object::Status::Uploading as i32,
+        )
         .await?;
     project
         .metainfo

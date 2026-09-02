@@ -6,18 +6,22 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use prost::Message;
 use storj_proto::metainfo::{
-    AddressedOrderLimit, BeginDeleteObjectRequest, BeginDeleteObjectResponse, BeginObjectRequest,
+    AddressedOrderLimit, BeginCopyObjectRequest, BeginCopyObjectResponse, BeginDeleteObjectRequest,
+    BeginDeleteObjectResponse, BeginMoveObjectRequest, BeginMoveObjectResponse, BeginObjectRequest,
     BeginObjectResponse, BeginSegmentRequest, BeginSegmentResponse, Bucket as ProtoBucket,
     BucketListItem, CohortRequirements, CommitObjectRequest, CommitObjectResponse,
     CommitSegmentRequest, CommitSegmentResponse, CompressedBatchRequest, CreateBucketRequest,
     CreateBucketResponse, DeleteBucketRequest, DeleteBucketResponse, DownloadObjectRequest,
-    DownloadObjectResponse, DownloadSegmentRequest, DownloadSegmentResponse,
-    FinishDeleteObjectRequest, FinishDeleteObjectResponse, GetBucketRequest, GetBucketResponse,
-    ListBucketsRequest, ListBucketsResponse, ListDirection, ListSegmentsRequest,
-    ListSegmentsResponse, MakeInlineSegmentRequest, MakeInlineSegmentResponse,
-    Object as ProtoObject, ProjectInfoRequest, ProjectInfoResponse, Range, RequestHeader,
-    RetryBeginSegmentPiecesRequest, RetryBeginSegmentPiecesResponse, SegmentListItem,
-    SegmentPosition, batch_request_item, batch_response_item, cohort_requirements, range,
+    DownloadObjectResponse, DownloadSegmentRequest, DownloadSegmentResponse, EncryptedKeyAndNonce,
+    FinishCopyObjectRequest, FinishCopyObjectResponse, FinishDeleteObjectRequest,
+    FinishDeleteObjectResponse, FinishMoveObjectRequest, FinishMoveObjectResponse,
+    GetBucketRequest, GetBucketResponse, GetObjectRequest, GetObjectResponse, ListBucketsRequest,
+    ListBucketsResponse, ListDirection, ListObjectsRequest, ListObjectsResponse,
+    ListSegmentsRequest, ListSegmentsResponse, MakeInlineSegmentRequest, MakeInlineSegmentResponse,
+    Object as ProtoObject, ObjectListItem, ProjectInfoRequest, ProjectInfoResponse, Range,
+    RequestHeader, RetryBeginSegmentPiecesRequest, RetryBeginSegmentPiecesResponse,
+    SegmentListItem, SegmentPosition, batch_request_item, batch_response_item, cohort_requirements,
+    object::Status as ObjectStatus, range,
 };
 use storj_proto::node::NodeAddress;
 use storj_proto::orders::{OrderLimit, PieceAction};
@@ -82,6 +86,7 @@ struct StoredSegment {
     scheme: RedundancyScheme,
 }
 
+#[derive(Clone)]
 struct CommittedObject {
     object: ProtoObject,
     segments: Vec<StoredSegment>,
@@ -106,6 +111,7 @@ struct MockState {
     last_commit_segment_id: Option<Vec<u8>>,
     stale_segment_ids: BTreeSet<Vec<u8>>,
     sn_tags: Vec<HashMap<String, Vec<u8>>>,
+    omit_delete_meta: bool,
 }
 
 /// Loopback TLS satellite that speaks `ProjectInfo`, buckets, and upload RPCs.
@@ -160,6 +166,7 @@ impl MockSatellite {
             last_commit_segment_id: None,
             stale_segment_ids: BTreeSet::new(),
             sn_tags: vec![HashMap::new(); 6],
+            omit_delete_meta: false,
         }));
 
         let server_cfg = server_config(&identity).expect("mock server tls");
@@ -232,6 +239,11 @@ impl MockSatellite {
             .expect("mock state")
             .get_bucket_denied
             .insert(bucket.to_owned());
+    }
+
+    /// `BeginDeleteObject` succeeds but omits object metadata (no-read grant).
+    pub fn omit_delete_object_metadata(&self) {
+        self.state.lock().expect("mock state").omit_delete_meta = true;
     }
 
     /// Storage nodes started with this satellite (long-tail / piece upload).
@@ -580,6 +592,24 @@ fn handle_batch_item(
         Some(Request::SegmentList(req)) => {
             batch_response_item::Response::SegmentList(list_segments(req, state)?)
         }
+        Some(Request::ObjectGet(req)) => {
+            batch_response_item::Response::ObjectGet(get_object(req, state)?)
+        }
+        Some(Request::ObjectList(req)) => {
+            batch_response_item::Response::ObjectList(list_objects(req, state)?)
+        }
+        Some(Request::ObjectBeginCopy(req)) => {
+            batch_response_item::Response::ObjectBeginCopy(begin_copy(req, state)?)
+        }
+        Some(Request::ObjectFinishCopy(req)) => {
+            batch_response_item::Response::ObjectFinishCopy(finish_copy(req, state)?)
+        }
+        Some(Request::ObjectBeginMove(req)) => {
+            batch_response_item::Response::ObjectBeginMove(begin_move(req, state)?)
+        }
+        Some(Request::ObjectFinishMove(req)) => {
+            batch_response_item::Response::ObjectFinishMove(finish_move(req, state)?)
+        }
         Some(Request::BucketCreate(req)) => {
             let body = handle_rpc(
                 rpc::CREATE_BUCKET,
@@ -699,11 +729,33 @@ fn begin_delete(
 ) -> Result<BeginDeleteObjectResponse, (u64, String)> {
     let mut st = state.lock().expect("mock state");
     check_key(&req.header, &st)?;
-    st.pending.remove(&req.stream_id);
-    st.aborted.insert(req.stream_id.clone());
+    if !req.stream_id.is_empty() {
+        st.pending.remove(&req.stream_id);
+        st.aborted.insert(req.stream_id.clone());
+        return Ok(BeginDeleteObjectResponse {
+            stream_id: req.stream_id,
+            object: None,
+        });
+    }
+    let name = utf8_name(&req.bucket)?;
+    if !st.buckets.contains_key(&name) {
+        return Err((RPC_NOT_FOUND, format!("bucket not found: {name}")));
+    }
+    let rec = st
+        .committed
+        .remove(&(name.clone(), req.encrypted_object_key.clone()))
+        .ok_or_else(|| (RPC_NOT_FOUND, "object not found".into()))?;
+    if let Some(bucket) = st.buckets.get_mut(&name) {
+        bucket.objects = bucket.objects.saturating_sub(1);
+    }
+    let object = if st.omit_delete_meta {
+        None
+    } else {
+        Some(rec.object.clone())
+    };
     Ok(BeginDeleteObjectResponse {
-        stream_id: req.stream_id,
-        object: None,
+        stream_id: rec.object.stream_id,
+        object,
     })
 }
 
@@ -714,6 +766,316 @@ fn finish_delete(
     let st = state.lock().expect("mock state");
     check_key(&req.header, &st)?;
     Ok(FinishDeleteObjectResponse {})
+}
+
+fn get_object(
+    req: GetObjectRequest,
+    state: &Mutex<MockState>,
+) -> Result<GetObjectResponse, (u64, String)> {
+    let st = state.lock().expect("mock state");
+    check_key(&req.header, &st)?;
+    let name = utf8_name(&req.bucket)?;
+    if !st.buckets.contains_key(&name) {
+        return Err((RPC_NOT_FOUND, format!("bucket not found: {name}")));
+    }
+    let rec = st
+        .committed
+        .get(&(name, req.encrypted_object_key))
+        .ok_or_else(|| (RPC_NOT_FOUND, "object not found".into()))?;
+    Ok(GetObjectResponse {
+        object: Some(rec.object.clone()),
+    })
+}
+
+fn list_objects(
+    req: ListObjectsRequest,
+    state: &Mutex<MockState>,
+) -> Result<ListObjectsResponse, (u64, String)> {
+    let st = state.lock().expect("mock state");
+    check_key(&req.header, &st)?;
+    let name = utf8_name(&req.bucket)?;
+    if !st.buckets.contains_key(&name) {
+        return Err((RPC_NOT_FOUND, format!("bucket not found: {name}")));
+    }
+    let recursive = req.recursive || req.delimiter.is_empty();
+    let delim = if recursive {
+        None
+    } else if req.delimiter.is_empty() {
+        Some(b"/".as_slice())
+    } else {
+        Some(req.delimiter.as_slice())
+    };
+    let include = req.object_includes.unwrap_or_default();
+    let include_custom = req.use_object_includes && include.metadata;
+    let include_system = !req.use_object_includes || !include.exclude_system_metadata;
+
+    let mut entries: Vec<(Vec<u8>, Option<CommittedObject>)> = Vec::new();
+    let mut prefixes = BTreeSet::new();
+    for ((bucket, enc_key), rec) in &st.committed {
+        if bucket != &name {
+            continue;
+        }
+        let Some(remainder) = strip_list_prefix(enc_key, &req.encrypted_prefix) else {
+            continue;
+        };
+        if !req.encrypted_cursor.is_empty()
+            && remainder.as_slice() <= req.encrypted_cursor.as_slice()
+        {
+            continue;
+        }
+        if let Some(d) = delim {
+            if let Some(idx) = remainder.windows(d.len()).position(|w| w == d) {
+                let mut prefix_key = remainder[..idx + d.len()].to_vec();
+                if prefixes.insert(prefix_key.clone()) {
+                    entries.push((std::mem::take(&mut prefix_key), None));
+                }
+                continue;
+            }
+        }
+        entries.push((
+            remainder,
+            Some(CommittedObject {
+                object: rec.object.clone(),
+                segments: rec.segments.clone(),
+            }),
+        ));
+    }
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    let limit = if req.limit <= 0 {
+        1000
+    } else {
+        req.limit as usize
+    };
+    let more = entries.len() > limit;
+    let items = entries
+        .into_iter()
+        .take(limit)
+        .map(|(remainder, rec)| match rec {
+            None => ObjectListItem {
+                encrypted_object_key: remainder,
+                status: ObjectStatus::Prefix as i32,
+                ..Default::default()
+            },
+            Some(rec) => {
+                let mut item = ObjectListItem {
+                    encrypted_object_key: remainder,
+                    status: rec.object.status,
+                    stream_id: rec.object.stream_id.clone(),
+                    ..Default::default()
+                };
+                if include_system {
+                    item.created_at = rec.object.created_at;
+                    item.expires_at = rec.object.expires_at;
+                    item.plain_size = rec.object.plain_size;
+                }
+                if include_custom {
+                    item.encrypted_metadata = rec.object.encrypted_metadata.clone();
+                    item.encrypted_metadata_nonce = rec.object.encrypted_metadata_nonce.clone();
+                    item.encrypted_metadata_encrypted_key =
+                        rec.object.encrypted_metadata_encrypted_key.clone();
+                    item.encrypted_etag = rec.object.encrypted_etag.clone();
+                }
+                item
+            }
+        })
+        .collect();
+    Ok(ListObjectsResponse { items, more })
+}
+
+fn strip_list_prefix(enc_key: &[u8], prefix: &[u8]) -> Option<Vec<u8>> {
+    if prefix.is_empty() {
+        return Some(enc_key.to_vec());
+    }
+    if !enc_key.starts_with(prefix) {
+        return None;
+    }
+    let rest = &enc_key[prefix.len()..];
+    if rest.is_empty() {
+        return None;
+    }
+    if rest[0] == b'/' {
+        Some(rest[1..].to_vec())
+    } else {
+        None
+    }
+}
+
+fn begin_copy(
+    req: BeginCopyObjectRequest,
+    state: &Mutex<MockState>,
+) -> Result<BeginCopyObjectResponse, (u64, String)> {
+    let st = state.lock().expect("mock state");
+    check_key(&req.header, &st)?;
+    let name = utf8_name(&req.bucket)?;
+    if !st.buckets.contains_key(&name) {
+        return Err((RPC_NOT_FOUND, format!("bucket not found: {name}")));
+    }
+    let dest = utf8_name(&req.new_bucket)?;
+    if !st.buckets.contains_key(&dest) {
+        return Err((RPC_NOT_FOUND, format!("bucket not found: {dest}")));
+    }
+    let rec = st
+        .committed
+        .get(&(name, req.encrypted_object_key))
+        .ok_or_else(|| (RPC_NOT_FOUND, "object not found".into()))?;
+    Ok(BeginCopyObjectResponse {
+        stream_id: rec.object.stream_id.clone(),
+        encrypted_metadata_key_nonce: rec.object.encrypted_metadata_nonce.clone(),
+        encrypted_metadata_key: rec.object.encrypted_metadata_encrypted_key.clone(),
+        segment_keys: rec
+            .segments
+            .iter()
+            .map(|s| EncryptedKeyAndNonce {
+                position: Some(s.position),
+                encrypted_key_nonce: s.encrypted_key_nonce.clone(),
+                encrypted_key: s.encrypted_key.clone(),
+            })
+            .collect(),
+        encryption_parameters: rec.object.encryption_parameters,
+        checksum_algorithm: rec.object.checksum_algorithm,
+    })
+}
+
+fn finish_copy(
+    req: FinishCopyObjectRequest,
+    state: &Mutex<MockState>,
+) -> Result<FinishCopyObjectResponse, (u64, String)> {
+    let mut st = state.lock().expect("mock state");
+    check_key(&req.header, &st)?;
+    let dest = utf8_name(&req.new_bucket)?;
+    if !st.buckets.contains_key(&dest) {
+        return Err((RPC_NOT_FOUND, format!("bucket not found: {dest}")));
+    }
+    let src = st
+        .committed
+        .iter()
+        .find(|(_, rec)| rec.object.stream_id == req.stream_id)
+        .map(|(_, rec)| rec.clone())
+        .ok_or_else(|| (RPC_NOT_FOUND, "object not found".into()))?;
+    let dest_obj = apply_relocated(
+        &src,
+        dest.clone(),
+        req.new_encrypted_object_key.clone(),
+        &req.new_encrypted_metadata_key,
+        &req.new_encrypted_metadata_key_nonce,
+        &req.new_segment_keys,
+        true,
+        &mut st,
+    )?;
+    Ok(FinishCopyObjectResponse {
+        object: Some(dest_obj),
+    })
+}
+
+fn begin_move(
+    req: BeginMoveObjectRequest,
+    state: &Mutex<MockState>,
+) -> Result<BeginMoveObjectResponse, (u64, String)> {
+    let copy = begin_copy(
+        BeginCopyObjectRequest {
+            header: req.header,
+            bucket: req.bucket,
+            encrypted_object_key: req.encrypted_object_key,
+            new_bucket: req.new_bucket,
+            new_encrypted_object_key: req.new_encrypted_object_key,
+            object_version: Vec::new(),
+        },
+        state,
+    )?;
+    Ok(BeginMoveObjectResponse {
+        stream_id: copy.stream_id,
+        encrypted_metadata_key_nonce: copy.encrypted_metadata_key_nonce,
+        encrypted_metadata_key: copy.encrypted_metadata_key,
+        segment_keys: copy.segment_keys,
+        encryption_parameters: copy.encryption_parameters,
+    })
+}
+
+fn finish_move(
+    req: FinishMoveObjectRequest,
+    state: &Mutex<MockState>,
+) -> Result<FinishMoveObjectResponse, (u64, String)> {
+    let mut st = state.lock().expect("mock state");
+    check_key(&req.header, &st)?;
+    let dest = utf8_name(&req.new_bucket)?;
+    if !st.buckets.contains_key(&dest) {
+        return Err((RPC_NOT_FOUND, format!("bucket not found: {dest}")));
+    }
+    let src_key = st
+        .committed
+        .iter()
+        .find(|(_, rec)| rec.object.stream_id == req.stream_id)
+        .map(|(k, _)| k.clone())
+        .ok_or_else(|| (RPC_NOT_FOUND, "object not found".into()))?;
+    let src = st
+        .committed
+        .remove(&src_key)
+        .ok_or_else(|| (RPC_NOT_FOUND, "object not found".into()))?;
+    if let Some(bucket) = st.buckets.get_mut(&src_key.0) {
+        bucket.objects = bucket.objects.saturating_sub(1);
+    }
+    apply_relocated(
+        &src,
+        dest,
+        req.new_encrypted_object_key,
+        &req.new_encrypted_metadata_key,
+        &req.new_encrypted_metadata_key_nonce,
+        &req.new_segment_keys,
+        false,
+        &mut st,
+    )?;
+    Ok(FinishMoveObjectResponse {})
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_relocated(
+    src: &CommittedObject,
+    dest_bucket: String,
+    dest_enc: Vec<u8>,
+    new_meta_key: &[u8],
+    new_meta_nonce: &[u8],
+    new_segment_keys: &[EncryptedKeyAndNonce],
+    new_stream: bool,
+    st: &mut MockState,
+) -> Result<ProtoObject, (u64, String)> {
+    let dest_exists = st
+        .committed
+        .contains_key(&(dest_bucket.clone(), dest_enc.clone()));
+    let mut object = src.object.clone();
+    if new_stream {
+        st.next_id += 1;
+        object.stream_id = st.next_id.to_be_bytes().to_vec();
+    }
+    object.bucket = dest_bucket.as_bytes().to_vec();
+    object.encrypted_object_key = dest_enc.clone();
+    if !new_meta_key.is_empty() {
+        object.encrypted_metadata_encrypted_key = new_meta_key.to_vec();
+        object.encrypted_metadata_nonce = new_meta_nonce.to_vec();
+    }
+    let mut segments = src.segments.clone();
+    for seg in &mut segments {
+        if let Some(k) = new_segment_keys.iter().find(|k| {
+            k.position.as_ref().is_some_and(|p| {
+                p.part_number == seg.position.part_number && p.index == seg.position.index
+            })
+        }) {
+            seg.encrypted_key = k.encrypted_key.clone();
+            seg.encrypted_key_nonce = k.encrypted_key_nonce.clone();
+        }
+    }
+    if !dest_exists {
+        if let Some(bucket) = st.buckets.get_mut(&dest_bucket) {
+            bucket.objects += 1;
+        }
+    }
+    st.committed.insert(
+        (dest_bucket, dest_enc),
+        CommittedObject {
+            object: object.clone(),
+            segments,
+        },
+    );
+    Ok(object)
 }
 
 fn begin_segment(

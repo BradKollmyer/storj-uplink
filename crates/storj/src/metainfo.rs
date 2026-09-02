@@ -12,11 +12,13 @@ use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
 
 use storj_proto::metainfo::{
-    self, BatchRequest, BatchRequestItem, BeginDeleteObjectRequest, BeginObjectRequest,
-    BeginSegmentRequest, CommitObjectRequest, CommitSegmentRequest, CompressedBatchResponse,
-    CreateBucketRequest, DeleteBucketRequest, DownloadObjectRequest, DownloadSegmentRequest,
-    FinishDeleteObjectRequest, GetBucketRequest, ListBucketsRequest, ListSegmentsRequest,
-    MakeInlineSegmentRequest, ProjectInfoRequest, ProjectInfoResponse, Range, RequestHeader,
+    self, BatchRequest, BatchRequestItem, BeginCopyObjectRequest, BeginDeleteObjectRequest,
+    BeginMoveObjectRequest, BeginObjectRequest, BeginSegmentRequest, CommitObjectRequest,
+    CommitSegmentRequest, CompressedBatchResponse, CreateBucketRequest, DeleteBucketRequest,
+    DownloadObjectRequest, DownloadSegmentRequest, FinishCopyObjectRequest,
+    FinishDeleteObjectRequest, FinishMoveObjectRequest, GetBucketRequest, GetObjectRequest,
+    ListBucketsRequest, ListObjectsRequest, ListSegmentsRequest, MakeInlineSegmentRequest,
+    ObjectListItemIncludes, ProjectInfoRequest, ProjectInfoResponse, Range, RequestHeader,
     RetryBeginSegmentPiecesRequest, SegmentPosition, batch_request_item, batch_response_item,
 };
 use storj_proto::rpc;
@@ -41,6 +43,16 @@ pub(crate) const RPC_UNAVAILABLE: u64 = 14;
 
 const SATELLITE_ATTEMPTS: u32 = 3;
 const LIST_BUCKETS_LIMIT: i32 = 1000;
+const LIST_OBJECTS_LIMIT: i32 = 1000;
+
+pub(crate) struct ListObjectsParams {
+    pub encrypted_prefix: Vec<u8>,
+    pub encrypted_cursor: Vec<u8>,
+    pub recursive: bool,
+    pub include_custom: bool,
+    pub include_system: bool,
+    pub arbitrary_prefix: bool,
+}
 
 type SatelliteStream = TlsStream<TcpStream>;
 
@@ -600,13 +612,14 @@ impl MetainfoClient {
         bucket: &str,
         encrypted_object_key: Vec<u8>,
         stream_id: Vec<u8>,
+        status: i32,
     ) -> Result<metainfo::BeginDeleteObjectResponse> {
         let req = BeginDeleteObjectRequest {
             header: Some(self.header()),
             bucket: bucket.as_bytes().to_vec(),
             encrypted_object_key,
             stream_id,
-            status: metainfo::object::Status::Uploading as i32,
+            status,
             ..Default::default()
         };
         let items = self
@@ -650,6 +663,198 @@ impl MetainfoClient {
             _ => Err(Error::new(
                 ErrorKind::Protocol,
                 "unexpected FinishDeleteObject response",
+            )),
+        }
+    }
+
+    pub(crate) async fn get_object(
+        &self,
+        bucket: &str,
+        key: &str,
+        encrypted_object_key: Vec<u8>,
+    ) -> Result<metainfo::GetObjectResponse> {
+        let req = GetObjectRequest {
+            header: Some(self.header()),
+            bucket: bucket.as_bytes().to_vec(),
+            encrypted_object_key,
+            redundancy_scheme_per_segment: true,
+            ..Default::default()
+        };
+        let items = self
+            .compressed_batch(
+                vec![BatchRequestItem {
+                    request: Some(batch_request_item::Request::ObjectGet(req)),
+                }],
+                bucket,
+                key,
+            )
+            .await?;
+        match Self::expect_one(items, "GetObject")? {
+            batch_response_item::Response::ObjectGet(r) => Ok(r),
+            _ => Err(Error::new(
+                ErrorKind::Protocol,
+                "unexpected GetObject response",
+            )),
+        }
+    }
+
+    pub(crate) async fn list_objects(
+        &self,
+        bucket: &str,
+        params: ListObjectsParams,
+    ) -> Result<metainfo::ListObjectsResponse> {
+        let req = ListObjectsRequest {
+            header: Some(self.header()),
+            bucket: bucket.as_bytes().to_vec(),
+            delimiter: if params.recursive {
+                Vec::new()
+            } else {
+                b"/".to_vec()
+            },
+            encrypted_prefix: params.encrypted_prefix,
+            encrypted_cursor: params.encrypted_cursor,
+            recursive: params.recursive,
+            limit: LIST_OBJECTS_LIMIT,
+            object_includes: Some(ObjectListItemIncludes {
+                metadata: params.include_custom,
+                exclude_system_metadata: !params.include_system,
+                ..Default::default()
+            }),
+            use_object_includes: true,
+            arbitrary_prefix: params.arbitrary_prefix,
+            ..Default::default()
+        };
+        let items = self
+            .compressed_batch(
+                vec![BatchRequestItem {
+                    request: Some(batch_request_item::Request::ObjectList(req)),
+                }],
+                bucket,
+                "",
+            )
+            .await?;
+        match Self::expect_one(items, "ListObjects")? {
+            batch_response_item::Response::ObjectList(r) => Ok(r),
+            _ => Err(Error::new(
+                ErrorKind::Protocol,
+                "unexpected ListObjects response",
+            )),
+        }
+    }
+
+    pub(crate) async fn begin_copy_object(
+        &self,
+        src_bucket: &str,
+        src_key: &str,
+        encrypted_object_key: Vec<u8>,
+        new_bucket: &str,
+        new_encrypted_object_key: Vec<u8>,
+    ) -> Result<metainfo::BeginCopyObjectResponse> {
+        let req = BeginCopyObjectRequest {
+            header: Some(self.header()),
+            bucket: src_bucket.as_bytes().to_vec(),
+            encrypted_object_key,
+            new_bucket: new_bucket.as_bytes().to_vec(),
+            new_encrypted_object_key,
+            ..Default::default()
+        };
+        let items = self
+            .compressed_batch(
+                vec![BatchRequestItem {
+                    request: Some(batch_request_item::Request::ObjectBeginCopy(req)),
+                }],
+                src_bucket,
+                src_key,
+            )
+            .await?;
+        match Self::expect_one(items, "BeginCopyObject")? {
+            batch_response_item::Response::ObjectBeginCopy(r) => Ok(r),
+            _ => Err(Error::new(
+                ErrorKind::Protocol,
+                "unexpected BeginCopyObject response",
+            )),
+        }
+    }
+
+    pub(crate) async fn finish_copy_object(
+        &self,
+        dst_bucket: &str,
+        dst_key: &str,
+        mut req: FinishCopyObjectRequest,
+    ) -> Result<metainfo::FinishCopyObjectResponse> {
+        req.header = Some(self.header());
+        let items = self
+            .compressed_batch(
+                vec![BatchRequestItem {
+                    request: Some(batch_request_item::Request::ObjectFinishCopy(req)),
+                }],
+                dst_bucket,
+                dst_key,
+            )
+            .await?;
+        match Self::expect_one(items, "FinishCopyObject")? {
+            batch_response_item::Response::ObjectFinishCopy(r) => Ok(r),
+            _ => Err(Error::new(
+                ErrorKind::Protocol,
+                "unexpected FinishCopyObject response",
+            )),
+        }
+    }
+
+    pub(crate) async fn begin_move_object(
+        &self,
+        src_bucket: &str,
+        src_key: &str,
+        encrypted_object_key: Vec<u8>,
+        new_bucket: &str,
+        new_encrypted_object_key: Vec<u8>,
+    ) -> Result<metainfo::BeginMoveObjectResponse> {
+        let req = BeginMoveObjectRequest {
+            header: Some(self.header()),
+            bucket: src_bucket.as_bytes().to_vec(),
+            encrypted_object_key,
+            new_bucket: new_bucket.as_bytes().to_vec(),
+            new_encrypted_object_key,
+        };
+        let items = self
+            .compressed_batch(
+                vec![BatchRequestItem {
+                    request: Some(batch_request_item::Request::ObjectBeginMove(req)),
+                }],
+                src_bucket,
+                src_key,
+            )
+            .await?;
+        match Self::expect_one(items, "BeginMoveObject")? {
+            batch_response_item::Response::ObjectBeginMove(r) => Ok(r),
+            _ => Err(Error::new(
+                ErrorKind::Protocol,
+                "unexpected BeginMoveObject response",
+            )),
+        }
+    }
+
+    pub(crate) async fn finish_move_object(
+        &self,
+        src_bucket: &str,
+        src_key: &str,
+        mut req: FinishMoveObjectRequest,
+    ) -> Result<()> {
+        req.header = Some(self.header());
+        let items = self
+            .compressed_batch(
+                vec![BatchRequestItem {
+                    request: Some(batch_request_item::Request::ObjectFinishMove(req)),
+                }],
+                src_bucket,
+                src_key,
+            )
+            .await?;
+        match Self::expect_one(items, "FinishMoveObject")? {
+            batch_response_item::Response::ObjectFinishMove(_) => Ok(()),
+            _ => Err(Error::new(
+                ErrorKind::Protocol,
+                "unexpected FinishMoveObject response",
             )),
         }
     }
