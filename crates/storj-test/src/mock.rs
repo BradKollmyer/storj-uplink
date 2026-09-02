@@ -826,6 +826,7 @@ fn begin_object(
 ) -> Result<BeginObjectResponse, (u64, String)> {
     let mut st = state.lock().expect("mock state");
     check_key(&req.header, &st)?;
+    check_action(&req.header, Action::Write)?;
     let name = utf8_name(&req.bucket)?;
     if !st.buckets.contains_key(&name) {
         return Err((RPC_NOT_FOUND, format!("bucket not found: {name}")));
@@ -873,6 +874,7 @@ fn commit_object(
 ) -> Result<CommitObjectResponse, (u64, String)> {
     let mut st = state.lock().expect("mock state");
     check_key(&req.header, &st)?;
+    check_action(&req.header, Action::Write)?;
     if st.fail_commit {
         st.fail_commit = false;
         return Err((RPC_INTERNAL, "commit object failed".into()));
@@ -933,6 +935,7 @@ fn begin_delete(
 ) -> Result<BeginDeleteObjectResponse, (u64, String)> {
     let mut st = state.lock().expect("mock state");
     check_key(&req.header, &st)?;
+    check_action(&req.header, Action::Delete)?;
     if !req.stream_id.is_empty() {
         st.pending.remove(&req.stream_id);
         st.aborted.insert(req.stream_id.clone());
@@ -984,6 +987,7 @@ fn get_object(
 ) -> Result<GetObjectResponse, (u64, String)> {
     let st = state.lock().expect("mock state");
     check_key(&req.header, &st)?;
+    check_action(&req.header, Action::Read)?;
     let name = utf8_name(&req.bucket)?;
     if !st.buckets.contains_key(&name) {
         return Err((RPC_NOT_FOUND, format!("bucket not found: {name}")));
@@ -1003,6 +1007,7 @@ fn list_objects(
 ) -> Result<ListObjectsResponse, (u64, String)> {
     let st = state.lock().expect("mock state");
     check_key(&req.header, &st)?;
+    check_action(&req.header, Action::List)?;
     let name = utf8_name(&req.bucket)?;
     if !st.buckets.contains_key(&name) {
         return Err((RPC_NOT_FOUND, format!("bucket not found: {name}")));
@@ -1124,6 +1129,7 @@ fn begin_copy(
 ) -> Result<BeginCopyObjectResponse, (u64, String)> {
     let st = state.lock().expect("mock state");
     check_key(&req.header, &st)?;
+    check_action(&req.header, Action::Write)?;
     let name = utf8_name(&req.bucket)?;
     if !st.buckets.contains_key(&name) {
         return Err((RPC_NOT_FOUND, format!("bucket not found: {name}")));
@@ -1160,6 +1166,7 @@ fn finish_copy(
 ) -> Result<FinishCopyObjectResponse, (u64, String)> {
     let mut st = state.lock().expect("mock state");
     check_key(&req.header, &st)?;
+    check_action(&req.header, Action::Write)?;
     let dest = utf8_name(&req.new_bucket)?;
     if !st.buckets.contains_key(&dest) {
         return Err((RPC_NOT_FOUND, format!("bucket not found: {dest}")));
@@ -1215,6 +1222,8 @@ fn finish_move(
 ) -> Result<FinishMoveObjectResponse, (u64, String)> {
     let mut st = state.lock().expect("mock state");
     check_key(&req.header, &st)?;
+    check_action(&req.header, Action::Write)?;
+    check_action(&req.header, Action::Write)?;
     let dest = utf8_name(&req.new_bucket)?;
     if !st.buckets.contains_key(&dest) {
         return Err((RPC_NOT_FOUND, format!("bucket not found: {dest}")));
@@ -1304,6 +1313,7 @@ fn begin_segment(
 ) -> Result<BeginSegmentResponse, (u64, String)> {
     let mut st = state.lock().expect("mock state");
     check_key(&req.header, &st)?;
+    check_action(&req.header, Action::Write)?;
     if !st.pending.contains_key(&req.stream_id) {
         return Err((RPC_NOT_FOUND, "object not found".into()));
     }
@@ -1460,6 +1470,7 @@ fn commit_segment(
 ) -> Result<CommitSegmentResponse, (u64, String)> {
     let mut st = state.lock().expect("mock state");
     check_key(&req.header, &st)?;
+    check_action(&req.header, Action::Write)?;
     if st.stale_segment_ids.contains(&req.segment_id) {
         return Err((
             RPC_INVALID_ARGUMENT,
@@ -1512,6 +1523,7 @@ fn make_inline(
 ) -> Result<MakeInlineSegmentResponse, (u64, String)> {
     let mut st = state.lock().expect("mock state");
     check_key(&req.header, &st)?;
+    check_action(&req.header, Action::Write)?;
     if req.encrypted_inline_data.len() > 4 * 1024 + 16 {
         return Err((
             RPC_INVALID_ARGUMENT,
@@ -1544,6 +1556,7 @@ fn download_object(
 ) -> Result<DownloadObjectResponse, (u64, String)> {
     let st = state.lock().expect("mock state");
     check_key(&req.header, &st)?;
+    check_action(&req.header, Action::Read)?;
     let name = utf8_name(&req.bucket)?;
     if !st.buckets.contains_key(&name) {
         return Err((RPC_NOT_FOUND, format!("bucket not found: {name}")));
@@ -1587,6 +1600,7 @@ fn download_segment(
 ) -> Result<DownloadSegmentResponse, (u64, String)> {
     let st = state.lock().expect("mock state");
     check_key(&req.header, &st)?;
+    check_action(&req.header, Action::Read)?;
     let committed = st
         .committed
         .values()
@@ -1616,6 +1630,7 @@ fn list_segments(
 ) -> Result<ListSegmentsResponse, (u64, String)> {
     let st = state.lock().expect("mock state");
     check_key(&req.header, &st)?;
+    check_action(&req.header, Action::List)?;
     let (mut segments, encryption_parameters) = if let Some(committed) = st
         .committed
         .values()
@@ -1989,6 +2004,42 @@ fn object_lock_rec_mut<'a>(
         .or_default())
 }
 
+/// Which caveat gate an RPC falls under (Go `macaroon.Action`).
+#[derive(Clone, Copy, Debug)]
+enum Action {
+    Read,
+    Write,
+    List,
+    Delete,
+}
+
+/// Enforce the `disallow_*` caveats of the request's macaroon for `action`,
+/// like the satellite's `validateAuth`.
+fn check_action(header: &Option<RequestHeader>, action: Action) -> Result<(), (u64, String)> {
+    let got = header.as_ref().map(|h| h.api_key.as_slice()).unwrap_or(&[]);
+    let Ok(mac) = storj_access::Macaroon::parse(got) else {
+        return Err((RPC_UNAUTHENTICATED, "invalid api key".into()));
+    };
+    for raw in mac.caveats() {
+        let Ok(c) = storj_access::Caveat::decode(raw) else {
+            return Err((RPC_UNAUTHENTICATED, "invalid caveat".into()));
+        };
+        let denied = match action {
+            Action::Read => c.disallow_reads,
+            Action::Write => c.disallow_writes,
+            Action::List => c.disallow_lists,
+            Action::Delete => c.disallow_deletes,
+        };
+        if denied {
+            return Err((
+                RPC_PERMISSION_DENIED,
+                format!("permission denied: {action:?} not allowed by api key"),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Secret the mock's root API key was minted with (see `MockSatellite::start`).
 const MOCK_MACAROON_SECRET: [u8; 32] = [0x42; 32];
 
@@ -2095,6 +2146,7 @@ fn update_object_metadata(
 ) -> Result<UpdateObjectMetadataResponse, (u64, String)> {
     let mut st = state.lock().expect("mock state");
     check_key(&req.header, &st)?;
+    check_action(&req.header, Action::Write)?;
     let name = utf8_name(&req.bucket)?;
     if !st.buckets.contains_key(&name) {
         return Err((RPC_NOT_FOUND, format!("bucket not found: {name}")));

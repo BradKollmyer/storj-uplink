@@ -101,7 +101,13 @@ async fn project_open_returns_result() {
     // 2025 Project::open returned Self. Ours returns Result (native dial can fail).
     let serialized = include_str!("fixtures/grant_go.txt").trim();
     let access = Access::parse(serialized).expect("fixture grant");
-    match Project::open(&access).await {
+    // The fixture points at a local port nobody serves; bound the dial so an
+    // unrelated listener there cannot hang this test for the default 20 s.
+    let config = storj::Config {
+        dial_timeout: Some(std::time::Duration::from_secs(1)),
+        ..Default::default()
+    };
+    match Project::open_with_config(&access, config).await {
         Ok(_) => panic!("Project::open must return Result (native dial can fail)"),
         Err(err) => {
             assert!(

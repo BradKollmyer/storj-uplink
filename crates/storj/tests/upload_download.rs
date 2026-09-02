@@ -76,7 +76,7 @@ async fn drop_upload_aborts() {
         .unwrap();
     upload.write_all(b"not committed").await.unwrap();
     drop(upload);
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    wait_for_abort(&mock).await;
     assert_eq!(mock.committed_count(), 0);
     assert!(mock.aborted_count() >= 1);
 }
@@ -503,7 +503,7 @@ async fn failed_commit_object_aborts() {
         .unwrap();
     upload.write_all(b"hello").await.unwrap();
     assert!(upload.commit().await.is_err());
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    wait_for_abort(&mock).await;
     assert_eq!(mock.committed_count(), 0);
     assert!(mock.aborted_count() >= 1);
 }
@@ -550,7 +550,7 @@ async fn upload_from_aborts_on_reader_error() {
         .await
         .unwrap_err();
     assert_eq!(err.kind(), ErrorKind::Io);
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    wait_for_abort(&mock).await;
     assert_eq!(mock.committed_count(), 0);
     assert!(mock.aborted_count() >= 1);
 }
@@ -598,5 +598,13 @@ impl tokio::io::AsyncRead for FailAfter {
         buf.put_slice(b"x");
         self.left -= 1;
         std::task::Poll::Ready(Ok(()))
+    }
+}
+
+/// The abort runs on a spawned task; poll instead of sleeping a fixed time.
+async fn wait_for_abort(mock: &storj_test::MockSatellite) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while mock.aborted_count() == 0 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }

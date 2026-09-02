@@ -4,7 +4,7 @@ go 1.25.0
 
 require (
 	storj.io/common v0.0.0-20260818140313-d38275a3768b
-	storj.io/infectious v0.0.2
+	storj.io/infectious v1.0.1
 )
 
 require (
