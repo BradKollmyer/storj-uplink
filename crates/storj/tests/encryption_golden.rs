@@ -5,10 +5,11 @@
 use std::fs;
 
 use storj::EncryptionKey;
-use storj::constants::ARGON2_PARALLELISM_REQUEST;
+use storj::constants::{ARGON2_PARALLELISM_REQUEST, ENCRYPTION_BLOCK_SIZE};
 use storj::encryption::{
-    CipherSuite, Store, decrypt_path, derive_path_key_component, derive_root_key, encrypt_path,
-    encrypt_prefix,
+    CipherSuite, EncryptionParameters, Store, calc_encompassing_blocks, calc_encrypted_size,
+    decrypt, decrypt_path, derive_path_key_component, derive_root_key, encrypt, encrypt_path,
+    encrypt_prefix, increment_bytes, pad, unpad,
 };
 
 #[derive(Debug)]
@@ -148,4 +149,57 @@ fn path_encrypt_decrypt_empty_unicode_prefixes() {
         let pdec = decrypt_path("bucket", &penc, &store).unwrap();
         assert_eq!(pdec, path.as_bytes(), "prefix path={path:?}");
     }
+}
+
+/// Go `nacl/secretbox.Seal` + `crypto/aes` GCM, key `00..1f`, nonce zeros, pt `hello`.
+#[test]
+fn content_encrypt_matches_go_primitives() {
+    let key = EncryptionKey::from_bytes(std::array::from_fn(|i| u8::try_from(i).expect("i < 32")));
+    let nonce = [0u8; 24];
+    let aes = encrypt(b"hello", CipherSuite::AES_GCM, key.inner(), &nonce).unwrap();
+    assert_eq!(
+        hex::encode(&aes),
+        "66d9d9b2da0e0c4679f3a82524f5e0499271e16f30"
+    );
+    let sb = encrypt(b"hello", CipherSuite::SECRET_BOX, key.inner(), &nonce).unwrap();
+    assert_eq!(
+        hex::encode(&sb),
+        "9031d88e6447f0b8bf44357c58bf25f4226b9c2df7"
+    );
+    assert_eq!(
+        decrypt(&aes, CipherSuite::AES_GCM, key.inner(), &nonce).unwrap(),
+        b"hello"
+    );
+    assert_eq!(
+        decrypt(&sb, CipherSuite::SECRET_BOX, key.inner(), &nonce).unwrap(),
+        b"hello"
+    );
+}
+
+#[test]
+fn nonce_increment_pad_and_encrypted_size_match_go() {
+    let mut buf = [0u8, 0, 0, 0];
+    assert!(!increment_bytes(&mut buf, 1).unwrap());
+    assert_eq!(buf, [1, 0, 0, 0]);
+
+    let mut wrap = [255u8, 0, 0, 0];
+    assert!(!increment_bytes(&mut wrap, 1).unwrap());
+    assert_eq!(wrap, [0, 1, 0, 0]);
+
+    assert_eq!(hex::encode(pad(b"hi", 8).unwrap()), "6869000000000006");
+    assert_eq!(unpad(&pad(b"hi", 8).unwrap()).unwrap(), b"hi");
+
+    let aes = EncryptionParameters {
+        cipher_suite: CipherSuite::AES_GCM,
+        block_size: 1024,
+    };
+    assert_eq!(calc_encrypted_size(0, aes).unwrap(), 1024);
+    assert_eq!(calc_encrypted_size(1, aes).unwrap(), 1024);
+    assert_eq!(calc_encrypted_size(1020, aes).unwrap(), 2048);
+
+    assert_eq!(calc_encompassing_blocks(0, 11, 10), (0, 2));
+    assert_eq!(
+        calc_encompassing_blocks(1, ENCRYPTION_BLOCK_SIZE as i64, ENCRYPTION_BLOCK_SIZE),
+        (0, 2)
+    );
 }

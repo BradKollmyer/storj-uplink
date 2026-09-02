@@ -1,7 +1,4 @@
-//! Cipher suites and one-shot encrypt/decrypt (AES-256-GCM, EncNull).
-
-use aes_gcm::aead::{Aead, KeyInit};
-use aes_gcm::{Aes256Gcm, Nonce};
+//! Cipher suites and one-shot encrypt/decrypt (AES-256-GCM, Secretbox, EncNull).
 
 use crate::error::{Error, ErrorKind, Result};
 use crate::key::Key;
@@ -24,7 +21,7 @@ impl CipherSuite {
     pub const NULL: Self = Self(1);
     /// AES-256-GCM (`ENC_AESGCM`). Default path cipher.
     pub const AES_GCM: Self = Self(2);
-    /// NaCl secretbox (`ENC_SECRETBOX`). Content cipher; path support is later.
+    /// NaCl secretbox (`ENC_SECRETBOX`). Content cipher (legacy objects).
     pub const SECRET_BOX: Self = Self(3);
     /// Encryption-bypass listing mode (`ENC_NULL_BASE64URL`).
     pub const NULL_BASE64_URL: Self = Self(4);
@@ -40,14 +37,11 @@ pub fn encrypt(data: &[u8], cipher: CipherSuite, key: &Key, nonce: &[u8]) -> Res
     }
     match cipher {
         CipherSuite::NULL => Ok(data.to_vec()),
-        CipherSuite::AES_GCM => encrypt_aes_gcm(data, key, nonce),
+        CipherSuite::AES_GCM => crate::aesgcm::encrypt(data, key, nonce),
+        CipherSuite::SECRET_BOX => crate::secretbox::encrypt(data, key, nonce),
         CipherSuite::NULL_BASE64_URL => Err(Error::new(
             ErrorKind::InvalidConfig,
             "base64 encoding not supported for this operation",
-        )),
-        CipherSuite::SECRET_BOX => Err(Error::new(
-            ErrorKind::InvalidConfig,
-            format!("encryption type {} is not supported", cipher.0),
         )),
         other => Err(Error::new(
             ErrorKind::InvalidConfig,
@@ -70,41 +64,17 @@ pub fn decrypt(
     }
     match cipher {
         CipherSuite::NULL => Ok(cipher_data.to_vec()),
-        CipherSuite::AES_GCM => decrypt_aes_gcm(cipher_data, key, nonce),
+        CipherSuite::AES_GCM => crate::aesgcm::decrypt(cipher_data, key, nonce),
+        CipherSuite::SECRET_BOX => crate::secretbox::decrypt(cipher_data, key, nonce),
         CipherSuite::NULL_BASE64_URL => Err(Error::new(
             ErrorKind::InvalidConfig,
             "base64 encoding not supported for this operation",
-        )),
-        CipherSuite::SECRET_BOX => Err(Error::new(
-            ErrorKind::InvalidConfig,
-            format!("encryption type {} is not supported", cipher.0),
         )),
         other => Err(Error::new(
             ErrorKind::InvalidConfig,
             format!("encryption type {} is not supported", other.0),
         )),
     }
-}
-
-fn aes_gcm_nonce(nonce: &[u8]) -> Result<[u8; AES_GCM_NONCE_SIZE]> {
-    nonce
-        .get(..AES_GCM_NONCE_SIZE)
-        .and_then(|s| s.try_into().ok())
-        .ok_or_else(|| Error::new(ErrorKind::InvalidConfig, "AES-GCM nonce too short"))
-}
-
-fn encrypt_aes_gcm(data: &[u8], key: &Key, nonce: &[u8]) -> Result<Vec<u8>> {
-    let gcm = Aes256Gcm::new_from_slice(key.as_bytes()).expect("AES-256-GCM accepts 32-byte keys");
-    let nonce = aes_gcm_nonce(nonce)?;
-    gcm.encrypt(Nonce::from_slice(&nonce), data)
-        .map_err(|e| Error::new(ErrorKind::Protocol, format!("aes-gcm encrypt: {e}")))
-}
-
-fn decrypt_aes_gcm(cipher_data: &[u8], key: &Key, nonce: &[u8]) -> Result<Vec<u8>> {
-    let gcm = Aes256Gcm::new_from_slice(key.as_bytes()).expect("AES-256-GCM accepts 32-byte keys");
-    let nonce = aes_gcm_nonce(nonce)?;
-    gcm.decrypt(Nonce::from_slice(&nonce), cipher_data)
-        .map_err(|_| Error::new(ErrorKind::DecryptionFailed, "aes-gcm decrypt"))
 }
 
 #[cfg(test)]
@@ -161,6 +131,17 @@ mod tests {
             decrypt(&ct, CipherSuite::NULL, &key, &nonce).unwrap(),
             b"plain"
         );
+    }
+
+    #[test]
+    fn secretbox_roundtrip() {
+        let key = Key::from_bytes([7u8; 32]);
+        let nonce = [2u8; 24];
+        let ct = encrypt(b"hello", CipherSuite::SECRET_BOX, &key, &nonce).unwrap();
+        assert_ne!(ct, b"hello");
+        assert_eq!(ct.len(), b"hello".len() + 16);
+        let pt = decrypt(&ct, CipherSuite::SECRET_BOX, &key, &nonce).unwrap();
+        assert_eq!(pt, b"hello");
     }
 
     #[test]
