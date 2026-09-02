@@ -15,7 +15,8 @@ storj-access = { path = "crates/storj-access" }
 storj-proto = { path = "crates/storj-proto" }
 storj-rpc = { path = "crates/storj-rpc" }
 storj-test = { path = "crates/storj-test" }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "time"] }
+storj-uplink = { path = "crates/storj-uplink" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "time", "sync"] }
 bytes = "1"
 prost = "0.13"
 prost-types = "0.13"
@@ -25,6 +26,9 @@ zeroize = { version = "1", features = ["derive"] }
 argon2 = "0.5"
 hmac = "0.12"
 sha2 = "0.10"
+blake3 = "1"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand = "0.8"
 futures-core = "0.3"
 futures-util = "0.3"
 hex = "0.4"
