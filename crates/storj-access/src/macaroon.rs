@@ -924,6 +924,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "SystemTime has 100 ns resolution on Windows; the Go golden uses 1 ns nanos"
+    )]
     fn restrict_timed_matches_go() {
         let cav = Caveat {
             disallow_writes: true,
