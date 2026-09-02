@@ -518,6 +518,11 @@ impl Permission {
             ..Self::default()
         }
     }
+
+    /// True when every field is the zero value (Go `permission == (Permission{})`).
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 struct Packet<'a> {

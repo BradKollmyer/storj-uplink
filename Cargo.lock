@@ -390,10 +390,12 @@ name = "storj-access"
 version = "0.1.0"
 dependencies = [
  "bs58",
+ "getrandom",
  "hex",
  "hmac",
  "prost",
  "sha2",
+ "storj-encryption",
 ]
 
 [[package]]

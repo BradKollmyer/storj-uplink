@@ -1,4 +1,4 @@
-//! Access grants. Parse/serialize of the protobuf Scope; share lands in a later PR.
+//! Access grants: parse, serialize, share (restrict), and encryption-key override.
 
 use std::sync::Arc;
 
@@ -52,9 +52,31 @@ impl Access {
 
     /// Restrict permissions and (optionally) path prefixes.
     /// Intersection with existing caveats; cannot widen.
+    ///
+    /// `allow_lock` is mapped onto the granular Object Lock bits (Go v1.14
+    /// `Share`); the deprecated coarse lock flag is not granted.
     pub fn share(&self, permission: Permission, prefixes: &[SharePrefix]) -> Result<Self> {
-        let _ = (permission, prefixes);
-        Err(Error::not_implemented("Access::share"))
+        let mut grant_perm = to_grant_permission(&permission);
+        if permission.allow_lock {
+            grant_perm.allow_put_object_retention = true;
+            grant_perm.allow_get_object_retention = true;
+            grant_perm.allow_put_bucket_object_lock_configuration = true;
+            grant_perm.allow_get_bucket_object_lock_configuration = true;
+        }
+        let prefixes: Vec<storj_access::SharePrefix> = prefixes
+            .iter()
+            .map(|p| storj_access::SharePrefix {
+                bucket: p.bucket.clone(),
+                prefix: p.prefix.clone(),
+            })
+            .collect();
+        let grant = self
+            .inner
+            .restrict(&grant_perm, &prefixes)
+            .map_err(map_grant_err)?;
+        Ok(Self {
+            inner: Arc::new(grant),
+        })
     }
 
     /// Multitenancy: replace the encryption key for `bucket/prefix/`.
@@ -65,9 +87,11 @@ impl Access {
         prefix: &str,
         key: &EncryptionKey,
     ) -> Result<()> {
-        let _ = (bucket, key);
         require_encryption_prefix(prefix)?;
-        Err(Error::not_implemented("Access::override_encryption_key"))
+        let grant = Arc::make_mut(&mut self.inner);
+        grant
+            .override_encryption_key(bucket, prefix, key.as_bytes())
+            .map_err(map_grant_err)
     }
 
     /// CPU-heavy (Argon2id t=1, m=64MiB, **p=8**). Talks to satellite `ProjectInfo`.
@@ -102,10 +126,37 @@ impl Access {
             inner: Arc::new(storj_access::Grant::from_parts(
                 satellite_address.into(),
                 Vec::new(),
-                storj_access::EncryptionAccess::default(),
+                storj_access::EncryptionAccess {
+                    default_key: Some([1u8; 32]),
+                    ..Default::default()
+                },
             )),
         }
     }
+}
+
+fn to_grant_permission(p: &Permission) -> storj_access::Permission {
+    storj_access::Permission {
+        allow_download: p.allow_download,
+        allow_upload: p.allow_upload,
+        allow_list: p.allow_list,
+        allow_delete: p.allow_delete,
+        allow_lock: false,
+        allow_put_object_retention: p.allow_put_object_retention,
+        allow_get_object_retention: p.allow_get_object_retention,
+        allow_put_object_legal_hold: p.allow_put_object_legal_hold,
+        allow_get_object_legal_hold: p.allow_get_object_legal_hold,
+        allow_bypass_governance_retention: p.allow_bypass_governance_retention,
+        allow_put_bucket_object_lock_configuration: p.allow_put_bucket_object_lock_configuration,
+        allow_get_bucket_object_lock_configuration: p.allow_get_bucket_object_lock_configuration,
+        not_before: p.not_before,
+        not_after: p.not_after,
+        max_object_ttl: p.max_object_ttl,
+    }
+}
+
+fn map_grant_err(e: storj_access::Error) -> Error {
+    Error::new(ErrorKind::InvalidGrant, e.message().to_owned()).with_source(e)
 }
 
 /// Unencrypted share prefix. Encryption info is derived up to the last `/`.
@@ -244,10 +295,9 @@ mod tests {
             .unwrap_err();
         assert_eq!(e.kind(), ErrorKind::ObjectKeyInvalid);
 
-        let e = access
+        access
             .override_encryption_key("app", "user1/", &key)
-            .unwrap_err();
-        assert_eq!(e.kind(), ErrorKind::Protocol); // slash ok; impl pending
+            .expect("trailing slash is sufficient");
     }
 
     #[test]
