@@ -324,8 +324,31 @@ async fn serve_download(
             ));
         }
     }
-    let mut limit = None;
+    let mut limit: Option<OrderLimit> = None;
     let mut chunk = None;
+    // Bytes the uplink has signed orders for so far (cumulative, like a
+    // real node: it never sends beyond this and waits for a larger order).
+    let mut allocated: i64 = 0;
+    let take_order = |req_order: Option<storj_proto::orders::Order>,
+                      limit: &Option<OrderLimit>,
+                      allocated: &mut i64|
+     -> Result<(), storj_uplink::Error> {
+        if let Some(order) = req_order {
+            let l = limit
+                .as_ref()
+                .ok_or_else(|| storj_uplink::Error::protocol("order before limit"))?;
+            let pk = PiecePublicKey::from_bytes(&l.uplink_public_key)?;
+            verify_order(&order, &pk)?;
+            if order.serial_number != l.serial_number {
+                return Err(storj_uplink::Error::protocol("order serial mismatch"));
+            }
+            if order.amount > l.limit {
+                return Err(storj_uplink::Error::protocol("order exceeds limit"));
+            }
+            *allocated = (*allocated).max(order.amount);
+        }
+        Ok(())
+    };
     loop {
         let pkt = conn.read_packet().await?;
         if pkt.stream_id != stream_id {
@@ -338,6 +361,7 @@ async fn serve_download(
                     verify_order_limit(&l, satellite_cert)?;
                     limit = Some(l);
                 }
+                take_order(req.order, &limit, &mut allocated)?;
                 if let Some(c) = req.chunk {
                     chunk = Some(c);
                 }
@@ -364,26 +388,51 @@ async fn serve_download(
     const CHUNK: usize = 16 * 1024;
     let mut off = start as i64;
     let mut message_id = 0u64;
-    for part in slice.chunks(CHUNK) {
-        message_id += 1;
-        let resp = PieceDownloadResponse {
-            chunk: Some(piece_download_response::Chunk {
-                offset: off,
-                data: part.to_vec(),
-            }),
-            hash: None,
-            limit: None,
-            restored_from_trash: false,
-        };
-        conn.write_packet(&Packet {
-            stream_id,
-            message_id,
-            kind: Kind::MESSAGE,
-            control: false,
-            data: resp.encode_to_vec(),
-        })
-        .await?;
-        off += part.len() as i64;
+    let mut sent = 0usize;
+    let limit_for_orders = Some(limit.clone());
+    loop {
+        // Send everything currently allocated.
+        while sent < slice.len() && (sent as i64) < allocated {
+            let room = usize::try_from(allocated - sent as i64).unwrap_or(usize::MAX);
+            let n = CHUNK.min(slice.len() - sent).min(room);
+            let part = &slice[sent..sent + n];
+            message_id += 1;
+            let resp = PieceDownloadResponse {
+                chunk: Some(piece_download_response::Chunk {
+                    offset: off,
+                    data: part.to_vec(),
+                }),
+                hash: None,
+                limit: None,
+                restored_from_trash: false,
+            };
+            conn.write_packet(&Packet {
+                stream_id,
+                message_id,
+                kind: Kind::MESSAGE,
+                control: false,
+                data: resp.encode_to_vec(),
+            })
+            .await?;
+            off += part.len() as i64;
+            sent += n;
+        }
+        if sent >= slice.len() {
+            break;
+        }
+        // Out of allocation: wait for a larger order (or the client giving up).
+        let pkt = conn.read_packet().await?;
+        if pkt.stream_id != stream_id {
+            continue;
+        }
+        match pkt.kind {
+            Kind::MESSAGE => {
+                let req = PieceDownloadRequest::decode(pkt.data.as_slice())?;
+                take_order(req.order, &limit_for_orders, &mut allocated)?;
+            }
+            Kind::CLOSE_SEND | Kind::CLOSE => break,
+            _ => {}
+        }
     }
     message_id += 1;
     conn.write_packet(&Packet {

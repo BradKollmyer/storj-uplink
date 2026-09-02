@@ -268,9 +268,15 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Client<T> {
         offset: i64,
         size: i64,
     ) -> Result<Vec<u8>> {
+        // Like Go `piecestore.Download`: allocate (sign orders for) the piece
+        // in growing steps as data arrives instead of ordering the whole
+        // range up front, so a piece that is cancelled by the long tail is
+        // only settled for what was actually read.
+        let mut step = self.config.initial_step.max(1);
+        let mut allocated = size.min(step);
         let req = PieceDownloadRequest {
             limit: Some(limit.clone()),
-            order: Some(signed_order(limit, piece_key, size)?),
+            order: Some(signed_order(limit, piece_key, allocated)?),
             chunk: Some(piece_download_request::Chunk {
                 offset,
                 chunk_size: size,
@@ -279,8 +285,20 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Client<T> {
         };
         self.conn.send_msg(stream, &req.encode_to_vec()).await?;
 
-        let mut out = Vec::new();
+        let mut out = Vec::with_capacity(usize::try_from(size).unwrap_or(0));
         while (out.len() as i64) < size {
+            // Top up before the node runs out of allocation (it stops sending
+            // at `allocated` and waits for a larger order).
+            let received = out.len() as i64;
+            if allocated < size && allocated - received <= step / 2 {
+                step = next_order_step(step, self.config.maximum_step);
+                allocated = allocated.saturating_add(step).min(size);
+                let more = PieceDownloadRequest {
+                    order: Some(signed_order(limit, piece_key, allocated)?),
+                    ..Default::default()
+                };
+                self.conn.send_msg(stream, &more.encode_to_vec()).await?;
+            }
             match self.conn.recv_msg_opt(stream).await? {
                 Some(bytes) => {
                     let resp = PieceDownloadResponse::decode(bytes.as_slice())?;
