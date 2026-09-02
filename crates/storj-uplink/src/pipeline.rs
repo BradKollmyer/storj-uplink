@@ -246,6 +246,7 @@ pub fn encrypt_user_data(
     custom: &[(String, String)],
     segment_size: i64,
     last_segment_size: i64,
+    number_of_segments: i64,
     cipher: CipherSuite,
     derived_content_key: &Key,
     encryption_block_size: usize,
@@ -281,7 +282,7 @@ pub fn encrypt_user_data(
         encrypted_stream_info,
         encryption_type: cipher.0,
         encryption_block_size: i32::try_from(block).unwrap_or(i32::MAX),
-        number_of_segments: 1,
+        number_of_segments,
     }
     .encode_to_vec();
     let encrypted_etag = encrypt(&[], cipher, &metadata_key, &{
@@ -399,7 +400,7 @@ mod tests {
     fn stream_meta_block_size_is_encrypted_block() {
         let key = Key::from_bytes([9u8; 32]);
         let user =
-            encrypt_user_data(&[], 64 * 1024 * 1024, 11, CipherSuite::AES_GCM, &key, 0).unwrap();
+            encrypt_user_data(&[], 64 * 1024 * 1024, 11, 1, CipherSuite::AES_GCM, &key, 0).unwrap();
         let meta = StreamMeta::decode(user.encrypted_metadata.as_slice()).unwrap();
         assert_eq!(
             meta.encryption_block_size,
@@ -410,6 +411,7 @@ mod tests {
             &[],
             64 * 1024 * 1024,
             11,
+            1,
             CipherSuite::AES_GCM,
             &key,
             DEFAULT_ENCRYPTED_BLOCK_SIZE,
@@ -426,6 +428,7 @@ mod tests {
             &[("app:title".into(), "hi".into())],
             64 * 1024 * 1024,
             11,
+            1,
             CipherSuite::AES_GCM,
             &key,
             0,
@@ -454,6 +457,17 @@ mod tests {
             )
             .is_err()
         );
+        let user =
+            encrypt_user_data(&[], 64 * 1024 * 1024, 1, 2, CipherSuite::AES_GCM, &key, 0).unwrap();
+        let (meta, _) = decrypt_user_data(
+            &user.encrypted_metadata,
+            &user.encrypted_metadata_encrypted_key,
+            &user.encrypted_metadata_nonce,
+            CipherSuite::AES_GCM,
+            &key,
+        )
+        .unwrap();
+        assert_eq!(meta.number_of_segments, 2);
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! Piecestore client, order-limit verify, SN pool, and single-segment upload/download.
+//! Piecestore client, order-limit verify, SN pool, and segment upload/download.
 
 #![deny(clippy::undocumented_unsafe_blocks)]
 

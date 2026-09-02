@@ -14,10 +14,10 @@ use tokio_rustls::client::TlsStream;
 use storj_proto::metainfo::{
     self, BatchRequest, BatchRequestItem, BeginDeleteObjectRequest, BeginObjectRequest,
     BeginSegmentRequest, CommitObjectRequest, CommitSegmentRequest, CompressedBatchResponse,
-    CreateBucketRequest, DeleteBucketRequest, DownloadObjectRequest, FinishDeleteObjectRequest,
-    GetBucketRequest, ListBucketsRequest, MakeInlineSegmentRequest, ProjectInfoRequest,
-    ProjectInfoResponse, Range, RequestHeader, RetryBeginSegmentPiecesRequest, SegmentPosition,
-    batch_request_item, batch_response_item,
+    CreateBucketRequest, DeleteBucketRequest, DownloadObjectRequest, DownloadSegmentRequest,
+    FinishDeleteObjectRequest, GetBucketRequest, ListBucketsRequest, ListSegmentsRequest,
+    MakeInlineSegmentRequest, ProjectInfoRequest, ProjectInfoResponse, Range, RequestHeader,
+    RetryBeginSegmentPiecesRequest, SegmentPosition, batch_request_item, batch_response_item,
 };
 use storj_proto::rpc;
 use storj_rpc::tls::client_config;
@@ -510,7 +510,7 @@ impl MetainfoClient {
             bucket: bucket.as_bytes().to_vec(),
             encrypted_object_key,
             range,
-            limit: 1,
+            limit: 0,
             ..Default::default()
         };
         let items = self
@@ -527,6 +527,69 @@ impl MetainfoClient {
             _ => Err(Error::new(
                 ErrorKind::Protocol,
                 "unexpected DownloadObject response",
+            )),
+        }
+    }
+
+    pub(crate) async fn download_segment(
+        &self,
+        bucket: &str,
+        key: &str,
+        stream_id: Vec<u8>,
+        position: SegmentPosition,
+    ) -> Result<metainfo::DownloadSegmentResponse> {
+        let req = DownloadSegmentRequest {
+            header: Some(self.header()),
+            stream_id,
+            cursor_position: Some(position),
+            ..Default::default()
+        };
+        let items = self
+            .compressed_batch(
+                vec![BatchRequestItem {
+                    request: Some(batch_request_item::Request::SegmentDownload(req)),
+                }],
+                bucket,
+                key,
+            )
+            .await?;
+        match Self::expect_one(items, "DownloadSegment")? {
+            batch_response_item::Response::SegmentDownload(r) => Ok(r),
+            _ => Err(Error::new(
+                ErrorKind::Protocol,
+                "unexpected DownloadSegment response",
+            )),
+        }
+    }
+
+    pub(crate) async fn list_segments(
+        &self,
+        bucket: &str,
+        key: &str,
+        stream_id: Vec<u8>,
+        cursor: Option<SegmentPosition>,
+    ) -> Result<metainfo::ListSegmentsResponse> {
+        let req = ListSegmentsRequest {
+            header: Some(self.header()),
+            stream_id,
+            cursor_position: cursor,
+            limit: 0,
+            range: None,
+        };
+        let items = self
+            .compressed_batch(
+                vec![BatchRequestItem {
+                    request: Some(batch_request_item::Request::SegmentList(req)),
+                }],
+                bucket,
+                key,
+            )
+            .await?;
+        match Self::expect_one(items, "ListSegments")? {
+            batch_response_item::Response::SegmentList(r) => Ok(r),
+            _ => Err(Error::new(
+                ErrorKind::Protocol,
+                "unexpected ListSegments response",
             )),
         }
     }

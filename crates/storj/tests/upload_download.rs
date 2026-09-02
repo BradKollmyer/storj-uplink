@@ -253,12 +253,95 @@ async fn shutdown_does_not_commit() {
     assert_eq!(mock.committed_count(), 1);
 }
 
-#[tokio::test]
-#[ignore = "PR 22: multi-segment 64MiB+1"]
+fn pattern_byte(i: usize) -> u8 {
+    (i % 251) as u8
+}
+
+async fn write_pattern(upload: &mut storj::Upload, size: usize) {
+    let mut pos = 0usize;
+    let mut buf = vec![0u8; 64 * 1024];
+    while pos < size {
+        let n = (size - pos).min(buf.len());
+        for (i, b) in buf[..n].iter_mut().enumerate() {
+            *b = pattern_byte(pos + i);
+        }
+        upload.write_all(&buf[..n]).await.unwrap();
+        pos += n;
+    }
+}
+
+fn assert_pattern(got: &[u8], offset: usize) {
+    assert!(
+        got.iter()
+            .enumerate()
+            .all(|(i, b)| *b == pattern_byte(offset + i)),
+        "pattern mismatch"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn multi_segment_round_trip() {
-    let size = INTEROP_SIZES[5];
-    assert_eq!(size_label(size), "64MiB+1");
-    panic!("needs multi-segment pipeline");
+    let size = INTEROP_SIZES[5] as usize;
+    assert_eq!(size_label(size as u64), "64MiB+1");
+
+    let mock = MockSatellite::start().await;
+    let project = open_project(&mock).await;
+    let bucket = unique("ms");
+    project.ensure_bucket(&bucket).await.unwrap();
+
+    let mut upload = project
+        .upload_object(&bucket, "big.bin", Default::default())
+        .await
+        .unwrap();
+    write_pattern(&mut upload, size).await;
+    let obj = upload.commit().await.expect("commit 64MiB+1");
+    assert_eq!(obj.system.content_length, size as i64);
+    assert!(mock.remote_segment_count() >= 1);
+    assert_eq!(mock.inline_segment_count() + mock.remote_segment_count(), 2);
+
+    let mut download = project
+        .download_object(&bucket, "big.bin", Default::default())
+        .await
+        .expect("full download");
+    assert_eq!(download.info().system.content_length, size as i64);
+    let mut got = Vec::new();
+    download.read_to_end(&mut got).await.unwrap();
+    assert_eq!(got.len(), size);
+    assert_pattern(&got, 0);
+    drop(got);
+
+    let span_off = MAX_SEGMENT_SIZE as i64 - 16;
+    let mut spanned = project
+        .download_object(
+            &bucket,
+            "big.bin",
+            DownloadOptions {
+                offset: span_off,
+                length: 17,
+            },
+        )
+        .await
+        .expect("spanning range");
+    let mut slice = Vec::new();
+    spanned.read_to_end(&mut slice).await.unwrap();
+    assert_eq!(slice.len(), 17);
+    assert_pattern(&slice, span_off as usize);
+
+    let mut suffix = project
+        .download_object(
+            &bucket,
+            "big.bin",
+            DownloadOptions {
+                offset: -8,
+                length: -1,
+            },
+        )
+        .await
+        .expect("suffix range");
+    let mut tail = Vec::new();
+    suffix.read_to_end(&mut tail).await.unwrap();
+    assert_eq!(tail.len(), 8);
+    assert_pattern(&tail, size - 8);
 }
 
 #[tokio::test]
@@ -389,22 +472,22 @@ async fn abort_uncommitted() {
     assert!(mock.aborted_count() >= 1);
 }
 
-#[tokio::test]
-async fn write_beyond_one_segment_fails() {
+#[tokio::test(flavor = "multi_thread")]
+async fn write_beyond_one_segment_is_two_segments() {
     let mock = MockSatellite::start().await;
     let project = open_project(&mock).await;
     let bucket = unique("big");
     project.ensure_bucket(&bucket).await.unwrap();
     let mut upload = project
-        .upload_object(&bucket, "too-big", Default::default())
+        .upload_object(&bucket, "two-seg", Default::default())
         .await
         .unwrap();
-    let data = vec![0u8; MAX_SEGMENT_SIZE as usize + 1];
-    let err = upload.write_all(&data).await.unwrap_err();
-    assert!(err.to_string().contains("64MiB") || err.to_string().contains("single-segment"));
-    drop(upload);
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    assert_eq!(mock.committed_count(), 0);
+    write_pattern(&mut upload, MAX_SEGMENT_SIZE as usize + 1).await;
+    let obj = upload.commit().await.expect("64MiB+1 commit");
+    assert_eq!(obj.system.content_length, MAX_SEGMENT_SIZE as i64 + 1);
+    assert!(mock.remote_segment_count() >= 1);
+    assert_eq!(mock.inline_segment_count() + mock.remote_segment_count(), 2);
+    assert_eq!(mock.committed_count(), 1);
 }
 
 #[tokio::test]

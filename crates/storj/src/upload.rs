@@ -27,6 +27,40 @@ pub(crate) struct UploadInner {
     pub(crate) block_size: usize,
     pub(crate) custom: CustomMetadata,
     pub(crate) plaintext: Vec<u8>,
+    pub(crate) next_segment: i32,
+    pub(crate) total_plain: i64,
+    pub(crate) last_segment_plain: i64,
+    pub(crate) pending_flush: Option<tokio::task::JoinHandle<Result<FlushedSegment>>>,
+}
+
+pub(crate) struct FlushedSegment {
+    pub(crate) index: i32,
+    pub(crate) plain_size: i64,
+}
+
+impl UploadInner {
+    pub(crate) fn apply_flush(&mut self, flushed: FlushedSegment) {
+        self.next_segment = self.next_segment.max(flushed.index + 1);
+        self.total_plain += flushed.plain_size;
+        self.last_segment_plain = flushed.plain_size;
+    }
+
+    pub(crate) fn poll_pending_flush(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        let Some(mut handle) = self.pending_flush.take() else {
+            return Poll::Ready(Ok(()));
+        };
+        match Pin::new(&mut handle).poll(cx) {
+            Poll::Pending => {
+                self.pending_flush = Some(handle);
+                Poll::Pending
+            }
+            Poll::Ready(join) => {
+                let flushed = join?;
+                self.apply_flush(flushed?);
+                Poll::Ready(Ok(()))
+            }
+        }
+    }
 }
 
 impl Upload {
@@ -85,11 +119,14 @@ impl Upload {
 
 impl Drop for Upload {
     fn drop(&mut self) {
-        let Some(inner) = self.lock_inner().take() else {
+        let Some(mut inner) = self.lock_inner().take() else {
             return;
         };
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move {
+        if let Some(handle) = inner.pending_flush.take() {
+            handle.abort();
+        }
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            rt.spawn(async move {
                 let _ = crate::project::abort_upload(inner).await;
             });
         }
@@ -99,7 +136,7 @@ impl Drop for Upload {
 impl AsyncWrite for Upload {
     fn poll_write(
         self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
+        cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
         let mut g = self.lock_inner();
@@ -111,28 +148,43 @@ impl AsyncWrite for Upload {
             .into()));
         };
         let max = crate::constants::MAX_SEGMENT_SIZE as usize;
-        if inner.plaintext.len() >= max {
-            return Poll::Ready(Err(Error::new(
-                ErrorKind::Protocol,
-                "single-segment upload exceeds 64MiB",
-            )
-            .into()));
+        loop {
+            match inner.poll_pending_flush(cx) {
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e.into())),
+                Poll::Pending if inner.plaintext.len() >= max => return Poll::Pending,
+                Poll::Pending | Poll::Ready(Ok(())) => {}
+            }
+            if inner.plaintext.len() >= max && inner.pending_flush.is_none() {
+                crate::project::spawn_flush_segment(inner);
+                continue;
+            }
+            let room = max.saturating_sub(inner.plaintext.len());
+            if room == 0 {
+                return Poll::Pending;
+            }
+            let n = buf.len().min(room);
+            inner.plaintext.extend_from_slice(&buf[..n]);
+            if inner.plaintext.len() >= max && inner.pending_flush.is_none() {
+                crate::project::spawn_flush_segment(inner);
+            }
+            return Poll::Ready(Ok(n));
         }
-        let room = max - inner.plaintext.len();
-        let n = buf.len().min(room);
-        inner.plaintext.extend_from_slice(&buf[..n]);
-        Poll::Ready(Ok(n))
     }
 
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        if self.lock_inner().is_none() {
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let mut g = self.lock_inner();
+        let Some(inner) = g.as_mut() else {
             return Poll::Ready(Err(Error::new(
                 ErrorKind::UploadDone,
                 "upload done: already committed or aborted",
             )
             .into()));
+        };
+        match inner.poll_pending_flush(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e.into())),
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
         }
-        Poll::Ready(Ok(()))
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {

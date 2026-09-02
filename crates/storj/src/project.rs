@@ -17,7 +17,7 @@ use crate::types::{
     DownloadOptions, ListObjectsOptions, ListUploadPartsOptions, ListUploadsOptions, Object,
     Retention, SetObjectRetentionOptions, SystemMetadata, UploadInfo, UploadOptions,
 };
-use crate::upload::{Download, PartUpload, Upload, UploadInner};
+use crate::upload::{Download, FlushedSegment, PartUpload, Upload, UploadInner};
 
 /// Stream of buckets.
 pub type BucketStream = Pin<Box<dyn Stream<Item = Result<Bucket>> + Send>>;
@@ -125,6 +125,10 @@ impl Project {
                 block_size,
                 custom: CustomMetadata::new(),
                 plaintext: Vec::new(),
+                next_segment: 0,
+                total_plain: 0,
+                last_segment_plain: 0,
+                pending_flush: None,
             },
         ))
     }
@@ -150,7 +154,7 @@ impl Project {
             .metainfo
             .download_object(bucket, key, enc_path, range)
             .await?;
-        download_single_segment(&self.inner, key, content_key, opts, resp).await
+        download_segments(&self.inner, bucket, key, content_key, opts, resp).await
     }
 
     /// Object metadata.
@@ -464,36 +468,24 @@ fn map_uplink(e: storj_uplink::Error) -> Error {
     }
 }
 
-async fn download_single_segment(
+async fn download_segments(
     project: &ProjectInner,
+    bucket: &str,
     key: &str,
     content_key: storj_encryption::Key,
     opts: DownloadOptions,
     resp: storj_proto::metainfo::DownloadObjectResponse,
 ) -> Result<Download> {
-    use storj_uplink::download::{
-        LongTailDownload, RemoteDecrypt, decode_encrypted, decrypt_inline, decrypt_remote,
-        download_pieces_long_tail, piece_byte_range, resolve_range,
-    };
-    use storj_uplink::orders::PiecePrivateKey;
-    use storj_uplink::pipeline::{
-        Redundancy, content_nonce, decrypt_key, decrypt_user_data, nonce_from_slice,
-    };
-    use storj_uplink::segment::PieceAssignment;
+    use storj_proto::metainfo::SegmentPosition;
+    use storj_uplink::download::{resolve_range, segment_plain_range};
+    use storj_uplink::pipeline::decrypt_user_data;
 
-    if resp.segment_download.len() > 1 || resp.segment_list.as_ref().is_some_and(|l| l.more) {
-        return Err(Error::new(
-            ErrorKind::Protocol,
-            "multi-segment objects are not supported",
-        ));
-    }
+    let stream_id = resp
+        .object
+        .as_ref()
+        .map(|o| o.stream_id.clone())
+        .unwrap_or_default();
     let mut info = object_from_proto(resp.object.clone(), key);
-    let seg = resp.segment_download.into_iter().next();
-    if let Some(s) = seg.as_ref() {
-        if s.plain_size > 0 {
-            info.system.content_length = s.plain_size;
-        }
-    }
     let (mut cipher, mut block_size) = encryption_from_params(
         resp.object
             .as_ref()
@@ -509,12 +501,6 @@ async fn download_single_segment(
                 &content_key,
             )
             .map_err(map_uplink)?;
-            if meta.number_of_segments > 1 {
-                return Err(Error::new(
-                    ErrorKind::Protocol,
-                    "multi-segment objects are not supported",
-                ));
-            }
             if meta.encryption_type != 0 {
                 cipher = storj_encryption::CipherSuite(meta.encryption_type);
             }
@@ -527,78 +513,175 @@ async fn download_single_segment(
         }
     }
 
+    let mut list = resp.segment_list.unwrap_or_default();
+    let mut downloaded = resp.segment_download;
+    while list.more {
+        let cursor = list
+            .items
+            .last()
+            .and_then(|i| i.position)
+            .map(|p| SegmentPosition {
+                part_number: p.part_number,
+                index: p.index + 1,
+            });
+        let page = project
+            .metainfo
+            .list_segments(bucket, key, stream_id.clone(), cursor)
+            .await?;
+        if page.items.is_empty() {
+            break;
+        }
+        list.more = page.more;
+        list.items.extend(page.items);
+    }
+    if info.system.content_length <= 0 {
+        let listed: i64 = list.items.iter().map(|i| i.plain_size).sum();
+        if listed > 0 {
+            info.system.content_length = listed;
+        } else {
+            info.system.content_length = downloaded.iter().map(|s| s.plain_size).sum();
+        }
+    }
+
     let object_size = info.system.content_length;
     let (plain_start, plain_len) =
         resolve_range(opts.offset, opts.length, object_size).map_err(map_uplink)?;
     if plain_len == 0 {
         return Ok(Download::new(info, Vec::new()));
     }
-    let seg =
-        seg.ok_or_else(|| Error::new(ErrorKind::Protocol, "DownloadObject missing segment"))?;
+
+    let have: std::collections::HashSet<(i32, i32)> = downloaded
+        .iter()
+        .filter_map(|s| s.position.map(|p| (p.part_number, p.index)))
+        .collect();
+    for item in &list.items {
+        let pos = item.position.unwrap_or_default();
+        let (_local_start, local_len) =
+            segment_plain_range(plain_start, plain_len, item.plain_offset, item.plain_size);
+        if local_len == 0 || have.contains(&(pos.part_number, pos.index)) {
+            continue;
+        }
+        downloaded.push(
+            project
+                .metainfo
+                .download_segment(bucket, key, stream_id.clone(), pos)
+                .await?,
+        );
+    }
+    if downloaded.is_empty() {
+        return Err(Error::new(
+            ErrorKind::Protocol,
+            "DownloadObject missing segment",
+        ));
+    }
+    downloaded.sort_by_key(|s| {
+        s.position
+            .map(|p| (p.part_number, p.index))
+            .unwrap_or_default()
+    });
+
+    let mut plaintext = Vec::new();
+    for seg in downloaded {
+        plaintext.extend(
+            decrypt_one_segment(
+                project,
+                &content_key,
+                cipher,
+                block_size,
+                plain_start,
+                plain_len,
+                seg,
+            )
+            .await?,
+        );
+    }
+    Ok(Download::new(info, plaintext))
+}
+
+async fn decrypt_one_segment(
+    project: &ProjectInner,
+    content_key: &storj_encryption::Key,
+    cipher: storj_encryption::CipherSuite,
+    block_size: usize,
+    object_start: i64,
+    object_len: i64,
+    seg: storj_proto::metainfo::DownloadSegmentResponse,
+) -> Result<Vec<u8>> {
+    use storj_uplink::download::{
+        LongTailDownload, RemoteDecrypt, decode_encrypted, decrypt_inline, decrypt_remote,
+        download_pieces_long_tail, piece_byte_range, segment_plain_range,
+    };
+    use storj_uplink::orders::PiecePrivateKey;
+    use storj_uplink::pipeline::{Redundancy, content_nonce, decrypt_key, nonce_from_slice};
+    use storj_uplink::segment::PieceAssignment;
+
+    let (local_start, local_len) =
+        segment_plain_range(object_start, object_len, seg.plain_offset, seg.plain_size);
+    if local_len == 0 {
+        return Ok(Vec::new());
+    }
     let position = seg.position.unwrap_or_default();
     let nonce = content_nonce(position.part_number, position.index);
     let enc_nonce = nonce_from_slice(&seg.encrypted_key_nonce).map_err(map_uplink)?;
     let segment_key =
-        decrypt_key(&seg.encrypted_key, cipher, &content_key, &enc_nonce).map_err(map_uplink)?;
+        decrypt_key(&seg.encrypted_key, cipher, content_key, &enc_nonce).map_err(map_uplink)?;
 
-    let plaintext = if !seg.encrypted_inline_data.is_empty() || seg.addressed_limits.is_empty() {
+    if !seg.encrypted_inline_data.is_empty() || seg.addressed_limits.is_empty() {
         let full = decrypt_inline(&seg.encrypted_inline_data, cipher, &segment_key, &nonce)
             .map_err(map_uplink)?;
-        slice_plain(&full, plain_start, plain_len)
-    } else {
-        let scheme = seg.redundancy_scheme.as_ref().ok_or_else(|| {
-            Error::new(ErrorKind::Protocol, "download response missing RS scheme")
-        })?;
-        let rs = Redundancy::from_scheme(scheme).map_err(map_uplink)?;
-        let decrypter = storj_encryption::new_decrypter(cipher, &segment_key, &nonce, block_size)
-            .map_err(map_enc)?;
-        let (piece_off, piece_size) = piece_byte_range(
-            plain_start,
-            plain_len,
-            decrypter.out_block_size(),
-            decrypter.in_block_size(),
-            &rs,
-        );
-        let mut assignments = Vec::new();
-        for (i, addressed) in seg.addressed_limits.into_iter().enumerate() {
-            if addressed.limit.is_none() {
-                continue;
-            }
-            assignments.push(PieceAssignment::from_addressed(i, addressed).map_err(map_uplink)?);
+        return Ok(slice_plain(&full, local_start, local_len));
+    }
+    let scheme = seg
+        .redundancy_scheme
+        .as_ref()
+        .ok_or_else(|| Error::new(ErrorKind::Protocol, "download response missing RS scheme"))?;
+    let rs = Redundancy::from_scheme(scheme).map_err(map_uplink)?;
+    let decrypter = storj_encryption::new_decrypter(cipher, &segment_key, &nonce, block_size)
+        .map_err(map_enc)?;
+    let (piece_off, piece_size) = piece_byte_range(
+        local_start,
+        local_len,
+        decrypter.out_block_size(),
+        decrypter.in_block_size(),
+        &rs,
+    );
+    let mut assignments = Vec::new();
+    for (i, addressed) in seg.addressed_limits.into_iter().enumerate() {
+        if addressed.limit.is_none() {
+            continue;
         }
-        let piece_key = PiecePrivateKey::from_bytes(&seg.private_key).map_err(map_uplink)?;
-        let shares = download_pieces_long_tail(LongTailDownload {
-            assignments,
-            piece_key,
-            satellite_ca: project.satellite_ca.clone(),
-            identity: project.identity.clone(),
-            pool: project.pool.clone(),
-            rs,
-            offset: piece_off,
-            size: piece_size,
-            dial_timeout: project.dial_timeout,
-        })
-        .await
-        .map_err(map_uplink)?;
-        let decoded = decode_encrypted(&shares, &rs).map_err(map_uplink)?;
-        let decoded_offset = usize::try_from(piece_off.saturating_mul(rs.k as i64)).unwrap_or(0);
-        let encrypted_size = usize::try_from(seg.segment_size.max(0)).unwrap_or(0);
-        decrypt_remote(RemoteDecrypt {
-            decoded: &decoded,
-            decoded_offset,
-            encrypted_size,
-            cipher,
-            key: &segment_key,
-            nonce: &nonce,
-            encrypted_block_size: block_size,
-            plain_start,
-            plain_len,
-            plain_size: object_size,
-        })
-        .map_err(map_uplink)?
-    };
-
-    Ok(Download::new(info, plaintext))
+        assignments.push(PieceAssignment::from_addressed(i, addressed).map_err(map_uplink)?);
+    }
+    let piece_key = PiecePrivateKey::from_bytes(&seg.private_key).map_err(map_uplink)?;
+    let shares = download_pieces_long_tail(LongTailDownload {
+        assignments,
+        piece_key,
+        satellite_ca: project.satellite_ca.clone(),
+        identity: project.identity.clone(),
+        pool: project.pool.clone(),
+        rs,
+        offset: piece_off,
+        size: piece_size,
+        dial_timeout: project.dial_timeout,
+    })
+    .await
+    .map_err(map_uplink)?;
+    let decoded = decode_encrypted(&shares, &rs).map_err(map_uplink)?;
+    let decoded_offset = usize::try_from(piece_off.saturating_mul(rs.k as i64)).unwrap_or(0);
+    let encrypted_size = usize::try_from(seg.segment_size.max(0)).unwrap_or(0);
+    decrypt_remote(RemoteDecrypt {
+        decoded: &decoded,
+        decoded_offset,
+        encrypted_size,
+        cipher,
+        key: &segment_key,
+        nonce: &nonce,
+        encrypted_block_size: block_size,
+        plain_start: local_start,
+        plain_len: local_len,
+        plain_size: seg.plain_size,
+    })
+    .map_err(map_uplink)
 }
 
 fn slice_plain(full: &[u8], start: i64, len: i64) -> Vec<u8> {
@@ -612,15 +695,47 @@ fn slice_plain(full: &[u8], start: i64, len: i64) -> Vec<u8> {
     full[start..end].to_vec()
 }
 
-pub(crate) async fn commit_upload(inner: UploadInner) -> Result<Object> {
-    use storj_proto::metainfo::{CommitSegmentRequest, MakeInlineSegmentRequest, SegmentPosition};
-    use storj_uplink::orders::PiecePrivateKey;
-    use storj_uplink::pipeline::content_nonce;
-    use storj_uplink::pipeline::{
-        Redundancy, encode_pieces, encrypt_inline, encrypt_key, encrypt_remote, encrypt_user_data,
-        is_inline, random_key, random_nonce,
+pub(crate) fn spawn_flush_segment(inner: &mut UploadInner) {
+    const MAX: usize = crate::constants::MAX_SEGMENT_SIZE as usize;
+    if inner.pending_flush.is_some() || inner.plaintext.len() < MAX {
+        return;
+    }
+    let mut chunk = std::mem::take(&mut inner.plaintext);
+    if chunk.len() > MAX {
+        inner.plaintext = chunk.split_off(MAX);
+    }
+    let job = SegmentCommit {
+        project: Arc::clone(&inner.project),
+        bucket: inner.bucket.clone(),
+        key: inner.key.clone(),
+        stream_id: inner.stream_id.clone(),
+        content_key: inner.content_key.clone(),
+        cipher: inner.cipher,
+        block_size: inner.block_size,
+        index: inner.next_segment,
+        plain: chunk,
     };
-    use storj_uplink::segment::{LongTailUpload, PieceAssignment, upload_pieces_long_tail};
+    inner.pending_flush = Some(tokio::spawn(async move {
+        let index = job.index;
+        let plain_size = commit_one_segment(job).await?;
+        Ok(FlushedSegment { index, plain_size })
+    }));
+}
+
+struct SegmentCommit {
+    project: Arc<ProjectInner>,
+    bucket: String,
+    key: String,
+    stream_id: Vec<u8>,
+    content_key: storj_encryption::Key,
+    cipher: storj_encryption::CipherSuite,
+    block_size: usize,
+    index: i32,
+    plain: Vec<u8>,
+}
+
+pub(crate) async fn commit_upload(mut inner: UploadInner) -> Result<Object> {
+    use storj_uplink::pipeline::encrypt_user_data;
 
     let abort = PendingAbort {
         project: Arc::clone(&inner.project),
@@ -630,143 +745,179 @@ pub(crate) async fn commit_upload(inner: UploadInner) -> Result<Object> {
     };
     let mut abort_on_drop = AbortOnDrop(Some(abort));
 
-    let UploadInner {
+    if let Some(handle) = inner.pending_flush.take() {
+        let flushed = handle.await??;
+        inner.apply_flush(flushed);
+    }
+    if !inner.plaintext.is_empty() || inner.next_segment == 0 {
+        let job = SegmentCommit {
+            project: Arc::clone(&inner.project),
+            bucket: inner.bucket.clone(),
+            key: inner.key.clone(),
+            stream_id: inner.stream_id.clone(),
+            content_key: inner.content_key.clone(),
+            cipher: inner.cipher,
+            block_size: inner.block_size,
+            index: inner.next_segment,
+            plain: std::mem::take(&mut inner.plaintext),
+        };
+        let index = job.index;
+        let plain_size = commit_one_segment(job).await?;
+        inner.apply_flush(FlushedSegment { index, plain_size });
+    }
+
+    let custom_pairs: Vec<(String, String)> = inner.custom.into_iter().collect();
+    let user = encrypt_user_data(
+        &custom_pairs,
+        crate::constants::MAX_SEGMENT_SIZE as i64,
+        inner.last_segment_plain,
+        i64::from(inner.next_segment),
+        inner.cipher,
+        &inner.content_key,
+        inner.block_size,
+    )
+    .map_err(map_uplink)?;
+
+    let committed = inner
+        .project
+        .metainfo
+        .commit_object(&inner.bucket, &inner.key, inner.stream_id, user)
+        .await?;
+    abort_on_drop.disarm();
+    let mut obj = object_from_proto(committed.object, &inner.key);
+    obj.system.content_length = inner.total_plain;
+    obj.custom = custom_pairs.into_iter().collect();
+    Ok(obj)
+}
+
+async fn commit_one_segment(job: SegmentCommit) -> Result<i64> {
+    use storj_proto::metainfo::{CommitSegmentRequest, MakeInlineSegmentRequest, SegmentPosition};
+    use storj_uplink::orders::PiecePrivateKey;
+    use storj_uplink::pipeline::{
+        MAX_INLINE_SEGMENT_SIZE, Redundancy, content_nonce, encode_pieces, encrypt_inline,
+        encrypt_key, encrypt_remote, is_inline, random_key, random_nonce,
+    };
+    use storj_uplink::segment::{LongTailUpload, PieceAssignment, upload_pieces_long_tail};
+
+    let SegmentCommit {
         project,
         bucket,
         key,
-        encrypted_object_key: _,
         stream_id,
         content_key,
         cipher,
         block_size,
-        custom,
-        plaintext,
-    } = inner;
-
+        index,
+        plain,
+    } = job;
     let segment_key = random_key();
     let encrypted_key_nonce = random_nonce();
     let encrypted_key = encrypt_key(&segment_key, cipher, &content_key, &encrypted_key_nonce)
-        .map_err(|e| Error::new(ErrorKind::Protocol, e.to_string()).with_source(e))?;
-    let nonce = content_nonce(0, 0);
-    let inline_data = encrypt_inline(&plaintext, cipher, &segment_key, &nonce)
-        .map_err(|e| Error::new(ErrorKind::Protocol, e.to_string()).with_source(e))?;
+        .map_err(map_uplink)?;
+    let nonce = content_nonce(0, index);
     let position = SegmentPosition {
         part_number: 0,
-        index: 0,
+        index,
     };
-    let last_plain = i64::try_from(plaintext.len()).unwrap_or(i64::MAX);
+    let last_plain = i64::try_from(plain.len()).unwrap_or(i64::MAX);
 
-    if is_inline(&inline_data) {
+    let inline_data = if plain.len() > MAX_INLINE_SEGMENT_SIZE {
+        None
+    } else {
+        let data = encrypt_inline(&plain, cipher, &segment_key, &nonce).map_err(map_uplink)?;
+        if is_inline(&data) { Some(data) } else { None }
+    };
+    if let Some(inline_data) = inline_data {
         project
             .metainfo
             .make_inline_segment(
                 &bucket,
                 &key,
                 MakeInlineSegmentRequest {
-                    stream_id: stream_id.clone(),
+                    stream_id,
                     position: Some(position),
                     encrypted_key_nonce: encrypted_key_nonce.to_vec(),
-                    encrypted_key: encrypted_key.clone(),
+                    encrypted_key,
                     encrypted_inline_data: inline_data,
                     plain_size: last_plain,
                     ..Default::default()
                 },
             )
             .await?;
-    } else {
-        let encrypted = encrypt_remote(&plaintext, cipher, &segment_key, &nonce, block_size)
-            .map_err(|e| Error::new(ErrorKind::Protocol, e.to_string()).with_source(e))?;
-        let enc_size = i64::try_from(encrypted.len()).unwrap_or(i64::MAX);
-        let begin = project
-            .metainfo
-            .begin_segment(&bucket, &key, stream_id.clone(), position, enc_size)
-            .await?;
-        let scheme = begin
-            .redundancy_scheme
-            .as_ref()
-            .ok_or_else(|| Error::new(ErrorKind::Protocol, "BeginSegment missing RS scheme"))?;
-        let rs = Redundancy::from_scheme(scheme)
-            .map_err(|e| Error::new(ErrorKind::Protocol, e.to_string()).with_source(e))?;
-        let pieces = encode_pieces(&encrypted, &rs)
-            .map_err(|e| Error::new(ErrorKind::Protocol, e.to_string()).with_source(e))?;
-        let mut assignments = Vec::new();
-        for (i, addressed) in begin.addressed_limits.into_iter().enumerate() {
-            assignments.push(
-                PieceAssignment::from_addressed(i, addressed)
-                    .map_err(|e| Error::new(ErrorKind::Protocol, e.to_string()).with_source(e))?,
-            );
-        }
-        let piece_key = PiecePrivateKey::from_bytes(&begin.private_key)
-            .map_err(|e| Error::new(ErrorKind::Protocol, e.to_string()).with_source(e))?;
-        let metainfo = &project.metainfo;
-        let bucket_c = bucket.clone();
-        let key_c = key.clone();
-        let (segment_id, results) = upload_pieces_long_tail(
-            LongTailUpload {
-                assignments,
-                segment_id: begin.segment_id.clone(),
-                piece_key,
-                pieces,
-                satellite_ca: project.satellite_ca.clone(),
-                identity: project.identity.clone(),
-                pool: project.pool.clone(),
-                rs,
-                cohort: begin.cohort_requirements.clone(),
-                dial_timeout: project.dial_timeout,
-            },
-            |seg_id, nums| {
-                let bucket = bucket_c.clone();
-                let key = key_c.clone();
-                async move {
-                    let resp = metainfo
-                        .retry_begin_segment_pieces(&bucket, &key, seg_id, nums)
-                        .await
-                        .map_err(|e| storj_uplink::Error::Protocol(e.to_string()))?;
-                    Ok((resp.segment_id, resp.addressed_limits))
-                }
-            },
-        )
-        .await
-        .map_err(|e| Error::new(ErrorKind::Protocol, e.to_string()).with_source(e))?;
-
-        project
-            .metainfo
-            .commit_segment(
-                &bucket,
-                &key,
-                CommitSegmentRequest {
-                    segment_id,
-                    encrypted_key_nonce: encrypted_key_nonce.to_vec(),
-                    encrypted_key: encrypted_key.clone(),
-                    size_encrypted_data: enc_size,
-                    plain_size: last_plain,
-                    upload_result: results,
-                    ..Default::default()
-                },
-            )
-            .await?;
+        return Ok(last_plain);
     }
 
-    let custom_pairs: Vec<(String, String)> = custom.into_iter().collect();
-    let user = encrypt_user_data(
-        &custom_pairs,
-        crate::constants::MAX_SEGMENT_SIZE as i64,
-        last_plain,
-        cipher,
-        &content_key,
-        block_size,
-    )
-    .map_err(|e| Error::new(ErrorKind::Protocol, e.to_string()).with_source(e))?;
-
-    let committed = project
+    let encrypted = tokio::task::spawn_blocking(move || {
+        encrypt_remote(&plain, cipher, &segment_key, &nonce, block_size)
+    })
+    .await?
+    .map_err(map_uplink)?;
+    let enc_size = i64::try_from(encrypted.len()).unwrap_or(i64::MAX);
+    let begin = project
         .metainfo
-        .commit_object(&bucket, &key, stream_id, user)
+        .begin_segment(&bucket, &key, stream_id, position, enc_size)
         .await?;
-    abort_on_drop.disarm();
-    let mut obj = object_from_proto(committed.object, &key);
-    obj.system.content_length = last_plain;
-    obj.custom = custom_pairs.into_iter().collect();
-    Ok(obj)
+    let scheme = begin
+        .redundancy_scheme
+        .as_ref()
+        .ok_or_else(|| Error::new(ErrorKind::Protocol, "BeginSegment missing RS scheme"))?;
+    let rs = Redundancy::from_scheme(scheme).map_err(map_uplink)?;
+    let pieces = tokio::task::spawn_blocking(move || encode_pieces(&encrypted, &rs))
+        .await?
+        .map_err(map_uplink)?;
+    let mut assignments = Vec::new();
+    for (i, addressed) in begin.addressed_limits.into_iter().enumerate() {
+        assignments.push(PieceAssignment::from_addressed(i, addressed).map_err(map_uplink)?);
+    }
+    let piece_key = PiecePrivateKey::from_bytes(&begin.private_key).map_err(map_uplink)?;
+    let metainfo = &project.metainfo;
+    let bucket_c = bucket.clone();
+    let key_c = key.clone();
+    let (segment_id, results) = upload_pieces_long_tail(
+        LongTailUpload {
+            assignments,
+            segment_id: begin.segment_id.clone(),
+            piece_key,
+            pieces,
+            satellite_ca: project.satellite_ca.clone(),
+            identity: project.identity.clone(),
+            pool: project.pool.clone(),
+            rs,
+            cohort: begin.cohort_requirements.clone(),
+            dial_timeout: project.dial_timeout,
+        },
+        |seg_id, nums| {
+            let bucket = bucket_c.clone();
+            let key = key_c.clone();
+            async move {
+                let resp = metainfo
+                    .retry_begin_segment_pieces(&bucket, &key, seg_id, nums)
+                    .await
+                    .map_err(|e| storj_uplink::Error::Protocol(e.to_string()))?;
+                Ok((resp.segment_id, resp.addressed_limits))
+            }
+        },
+    )
+    .await
+    .map_err(map_uplink)?;
+
+    project
+        .metainfo
+        .commit_segment(
+            &bucket,
+            &key,
+            CommitSegmentRequest {
+                segment_id,
+                encrypted_key_nonce: encrypted_key_nonce.to_vec(),
+                encrypted_key,
+                size_encrypted_data: enc_size,
+                plain_size: last_plain,
+                upload_result: results,
+                ..Default::default()
+            },
+        )
+        .await?;
+    Ok(last_plain)
 }
 
 struct PendingAbort {
@@ -809,6 +960,10 @@ async fn abort_pending(pending: PendingAbort) -> Result<()> {
         block_size: 0,
         custom: CustomMetadata::new(),
         plaintext: Vec::new(),
+        next_segment: 0,
+        total_plain: 0,
+        last_segment_plain: 0,
+        pending_flush: None,
     })
     .await
 }

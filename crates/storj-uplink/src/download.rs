@@ -1,4 +1,4 @@
-//! Single-segment download: CompressedBatch limits, RS from k pieces, decrypt, ranges.
+//! Segment download: CompressedBatch limits, RS from k pieces, decrypt, ranges.
 
 use std::time::Duration;
 
@@ -49,6 +49,30 @@ pub fn resolve_range(offset: i64, length: i64, object_size: i64) -> Result<(i64,
         start.saturating_add(length).min(object_size)
     };
     Ok((start, end.saturating_sub(start)))
+}
+
+/// Segment-local `(start, len)` for the overlap of an object range with a segment.
+///
+/// `object_start`/`object_len` are plaintext coordinates on the whole object.
+/// Empty overlap is `(0, 0)`.
+#[must_use]
+pub fn segment_plain_range(
+    object_start: i64,
+    object_len: i64,
+    seg_offset: i64,
+    seg_plain: i64,
+) -> (i64, i64) {
+    if object_len <= 0 || seg_plain <= 0 {
+        return (0, 0);
+    }
+    let object_end = object_start.saturating_add(object_len);
+    let seg_end = seg_offset.saturating_add(seg_plain);
+    let start = object_start.max(seg_offset);
+    let end = object_end.min(seg_end);
+    if end <= start {
+        return (0, 0);
+    }
+    (start - seg_offset, end - start)
 }
 
 /// Protobuf `Range` for `DownloadObjectRequest` (None = whole object).
@@ -404,6 +428,19 @@ mod tests {
         assert_eq!(resolve_range(1, -1, 0).unwrap(), (0, 0));
         assert!(resolve_range(-4, 2, 11).is_err());
         assert!(resolve_range(-4, 0, 11).is_err());
+    }
+
+    #[test]
+    fn segment_plain_range_clips_and_skips() {
+        assert_eq!(segment_plain_range(0, 100, 0, 64), (0, 64));
+        assert_eq!(segment_plain_range(10, 20, 0, 64), (10, 20));
+        assert_eq!(segment_plain_range(60, 20, 0, 64), (60, 4));
+        assert_eq!(segment_plain_range(64, 1, 0, 64), (0, 0));
+        assert_eq!(segment_plain_range(64, 1, 64, 1), (0, 1));
+        let max = 64 * 1024 * 1024i64;
+        assert_eq!(segment_plain_range(max - 16, 17, 0, max), (max - 16, 16));
+        assert_eq!(segment_plain_range(max - 16, 17, max, 1), (0, 1));
+        assert_eq!(segment_plain_range(0, 0, 0, 64), (0, 0));
     }
 
     #[test]
