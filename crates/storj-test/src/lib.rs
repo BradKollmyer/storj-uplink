@@ -153,6 +153,31 @@ pub fn assert_fixtures_layout(root: &Path) {
     }
 }
 
+/// Run a live-satellite test body, then delete `bucket` and every object in
+/// it, even when the body panicked, and only then re-raise the panic. Live
+/// tests (storj-sim, the Go↔Rust matrix) must not leave data behind on a real
+/// project.
+pub async fn with_bucket_cleanup<F>(project: &storj::Project, bucket: &str, body: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    // Spawned so a panic is captured as a JoinError instead of unwinding past
+    // the cleanup.
+    let outcome = tokio::spawn(body).await;
+    let cleanup = project.delete_bucket_with_objects(bucket).await;
+    match &cleanup {
+        Ok(_) => eprintln!("cleanup: deleted bucket {bucket}"),
+        Err(e) => eprintln!("cleanup: could not delete bucket {bucket}: {e}"),
+    }
+    if let Err(e) = outcome {
+        match e.try_into_panic() {
+            Ok(payload) => std::panic::resume_unwind(payload),
+            Err(e) => panic!("test body failed: {e}"),
+        }
+    }
+    cleanup.expect("live test bucket must be deleted after the run");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

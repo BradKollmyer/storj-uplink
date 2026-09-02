@@ -41,23 +41,31 @@ async fn sim_walkthrough_empty_and_inline() {
     );
     project.ensure_bucket(&bucket).await.expect("ensure_bucket");
 
-    for (key, payload) in [("empty", &b""[..]), ("inline", &b"hello storj-sim"[..])] {
-        let mut upload = project
-            .upload_object(&bucket, key, Default::default())
-            .await
-            .expect("upload_object");
-        upload.write_all(payload).await.expect("write");
-        upload.commit().await.expect("commit");
+    let body = {
+        let project = project.clone();
+        let bucket = bucket.clone();
+        async move {
+            for (key, payload) in [("empty", &b""[..]), ("inline", &b"hello storj-sim"[..])] {
+                let mut upload = project
+                    .upload_object(&bucket, key, Default::default())
+                    .await
+                    .expect("upload_object");
+                upload.write_all(payload).await.expect("write");
+                upload.commit().await.expect("commit");
 
-        let mut download = project
-            .download_object(&bucket, key, Default::default())
-            .await
-            .expect("download_object");
-        let mut got = Vec::new();
-        download.read_to_end(&mut got).await.expect("read");
-        download.close().await.expect("close");
-        assert_eq!(got, payload, "mismatch for {key}");
-    }
+                let mut download = project
+                    .download_object(&bucket, key, Default::default())
+                    .await
+                    .expect("download_object");
+                let mut got = Vec::new();
+                download.read_to_end(&mut got).await.expect("read");
+                download.close().await.expect("close");
+                assert_eq!(got, payload, "mismatch for {key}");
+            }
+        }
+    };
+    // Always delete the bucket and its objects, even if the body panicked.
+    storj_test::with_bucket_cleanup(&project, &bucket, body).await;
 
     project.close().await.ok();
 }
