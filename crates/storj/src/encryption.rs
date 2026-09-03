@@ -59,7 +59,7 @@ pub fn derive_root_key(
 mod tests {
     use super::*;
     use crate::constants::ARGON2_PARALLELISM_REQUEST;
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     use sha2::Sha512;
     use storj_encryption::derive_path_key_component;
 
@@ -105,7 +105,7 @@ mod tests {
         let a = derive_path_key_component(&key, "logs");
         let mut mac = HmacSha512::new_from_slice(&key).unwrap();
         mac.update(b"path:logs");
-        let expected = mac.finalize().into_bytes();
+        let expected: [u8; 64] = mac.finalize().into_bytes().into();
         assert_eq!(&a[..], &expected[..32]);
         assert_ne!(a, derive_path_key_component(&key, "path:logs"));
     }

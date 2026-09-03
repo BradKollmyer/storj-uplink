@@ -30,8 +30,8 @@ aes-gcm = "0.10"
 crypto_secretbox = { version = "0.1", default-features = false, features = ["alloc", "salsa20"] }
 argon2 = "0.6"
 base64 = "0.23"
-hmac = "0.12"
-sha2 = "0.10"
+hmac = "0.13"
+sha2 = "0.11"
 blake3 = "1"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand = "0.8"
