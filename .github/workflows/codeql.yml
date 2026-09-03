@@ -47,7 +47,9 @@ jobs:
           upload: false
       - name: Drop test-only alerts
         if: matrix.language == 'rust'
-        run: python3 .github/codeql/filter-test-alerts.py sarif-results/rust.sarif
+        run: |
+          python3 .github/codeql/filter-test-alerts.py --self-test
+          python3 .github/codeql/filter-test-alerts.py sarif-results/rust.sarif
       - name: Upload SARIF
         uses: github/codeql-action/upload-sarif@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4
         with:
