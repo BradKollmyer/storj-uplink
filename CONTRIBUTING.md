@@ -2,6 +2,9 @@
 
 Thanks for contributing to `storj-uplink`.
 
+This project follows the [Contributor Covenant](CODE_OF_CONDUCT.md). Report
+security issues privately as described in [SECURITY.md](SECURITY.md).
+
 ## License
 
 Contributions are dual-licensed **MIT OR Apache-2.0**, the same as the crate.

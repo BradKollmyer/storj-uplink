@@ -11,6 +11,12 @@ unpublished.
 
 ## [Unreleased]
 
+### Changed
+
+- The GitHub repository is public. CI and grant-roundtrip interop run on `main`
+  and pull requests (not every feature-branch push), with concurrency
+  cancellation. Fork pull requests never receive `STORJ_SIM_ACCESS`.
+
 ### Fixed
 
 - **Wire compatibility:** order-limit and piece-hash signatures are now verified

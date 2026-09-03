@@ -2,6 +2,7 @@ name: interop
 
 on:
   push:
+    branches: [main]
   pull_request:
   schedule:
     # Nightly storj-sim walkthrough (heavy; not part of default PR CI).
@@ -10,6 +11,10 @@ on:
 
 permissions:
   contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   # Grant parse/serialize/share vs Go uplink. No satellite.
@@ -39,6 +44,8 @@ jobs:
           --skip writer_reader_size_matrix
 
   # Nightly / manual only. Does not fail default PR CI when sim is unavailable.
+  # STORJ_SIM_ACCESS is a repository secret: it is available on schedule and
+  # workflow_dispatch, never on pull_request (including forks).
   # 64MiB+1 is part of the 1.0 Go↔Rust size matrix when a satellite is available:
   #   STORJ_INTEROP=1 STORJ_INTEROP_ACCESS=... cargo test -p storj --test interop \
   #     writer_reader_size_matrix -- --ignored
