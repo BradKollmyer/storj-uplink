@@ -1,0 +1,40 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+language: en-US
+reviews:
+  profile: chill
+  request_changes_workflow: false
+  high_level_summary: true
+  poem: false
+  in_progress_fortune: false
+  auto_review:
+    enabled: true
+    drafts: false
+  path_filters:
+    - "!**/Cargo.lock"
+    - "!**/go.sum"
+    - "!crates/storj-proto/src/gen/**"
+    - "!crates/storj/tests/fixtures/**"
+  path_instructions:
+    - path: "crates/storj/src/**"
+      instructions: >
+        Public API only. Do not re-export internal-crate items. Option structs
+        stay constructible by literal; satellite-produced types are
+        #[non_exhaustive].
+    - path: "crates/storj-uplink/src/**"
+      instructions: >
+        Wire-compat with Go uplink is mandatory. Peers sign with the leaf
+        certificate, not the CA. Encrypted segments use length-trailer padding
+        before erasure coding. CommitSegment pieces must be sorted by piece
+        number.
+    - path: ".github/workflows/**"
+      instructions: >
+        Pin third-party actions by commit SHA. Never expose STORJ_SIM_ACCESS
+        on pull_request (including forks). Keep permissions: contents: read
+        unless a job needs more.
+knowledge_base:
+  code_guidelines:
+    enabled: true
+    filePatterns:
+      - "CLAUDE.md"
+      - "CONTRIBUTING.md"
+      - "docs/design-native-uplink.md"
