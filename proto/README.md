@@ -46,4 +46,4 @@ bash proto/gen-prost.sh    # regenerate crates/storj-proto/src/gen from proto/
 cargo fmt --all && git diff --exit-code crates/storj-proto/src/gen
 ```
 
-CI runs the pin checksum, then regen + `git diff --exit-code` so checked-in prost cannot drift from the vendored `.proto` files. `gen-prost.sh` pins `prost-build = 0.13.5` and a vendored `protoc` (`protoc-bin-vendored`).
+CI runs the pin checksum, then regen + `git diff --exit-code` so checked-in prost cannot drift from the vendored `.proto` files. `gen-prost.sh` pins `prost-build = 0.14.4` and a vendored `protoc` (`protoc-bin-vendored`).
