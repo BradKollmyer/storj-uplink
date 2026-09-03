@@ -41,3 +41,42 @@ cargo test -p storj --test encryption_golden --test grant_golden
 ## Interop matrix (v1.0 exit criterion)
 
 `{go,rust} writer × {go,rust} reader × {empty, 1B, inline-1, inline+1, 1seg, 64MiB+1}` (full upload/download round trips) plus grant parse/serialize/`Share` restriction. Ranged reads and prefix listing are covered against the mock satellite, not against Go. Defined in `storj-test::INTEROP_SIZES` / `INTEROP_SIDES`. PR CI `grant-roundtrip` runs grant parse/serialize/share on every PR (no satellite) and `--skip`s the object matrix. The object matrix, including `64MiB+1`, is opt-in (`STORJ_INTEROP=1` plus `STORJ_INTEROP_ACCESS` / `STORJ_SIM_ACCESS`); the nightly `interop` workflow runs it when the `STORJ_SIM_ACCESS` secret is configured.
+
+## Local storj-sim
+
+The Go↔Rust matrix runs in about two minutes against a local `storj-sim`
+network (vs. ~15 min against a live satellite). What worked on macOS:
+
+```bash
+# Postgres + Redis for the satellite
+docker run -d --name storj-sim-pg -e POSTGRES_USER=storj -e POSTGRES_PASSWORD=storj \
+  -e POSTGRES_DB=master -p 5433:5432 postgres:16
+brew install redis            # storj-sim spawns redis-server itself
+
+# storj binaries (jobq and multinode are required by current storj-sim)
+GOBIN=$HOME/storj-sim-bin go install storj.io/storj/cmd/{storj-sim,satellite,storagenode,\
+versioncontrol,identity,uplink,jobq,multinode}@latest
+export PATH=$HOME/storj-sim-bin:$PATH
+
+storj-sim network setup --postgres="postgres://storj:storj@localhost:5433/master?sslmode=disable"
+storj-sim network run
+```
+
+Two upstream storj-sim issues needed local patches to `cmd/storj-sim/network.go`
+(copy the module out of `$GOPATH/pkg/mod`, edit, `go build ./cmd/storj-sim`):
+
+- the satellite core/rangedloop/repairer processes dial `jobq` at startup but
+  only wait for the migration, so they race it; add `.WaitForStart(jobqProcess)`
+  to those three processes;
+- the S3 gateway fails its port check inside the simulator; it is not needed
+  for these tests, so skip creating the gateway process when
+  `STORJ_SIM_NO_GATEWAY` is set (`storj-sim network env GATEWAY_0_ACCESS` still
+  reads the grant from the generated config).
+
+Then:
+
+```bash
+export STORJ_SIM=1 STORJ_INTEROP=1
+export STORJ_SIM_ACCESS="$(storj-sim network env GATEWAY_0_ACCESS)"
+cargo test -p storj --test sim --test interop -- --ignored
+```

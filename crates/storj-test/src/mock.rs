@@ -1479,6 +1479,17 @@ fn commit_segment(
         ));
     }
     st.last_commit_segment_id = Some(req.segment_id.clone());
+    // metabase.CommitSegment: pieces must be strictly ordered by piece number.
+    if req
+        .upload_result
+        .windows(2)
+        .any(|w| w[0].piece_num >= w[1].piece_num)
+    {
+        return Err((
+            RPC_INVALID_ARGUMENT,
+            "metabase: invalid request: pieces should be ordered".into(),
+        ));
+    }
     // Satellite `validateRemoteSegment`: every reported piece must be exactly
     // eestream.CalcPieceSize(size_encrypted_data) bytes (the +4 is the
     // padding trailer the uplink appends before erasure coding).
