@@ -128,6 +128,10 @@ async fn writer_reader_size_matrix() {
         let grant = grant.clone();
         let bucket = bucket.clone();
         async move {
+            // Run every cell even after a failure, so one live run reports
+            // the whole matrix instead of stopping at the first bad cell.
+            let mut passed = Vec::new();
+            let mut failed = Vec::new();
             for &(writer, reader) in INTEROP_SIDES {
                 for &size in INTEROP_SIZES {
                     let name = format!(
@@ -138,13 +142,44 @@ async fn writer_reader_size_matrix() {
                     );
                     let key = format!("{}/{}", writer.as_str(), size_label(size));
                     let want = payload(size);
-                    round_trip(writer, reader, &project, &grant, &bucket, &key, &want)
-                        .await
-                        .unwrap_or_else(|CellSkip(msg)| {
-                            panic!("go helper skipped despite live satellite ({name}): {msg}");
-                        });
+                    let cell = tokio::spawn({
+                        let project = project.clone();
+                        let grant = grant.clone();
+                        let bucket = bucket.clone();
+                        async move {
+                            round_trip(writer, reader, &project, &grant, &bucket, &key, &want).await
+                        }
+                    });
+                    match cell.await {
+                        Ok(Ok(())) => {
+                            eprintln!("matrix PASS {name}");
+                            passed.push(name);
+                        }
+                        Ok(Err(CellSkip(msg))) => {
+                            eprintln!("matrix FAIL {name}: go helper skipped: {msg}");
+                            failed.push(format!("{name}: go helper skipped: {msg}"));
+                        }
+                        Err(join) => {
+                            let msg = panic_message(join);
+                            eprintln!("matrix FAIL {name}: {msg}");
+                            failed.push(format!("{name}: {msg}"));
+                        }
+                    }
                 }
             }
+            eprintln!(
+                "matrix summary: {} passed, {} failed of {} cells",
+                passed.len(),
+                failed.len(),
+                passed.len() + failed.len()
+            );
+            assert!(
+                failed.is_empty(),
+                "{} of {} matrix cells failed:\n{}",
+                failed.len(),
+                passed.len() + failed.len(),
+                failed.join("\n")
+            );
         }
     };
     // Always delete the bucket and its objects (Go-written ones included),
@@ -155,6 +190,18 @@ async fn writer_reader_size_matrix() {
 }
 
 struct CellSkip(String);
+
+/// Text of a panic captured from a spawned cell.
+fn panic_message(join: tokio::task::JoinError) -> String {
+    match join.try_into_panic() {
+        Ok(payload) => payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+            .unwrap_or_else(|| "panic with non-string payload".to_owned()),
+        Err(e) => format!("task failed: {e}"),
+    }
+}
 
 async fn round_trip(
     writer: Side,

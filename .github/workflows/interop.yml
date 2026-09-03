@@ -87,4 +87,4 @@ jobs:
             echo "STORJ_SIM_ACCESS secret is not set; skipping object matrix."
             exit 0
           fi
-          cargo test --locked -p storj --test interop writer_reader_size_matrix -- --ignored
+          cargo test --locked -p storj --test interop writer_reader_size_matrix -- --ignored --nocapture
