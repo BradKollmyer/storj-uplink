@@ -168,20 +168,46 @@ impl PiecePublicKey {
     }
 }
 
-/// Protobuf bytes signed by the satellite (signature field omitted).
+/// Unix seconds of Go's zero `time.Time` (0001-01-01T00:00:00Z). gogoproto
+/// `stdtime, nullable=false` fields put this on the wire for an unset time.
+const GO_ZERO_TIME_UNIX: i64 = -62_135_596_800;
+
+/// Go `EncodeOrderLimit` / `EncodePieceHash` copy a timestamp into the
+/// signing message only `if !t.IsZero()`, so a zero `time.Time` (sent on the
+/// wire as year-1 seconds by the non-nullable `OrderLimit` field) must be
+/// omitted from the signed bytes. Re-encoding it verbatim breaks signature
+/// verification for every limit without a piece expiration.
+fn nonzero_time(t: Option<prost_types::Timestamp>) -> Option<prost_types::Timestamp> {
+    match t {
+        Some(ts) if ts.seconds == GO_ZERO_TIME_UNIX && ts.nanos == 0 => None,
+        other => other,
+    }
+}
+
+/// Go copies `NodeID` / `PiecePublicKey` values only `if !v.IsZero()`.
+fn nonzero_bytes(b: &[u8]) -> Vec<u8> {
+    if b.iter().all(|&x| x == 0) {
+        Vec::new()
+    } else {
+        b.to_vec()
+    }
+}
+
+/// Protobuf bytes signed by the satellite (signature field omitted), matching
+/// Go `signing.EncodeOrderLimit` byte for byte.
 pub fn encode_order_limit(limit: &OrderLimit) -> Vec<u8> {
     OrderLimitSigning {
         serial_number: limit.serial_number.clone(),
         satellite_id: limit.satellite_id.clone(),
-        deprecated_uplink_id: limit.deprecated_uplink_id.clone(),
-        uplink_public_key: limit.uplink_public_key.clone(),
+        deprecated_uplink_id: nonzero_bytes(&limit.deprecated_uplink_id),
+        uplink_public_key: nonzero_bytes(&limit.uplink_public_key),
         storage_node_id: limit.storage_node_id.clone(),
         piece_id: limit.piece_id.clone(),
         limit: limit.limit,
         action: limit.action,
-        piece_expiration: limit.piece_expiration,
-        order_expiration: limit.order_expiration,
-        order_creation: limit.order_creation,
+        piece_expiration: nonzero_time(limit.piece_expiration),
+        order_expiration: nonzero_time(limit.order_expiration),
+        order_creation: nonzero_time(limit.order_creation),
         encrypted_metadata_key_id: limit.encrypted_metadata_key_id.clone(),
         encrypted_metadata: limit.encrypted_metadata.clone(),
         satellite_signature: Vec::new(),
@@ -206,7 +232,7 @@ pub fn encode_piece_hash(hash: &PieceHash) -> Vec<u8> {
         piece_id: hash.piece_id.clone(),
         hash: hash.hash.clone(),
         piece_size: hash.piece_size,
-        timestamp: hash.timestamp,
+        timestamp: nonzero_time(hash.timestamp),
         signature: Vec::new(),
         hash_algorithm: hash.hash_algorithm,
     }
@@ -267,6 +293,37 @@ pub fn verify_piece_hash_node(hash: &PieceHash, node_cert_der: &[u8]) -> Result<
     let bytes = encode_piece_hash(hash);
     storj_rpc::hash_and_verify(node_cert_der, &bytes, &hash.signature)
         .map_err(|_| Error::PieceHashSignature)
+}
+
+#[cfg(test)]
+mod zero_time_tests {
+    use super::*;
+
+    #[test]
+    fn go_zero_time_is_omitted_from_signing_bytes() {
+        let zero = prost_types::Timestamp {
+            seconds: GO_ZERO_TIME_UNIX,
+            nanos: 0,
+        };
+        assert_eq!(nonzero_time(Some(zero)), None);
+        let epoch = prost_types::Timestamp {
+            seconds: 0,
+            nanos: 0,
+        };
+        assert_eq!(
+            nonzero_time(Some(epoch)),
+            Some(epoch),
+            "unix epoch is not Go's zero time"
+        );
+        let with = OrderLimit {
+            piece_expiration: Some(zero),
+            ..Default::default()
+        };
+        let without = OrderLimit::default();
+        assert_eq!(encode_order_limit(&with), encode_order_limit(&without));
+        assert!(nonzero_bytes(&[0u8; 32]).is_empty());
+        assert_eq!(nonzero_bytes(&[1u8; 4]), vec![1u8; 4]);
+    }
 }
 
 #[cfg(test)]

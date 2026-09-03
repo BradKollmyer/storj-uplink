@@ -230,15 +230,35 @@ func writeSignedGoldens(root string) {
 		Timestamp:     created,
 		HashAlgorithm: pb.PieceHashAlgorithm_SHA256,
 	}
+	// A production-shaped limit: encrypted metadata set, zero piece
+	// expiration, deprecated satellite address present. Also emit the exact
+	// bytes Go signs (EncodeOrderLimit) so the Rust encoder can be diffed.
+	fullLimit := must(signing.SignOrderLimit(ctx, signing.SignerFromFullIdentity(sat), &pb.OrderLimit{
+		SerialNumber:               serial,
+		SatelliteId:                sat.ID,
+		UplinkPublicKey:            pub,
+		StorageNodeId:              node.ID,
+		PieceId:                    pieceID,
+		Limit:                      7424 * 3,
+		Action:                     pb.PieceAction_GET,
+		OrderExpiration:            created.Add(2 * time.Hour),
+		OrderCreation:              created,
+		EncryptedMetadataKeyId:     bytes.Repeat([]byte{0x44}, 16),
+		EncryptedMetadata:          bytes.Repeat([]byte{0x55}, 48),
+		DeprecatedSatelliteAddress: &pb.NodeAddress{Address: "sat.example:7777"},
+	}))
+	fullSigningBytes := must(signing.EncodeOrderLimit(ctx, fullLimit))
 	nodeHash := must(signing.SignPieceHash(ctx, signing.SignerFromFullIdentity(node), unsignedHash))
 	uplinkHash := must(signing.SignUplinkPieceHash(ctx, priv, unsignedHash))
 	order := must(signing.SignUplinkOrder(ctx, priv, &pb.Order{SerialNumber: serial, Amount: 4096}))
 
 	line := fmt.Sprintf(`{"satellite_leaf_der":"%x","satellite_ca_der":"%x","satellite_node_id":%q,`+
 		`"node_leaf_der":"%x","node_ca_der":"%x","node_node_id":%q,"piece_public_key":"%x",`+
-		`"order_limit":"%x","piece_hash_node":"%x","order_uplink":"%x","piece_hash_uplink":"%x"}`+"\n",
+		`"order_limit":"%x","piece_hash_node":"%x","order_uplink":"%x","piece_hash_uplink":"%x",`+
+		`"order_limit_full":"%x","order_limit_full_signing_bytes":"%x"}`+"\n",
 		sat.Leaf.Raw, sat.CA.Raw, sat.ID.String(),
 		node.Leaf.Raw, node.CA.Raw, node.ID.String(), pub.Bytes(),
-		must(pb.Marshal(limit)), must(pb.Marshal(nodeHash)), must(pb.Marshal(order)), must(pb.Marshal(uplinkHash)))
+		must(pb.Marshal(limit)), must(pb.Marshal(nodeHash)), must(pb.Marshal(order)), must(pb.Marshal(uplinkHash)),
+		must(pb.Marshal(fullLimit)), fullSigningBytes)
 	mustWrite(path, line)
 }
