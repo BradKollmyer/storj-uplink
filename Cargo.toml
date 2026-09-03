@@ -26,7 +26,7 @@ prost-types = "0.13"
 thiserror = "2"
 zstd = "0.13"
 zeroize = { version = "1", features = ["derive"] }
-aes-gcm = "0.10"
+aes-gcm = "0.11"
 crypto_secretbox = { version = "0.1", default-features = false, features = ["alloc", "salsa20"] }
 argon2 = "0.5"
 base64 = "0.22"
