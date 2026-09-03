@@ -20,6 +20,7 @@ from pathlib import Path
 
 _CRYPTO_RULE = "hard-coded-cryptographic-value"
 _IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_CSPRNG_SCRATCH_RE = re.compile(r"let\s+mut\s+bytes\s*=\s*\[0u8;\s*N\]")
 
 
 def _is_ident_start(ch: str) -> bool:
@@ -491,13 +492,15 @@ def is_documented_crypto_fp_text(
     start_col: int | None = None,
     end_col: int | None = None,
 ) -> bool:
-    """Return True if this span is `ZERO_NONCE` or inside `csprng_bytes`."""
+    """Return True if this span is `ZERO_NONCE` or the `csprng_bytes` scratch init."""
     lines = text.splitlines()
     if start_line < 1 or start_line > len(lines):
         return False
     line = lines[start_line - 1]
     if _region_hits_ident(line, "ZERO_NONCE", start_col, end_col):
         return True
+    if not _CSPRNG_SCRATCH_RE.search(line.split("//", 1)[0]):
+        return False
     rng = _item_fn_body_lines(text, "csprng_bytes")
     if rng is None:
         return False
@@ -646,6 +649,7 @@ fn other() {
 }
 fn csprng_bytes<const N: usize>() -> [u8; N] {
     let mut bytes = [0u8; N];
+    let extra = [0u8; 32];
     bytes
 }
 const KEY: [u8; 32] = [0; 32];
@@ -653,7 +657,8 @@ const KEY: [u8; 32] = [0; 32];
     assert is_documented_crypto_fp_text(crypto, 2)
     assert not is_documented_crypto_fp_text(crypto, 4)
     assert is_documented_crypto_fp_text(crypto, 7)
-    assert not is_documented_crypto_fp_text(crypto, 10)
+    assert not is_documented_crypto_fp_text(crypto, 8)
+    assert not is_documented_crypto_fp_text(crypto, 11)
     assert is_documented_crypto_fp_text("encrypt(&ZERO_NONCE)\n", 1)
     # Comment beside an unrelated key must not match ZERO_NONCE.
     assert not is_documented_crypto_fp_text(
@@ -691,7 +696,18 @@ const KEY: [u8; 32] = [0; 32];
                             {
                                 "physicalLocation": {
                                     "artifactLocation": {"uri": "lib.rs"},
-                                    "region": {"startLine": 10},
+                                    "region": {"startLine": 8},
+                                }
+                            }
+                        ],
+                    },
+                    {
+                        "ruleId": "rust/hard-coded-cryptographic-value",
+                        "locations": [
+                            {
+                                "physicalLocation": {
+                                    "artifactLocation": {"uri": "lib.rs"},
+                                    "region": {"startLine": 11},
                                 }
                             }
                         ],
@@ -701,10 +717,12 @@ const KEY: [u8; 32] = [0; 32];
         ]
     }
     kept, dropped = filter_sarif(sarif, td)
-    assert dropped == 1 and kept == 1, (kept, dropped)
-    assert sarif["runs"][0]["results"][0]["locations"][0]["physicalLocation"][
-        "region"
-    ]["startLine"] == 10
+    assert dropped == 1 and kept == 2, (kept, dropped)
+    kept_lines = [
+        r["locations"][0]["physicalLocation"]["region"]["startLine"]
+        for r in sarif["runs"][0]["results"]
+    ]
+    assert kept_lines == [8, 11], kept_lines
 
     print("filter-test-alerts: self-test ok")
 
