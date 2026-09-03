@@ -1,12 +1,19 @@
 name: storj-uplink
 # Integration tests and goldens pin Go vectors with fixed passphrases/keys/nonces.
-# In-crate `#[cfg(test)]` modules are stripped from the SARIF by
-# `filter-test-alerts.py` (column-0 `#[cfg(test)]` through EOF).
+# Trailing `#[cfg(test)] mod` blocks are stripped from the SARIF by
+# `filter-test-alerts.py`.
+#
+# `rust/hard-coded-cryptographic-value` is excluded: this crate is an encryption
+# client. Remaining hits are Go-compat protocol zeros (`storj.Nonce{}` / metadata
+# and ETag nonces; uniqueness is the random content key) and CSPRNG scratch
+# buffers overwritten before use. Test goldens must keep fixed keys.
 paths-ignore:
   - "crates/storj/tests/**"
   - "crates/*/tests/**"
   - "fuzz/**"
   - "scripts/**"
   - "crates/storj-proto/src/gen/**"
-# Go lives only under scripts/ (fixture generator); it is not a CodeQL language
-# here. Default setup is disabled so this advanced workflow can upload.
+query-filters:
+  - exclude:
+      id: rust/hard-coded-cryptographic-value
+
