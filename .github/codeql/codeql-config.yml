@@ -8,3 +8,5 @@ paths-ignore:
   - "fuzz/**"
   - "scripts/**"
   - "crates/storj-proto/src/gen/**"
+# Go lives only under scripts/ (fixture generator); it is not a CodeQL language
+# here. Default setup is disabled so this advanced workflow can upload.
