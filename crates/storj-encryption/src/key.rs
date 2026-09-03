@@ -1,6 +1,6 @@
 //! Root-key derivation (Argon2id) and HMAC-SHA512 HD steps.
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Sha256, Sha512};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
@@ -124,7 +124,7 @@ pub fn derive_nonce(derived_key: &Key) -> [u8; 24] {
     let mut mac = hmac_sha512(derived_key.as_bytes());
     mac.update(NONCE_HMAC_INFO);
     // The full 64-byte MAC contains the derived key material; wipe it.
-    let full = Zeroizing::new(mac.finalize().into_bytes());
+    let full = Zeroizing::new(<[u8; 64]>::from(mac.finalize().into_bytes()));
     let mut out = [0u8; 24];
     out.copy_from_slice(&full[..24]);
     out
@@ -143,7 +143,7 @@ fn hmac_sha512(key: &[u8]) -> HmacSha512 {
 
 fn truncate_key(mac: HmacSha512) -> Key {
     // The first 32 bytes *are* the derived key; wipe the whole 64-byte MAC.
-    let full = Zeroizing::new(mac.finalize().into_bytes());
+    let full = Zeroizing::new(<[u8; 64]>::from(mac.finalize().into_bytes()));
     let mut out = [0u8; 32];
     out.copy_from_slice(&full[..32]);
     Key { bytes: out }
@@ -180,7 +180,7 @@ mod tests {
         let a = derive_path_key_component(&key, "logs");
         let mut mac = HmacSha512::new_from_slice(&key).unwrap();
         mac.update(b"path:logs");
-        let expected = mac.finalize().into_bytes();
+        let expected: [u8; 64] = mac.finalize().into_bytes().into();
         assert_eq!(&a[..], &expected[..32]);
         assert_ne!(a, derive_path_key_component(&key, "path:logs"));
     }
@@ -199,7 +199,7 @@ mod tests {
         let got = derive_key(&key, "content");
         let mut mac = HmacSha512::new_from_slice(key.as_bytes()).unwrap();
         mac.update(b"content");
-        let expected = mac.finalize().into_bytes();
+        let expected: [u8; 64] = mac.finalize().into_bytes().into();
         assert_eq!(&got.as_bytes()[..], &expected[..32]);
     }
 }

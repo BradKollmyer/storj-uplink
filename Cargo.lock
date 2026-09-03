@@ -683,6 +683,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hmac"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6303bc9732ae41b04cb554b844a762b4115a61bfaa81e3e83050991eeb56863f"
+dependencies = [
+ "digest 0.11.3",
+]
+
+[[package]]
 name = "hybrid-array"
 version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1125,7 +1134,7 @@ version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8dd2a808d456c4a54e300a23e9f5a67e122c3024119acbfd73e3bf664491cb2"
 dependencies = [
- "hmac",
+ "hmac 0.12.1",
  "subtle",
 ]
 
@@ -1343,7 +1352,7 @@ dependencies = [
  "futures-core",
  "futures-util",
  "hex",
- "hmac",
+ "hmac 0.13.0",
  "prost",
  "prost-types",
  "rand",
@@ -1367,7 +1376,7 @@ dependencies = [
  "bs58",
  "getrandom 0.4.3",
  "hex",
- "hmac",
+ "hmac 0.13.0",
  "prost",
  "sha2 0.11.0",
  "storj-encryption",
@@ -1392,7 +1401,7 @@ dependencies = [
  "base64 0.23.1",
  "crypto_secretbox",
  "hex",
- "hmac",
+ "hmac 0.13.0",
  "sha2 0.11.0",
  "zeroize",
 ]
