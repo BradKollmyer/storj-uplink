@@ -1,21 +1,25 @@
 #!/usr/bin/env python3
-"""Drop CodeQL results that sit in test code.
+"""Drop CodeQL results that sit in test code or documented false positives.
 
 Removes:
   * paths under a `tests/` directory
   * locations at or after a trailing item-level `#[cfg(test)] mod ...`
-    (unit tests in this repo live in modules at end of file)
+  * `rust/hard-coded-cryptographic-value` on `pub const ZERO_NONCE` or
+    inside `csprng_bytes` (Go `storj.Nonce{}` / CSPRNG scratch buffer)
 
-String literals and comments are ignored, so a file that mentions
-`#[cfg(test)]` in a raw string does not swallow later production alerts.
-`#[cfg(test)]` on items other than `mod` is not a cutoff.
+The hard-coded-crypto query stays enabled for every other production site.
+String literals and comments are ignored when finding the test-mod cutoff.
 """
 
 from __future__ import annotations
 
 import json
+import re
 import sys
 from pathlib import Path
+
+_FN_RE = re.compile(r"^(?:pub(?:\([^)]+\))?\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)")
+_CRYPTO_RULE = "hard-coded-cryptographic-value"
 
 
 def _is_ident_start(ch: str) -> bool:
@@ -337,6 +341,62 @@ def result_in_tests(result: dict, cutoffs: dict[str, int | None], repo: Path) ->
     return all(location_in_tests(loc, cutoffs, repo) for loc in locs)
 
 
+def _enclosing_fn_name(lines: list[str], start_line: int) -> str | None:
+    for i in range(start_line, 0, -1):
+        m = _FN_RE.match(lines[i - 1])
+        if m:
+            return m.group(1)
+    return None
+
+
+def is_documented_crypto_fp_text(text: str, start_line: int) -> bool:
+    lines = text.splitlines()
+    if start_line < 1 or start_line > len(lines):
+        return False
+    line = lines[start_line - 1]
+    # Named protocol constant (Go storj.Nonce{}), including call sites.
+    if "ZERO_NONCE" in line:
+        return True
+    return _enclosing_fn_name(lines, start_line) == "csprng_bytes"
+
+
+def is_documented_crypto_fp(path: Path, start_line: int) -> bool:
+    try:
+        return is_documented_crypto_fp_text(path.read_text(encoding="utf-8"), start_line)
+    except OSError:
+        return False
+
+
+def _result_rule_id(result: dict) -> str:
+    if isinstance(result.get("ruleId"), str):
+        return result["ruleId"]
+    rule = result.get("rule")
+    if isinstance(rule, dict):
+        return str(rule.get("id") or "")
+    if isinstance(rule, str):
+        return rule
+    return ""
+
+
+def location_documented_crypto_fp(loc: dict, repo: Path) -> bool:
+    phys = loc.get("physicalLocation") or {}
+    art = phys.get("artifactLocation") or {}
+    uri = art.get("uri") or ""
+    start = (phys.get("region") or {}).get("startLine")
+    if start is None:
+        return False
+    return is_documented_crypto_fp(repo / uri_path(uri), start)
+
+
+def result_documented_crypto_fp(result: dict, repo: Path) -> bool:
+    if _CRYPTO_RULE not in _result_rule_id(result):
+        return False
+    locs = result.get("locations") or []
+    if not locs:
+        return False
+    return all(location_documented_crypto_fp(loc, repo) for loc in locs)
+
+
 def filter_sarif(data: dict, repo: Path) -> tuple[int, int]:
     kept = 0
     dropped = 0
@@ -345,7 +405,9 @@ def filter_sarif(data: dict, repo: Path) -> tuple[int, int]:
         results = run.get("results") or []
         filtered = []
         for result in results:
-            if result_in_tests(result, cutoffs, repo):
+            if result_in_tests(result, cutoffs, repo) or result_documented_crypto_fp(
+                result, repo
+            ):
                 dropped += 1
             else:
                 filtered.append(result)
@@ -412,6 +474,21 @@ mod tests {
 '''
     line = test_cutoff_text(src5)
     assert line == 5, line
+
+    crypto = """
+pub const ZERO_NONCE: [u8; 24] = [0; 24];
+fn other() {
+    let key = [0u8; 32];
+}
+fn csprng_bytes<const N: usize>() -> [u8; N] {
+    let mut bytes = [0u8; N];
+    bytes
+}
+"""
+    assert is_documented_crypto_fp_text(crypto, 2)
+    assert not is_documented_crypto_fp_text(crypto, 4)
+    assert is_documented_crypto_fp_text(crypto, 7)
+    assert is_documented_crypto_fp_text("encrypt(&ZERO_NONCE)\n", 1)
 
     print("filter-test-alerts: self-test ok")
 
