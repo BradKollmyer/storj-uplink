@@ -4,7 +4,7 @@
 
 Please **do not** open a public GitHub issue for security reports.
 
-Email **bradk@vitalsoft.com** with a description of the issue, its impact, and
+Email **rises_gall_4w@icloud.com** with a description of the issue, its impact, and
 a reproduction if possible. You should receive an acknowledgement, and we will
 keep you informed while a fix is prepared.
 
