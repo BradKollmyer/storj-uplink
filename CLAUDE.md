@@ -41,6 +41,8 @@ go run -C scripts .        # regenerates crates/storj/tests/fixtures/*; CI fails
 it to regenerate. Bump `storj.io/*` pins in `scripts/go.mod`, `scripts/interop/go.mod`
 and `proto/README.md` together.
 
+CI runs on `main` and pull requests (not every feature-branch push).
+
 Live tests (all `#[ignore]`, opt-in by env; they create and delete their own bucket):
 
 ```bash

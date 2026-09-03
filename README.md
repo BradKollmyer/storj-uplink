@@ -104,6 +104,11 @@ Object-matrix interop and `storj-sim` need a live grant (`STORJ_INTEROP_ACCESS` 
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). Changelog: [CHANGELOG.md](CHANGELOG.md).
+Code of Conduct: [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
+
+## Security
+
+Report vulnerabilities privately — see [SECURITY.md](SECURITY.md).
 
 ## License
 
