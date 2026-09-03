@@ -16,6 +16,9 @@ unpublished.
 - The GitHub repository is public. CI and grant-roundtrip interop run on `main`
   and pull requests (not every feature-branch push), with concurrency
   cancellation. Fork pull requests never receive `STORJ_SIM_ACCESS`.
+- CodeQL default setup scans Rust, Go, and Actions. PRs also run GitHub
+  dependency review. CodeRabbit config is `.coderabbit.yaml` (install the
+  [CodeRabbit GitHub App](https://github.com/apps/coderabbitai) on this repo).
 
 ### Fixed
 
