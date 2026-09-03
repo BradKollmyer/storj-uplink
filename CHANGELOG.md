@@ -5,9 +5,10 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-The public API is `storj::*` only. Internal crates (`storj-access`, `storj-proto`,
-`storj-rpc`, `storj-encryption`, `storj-ec`, `storj-uplink`, `storj-test`) stay
-unpublished.
+The public API is `storj::*` only. Implementation crates (`storj-access`,
+`storj-proto`, `storj-rpc`, `storj-encryption`, `storj-ec`, `storj-uplink`) are
+published so the facade can resolve on crates.io; they are not a stable API.
+`storj-test` stays unpublished.
 
 ## [Unreleased]
 
@@ -46,6 +47,8 @@ runs and Dependabot bumps landed before `v1.0.0` was cut.
 - **Breaking:** `Object`, `UploadInfo`, `Part` and `RetentionMode` are
   `#[non_exhaustive]`; `Object` gained `version` (pass it to Object Lock calls).
 - Repository name is `storj-uplink` (was `storj-rust`). The public crate remains `storj`.
+- Published on crates.io: `storj` 1.0.0 and the implementation crates at the
+  same version. `storj-test` remains unpublished.
 - The GitHub repository is public. CI and grant-roundtrip interop run on `main`
   and pull requests (not every feature-branch push), with concurrency
   cancellation. Fork pull requests never receive `STORJ_SIM_ACCESS`.
@@ -118,8 +121,8 @@ runs and Dependabot bumps landed before `v1.0.0` was cut.
 
 - MSRV is 1.85 (edition 2024)
 - Dual-licensed MIT OR Apache-2.0
-- Consume via git or path: internal crates are `publish = false`, so
-  `cargo publish -p storj` is not possible yet
+- Install: `storj = "1.0"` from crates.io (docs: https://docs.rs/storj), or git
+  tag `v1.0.0`
 - Edge / GatewayMT (`storj::edge`) is specified for 1.x and is not in this
   release
 

@@ -4,9 +4,10 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "DRPC client frame codec and unary invoke (workspace-internal, unpublished)"
+description = "DRPC client frame codec and unary invoke"
 repository.workspace = true
-publish = false
+homepage.workspace = true
+exclude = ["testdata/**"]
 
 [dependencies]
 thiserror.workspace = true

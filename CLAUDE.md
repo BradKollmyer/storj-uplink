@@ -7,9 +7,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 A native Rust implementation of the Storj Uplink client (the Go reference is
 `storj.io/uplink` and `storj.io/common`, pinned in `proto/README.md` and
 `scripts/go.mod`). It speaks DRPC over TLS directly to satellites and storage
-nodes; it is not an FFI wrapper. Only the `storj` crate is public API; every
-other crate is `publish = false`. Go is never needed to build or use the crate,
-only to regenerate test fixtures and run the interop helper.
+nodes; it is not an FFI wrapper. Only the `storj` crate is public API. Implementation crates are published to
+crates.io so the facade can resolve; `storj-test` is `publish = false`. Go is
+never needed to build or use the crate, only to regenerate test fixtures and
+run the interop helper.
 
 ## Commands
 

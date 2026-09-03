@@ -1,6 +1,7 @@
 //! Piecestore client, order-limit verify, SN pool, and segment upload/download.
 //!
-//! Workspace-internal (`publish = false`).
+//! Implementation detail of the `storj` crate; not a stable public API.
+//! Depend on `storj` instead.
 
 #![deny(clippy::undocumented_unsafe_blocks)]
 

@@ -16,17 +16,21 @@ tree.
 
 ## Install
 
-Internal crates are workspace-only (`publish = false`), so 1.0.0 is consumed
-via git or path. Callers need their own Tokio runtime; `tokio` is not
-re-exported.
-
 ```toml
 [dependencies]
-storj = { git = "https://github.com/BradKollmyer/storj-uplink", tag = "v1.0.0" }
+storj = "1.0"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util"] }
 ```
 
+Callers need their own Tokio runtime; `tokio` is not re-exported.
+
+Git: `storj = { git = "https://github.com/BradKollmyer/storj-uplink", tag = "v1.0.0" }`.
 From this workspace: `storj = { path = "crates/storj" }`.
+
+The public API is `storj::*` only. Implementation crates (`storj-access`,
+`storj-ec`, `storj-encryption`, `storj-proto`, `storj-rpc`, `storj-uplink`)
+are on crates.io so Cargo can resolve them; do not depend on them directly.
+`storj-test` is unpublished.
 
 ## Quick start
 

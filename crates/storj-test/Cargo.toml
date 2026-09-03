@@ -4,8 +4,9 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Test helpers, fixtures, and interop gates for storj"
+description = "Test helpers, fixtures, and interop gates for storj (unpublished)"
 publish = false
+homepage.workspace = true
 
 [dependencies]
 prost.workspace = true

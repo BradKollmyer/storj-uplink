@@ -6,7 +6,8 @@ rust-version.workspace = true
 license.workspace = true
 description = "Reed-Solomon erasure coding compatible with Go infectious / eestream"
 repository.workspace = true
-publish = false
+homepage.workspace = true
+exclude = ["tests/**"]
 
 [dependencies]
 thiserror.workspace = true

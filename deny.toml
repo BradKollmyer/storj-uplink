@@ -37,9 +37,9 @@ allow = [
 
 [bans]
 multiple-versions = "warn"
-# Workspace path deps carry no version (internal crates are `publish = false`
-# and `storj` is consumed via git/path, see README); cargo-deny treats a
-# publishable crate's version-less path deps as wildcards, so warn instead.
+# `storj-test` is path-only (`publish = false`). Other workspace crates carry
+# `version` so they can be published. cargo-deny treats version-less path deps
+# as wildcards, so warn instead.
 wildcards = "warn"
 allow-wildcard-paths = true
 deny = [

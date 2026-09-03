@@ -1,5 +1,8 @@
 //! Reed-Solomon erasure coding for Storj stripes.
 //!
+//! Implementation detail of the `storj` crate; not a stable public API.
+//! Depend on `storj` instead.
+//!
 //! Shipping codec matches Go `storj.io/infectious` / `eestream` byte-for-byte
 //! (Rizzo/zfec systematic matrix over GF(2^8), poly 0x11d).
 //!
