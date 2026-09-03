@@ -11,21 +11,64 @@ unpublished.
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-09-03
+
+Native Uplink API freeze. This crate is not a wrapper around `uplink-c` and is
+not a drop-in for crates.io `uplink` 0.11.0 (blocking FFI, `!Send`).
+
+The 2026-09-02 snapshot is superseded by this tagged release: live satellite
+runs and Dependabot bumps landed before `v1.0.0` was cut.
+
+### Added
+
+- Multi-segment upload/download, including objects larger than one 64 MiB segment
+- Object list, stat, delete, copy, and move
+- Multipart uploads (`begin_upload` / `upload_part` / `commit_upload` / abort / list)
+- `revoke_access`, `update_object_metadata`, `upload_from` / `download_to`
+- Object Lock: retention, legal hold, and bucket lock configuration
+- `Config.message_timeout` (per-read/write deadline, default 10 min)
+- `UploadOptions.retention` / `UploadOptions.legal_hold`, sent in `BeginObject`
+- `storj-ec`: NEON/SSSE3 `addmul` (≈8x scalar), `ReedSolomon::decode_plan`
+  (matrix inverted once per share set), in-place stripe encoding
+- `storj-encryption`: in-place block transforms, in-place store adds, redacted
+  `Debug` for `Store`/`Lookup`/`PathIter`, zeroized derivation scratch
+- `cargo-fuzz` targets under `fuzz/` (DRPC frames, macaroons, grants, path
+  components, CompressedBatch)
+- Mock satellite enforces `disallow_*` caveats per RPC; mock storage node honors
+  download order allocation and verifies orders and the uplink piece hash
+- Go↔Rust writer/reader size matrix test including `64MiB+1` (opt-in: gated on
+  `STORJ_INTEROP` plus a live grant)
+
 ### Changed
 
+- **Breaking:** `storj::encryption` no longer re-exports `storj_encryption`
+  internals; only `EncryptionKey` and `derive_root_key` remain public.
+- **Breaking:** `Object`, `UploadInfo`, `Part` and `RetentionMode` are
+  `#[non_exhaustive]`; `Object` gained `version` (pass it to Object Lock calls).
+- Repository name is `storj-uplink` (was `storj-rust`). The public crate remains `storj`.
 - The GitHub repository is public. CI and grant-roundtrip interop run on `main`
   and pull requests (not every feature-branch push), with concurrency
   cancellation. Fork pull requests never receive `STORJ_SIM_ACCESS`.
-- CodeQL default setup scans Rust, Go, and Actions. PRs also run GitHub
-  dependency review. CodeRabbit config is `.coderabbit.yaml` (install the
-  [CodeRabbit GitHub App](https://github.com/apps/coderabbitai) on this repo).
+- CI: rustdoc, MSRV (1.85) and Linux/macOS/Windows jobs; `--locked`; read-only
+  token; whole-fixture staleness check; nightly object matrix when the
+  `STORJ_SIM_ACCESS` secret is present.
+- Advanced CodeQL workflow (Rust and Actions) with a SARIF filter for tests and
+  two documented protocol/CSPRNG false positives. The
+  `rust/hard-coded-cryptographic-value` query stays enabled. PRs run GitHub
+  dependency review. CodeRabbit config is `.coderabbit.yaml`.
+- aarch64 builds enable ARMv8 AES/PMULL via `.cargo/config.toml` (~10x AES-GCM).
+- Dependencies: `prost`/`prost-types` 0.14, `rand` 0.10, `sha2` 0.11, `hmac`
+  0.13, `getrandom` 0.4, `x509-parser` 0.18, `argon2` 0.6, `base64` 0.23.
+  GitHub Actions: `actions/checkout` 7, `actions/setup-go` 7,
+  `actions/dependency-review-action` 5.
 
 ### Fixed
 
 - **Wire compatibility:** order-limit and piece-hash signatures are now verified
   against the peer's *leaf* certificate (Go `SigneeFromPeerIdentity`), and the
-  uplink signs with its leaf key. 1.0.0 verified against the CA key, which
-  fails every remote-segment upload/download against a real satellite.
+  uplink signs with its leaf key. The 2026-09-02 snapshot verified against the
+  CA key, which fails every remote-segment upload/download against a real
+  satellite.
 - `RetryBeginSegmentPieces` responses are indexed by piece number (the satellite
   returns the full limit list), so retry rounds upload under the right limits.
 - Multipart abort sends only `BeginDeleteObject` (Go never calls
@@ -59,8 +102,8 @@ unpublished.
 - **Found by the first live runs against a production satellite** (the full
   Go↔Rust size matrix, including 64 MiB+1, now passes there and against storj-sim):
   - TLS peer verification accepts signed identity chains (`leaf, CA, signer`)
-    like Go `peertls`; 1.0.0 required the CA to be self-signed and could not
-    open a `Project` against a real satellite.
+    like Go `peertls`; the 2026-09-02 snapshot required the CA to be self-signed
+    and could not open a `Project` against a real satellite.
   - Order-limit / piece-hash signing bytes omit Go-zero timestamps (year-1
     seconds on the wire) and zero keys, matching `signing.EncodeOrderLimit`;
     every limit without a piece expiration failed verification before.
@@ -71,46 +114,6 @@ unpublished.
   - The mocks now present signed identity chains and enforce piece sizes and
     ordering, so these paths are covered without a satellite.
 
-### Added
-
-- `Config.message_timeout` (per-read/write deadline, default 10 min).
-- `UploadOptions.retention` / `UploadOptions.legal_hold`, sent in `BeginObject`.
-- `storj-ec`: NEON/SSSE3 `addmul` (≈8x scalar), `ReedSolomon::decode_plan`
-  (matrix inverted once per share set), in-place stripe encoding.
-- `storj-encryption`: in-place block transforms, in-place store adds, redacted
-  `Debug` for `Store`/`Lookup`/`PathIter`, zeroized derivation scratch.
-- `cargo-fuzz` targets under `fuzz/` (DRPC frames, macaroons, grants, path
-  components, CompressedBatch).
-- Mock satellite enforces `disallow_*` caveats per RPC; mock storage node honors
-  download order allocation and verifies orders and the uplink piece hash.
-
-### Changed
-
-- **Breaking:** `storj::encryption` no longer re-exports `storj_encryption`
-  internals; only `EncryptionKey` and `derive_root_key` remain public.
-- **Breaking:** `Object`, `UploadInfo`, `Part` and `RetentionMode` are
-  `#[non_exhaustive]`; `Object` gained `version` (pass it to Object Lock calls).
-- Repository name is `storj-uplink` (was `storj-rust`). The public crate remains `storj`.
-- CI: rustdoc, MSRV (1.85) and Linux/macOS/Windows jobs; `--locked`; read-only
-  token; whole-fixture staleness check; nightly object matrix when the
-  `STORJ_SIM_ACCESS` secret is present.
-- aarch64 builds enable ARMv8 AES/PMULL via `.cargo/config.toml` (~10x AES-GCM).
-
-## [1.0.0] - 2026-09-02
-
-Native Uplink API freeze. This crate is not a wrapper around `uplink-c` and is
-not a drop-in for crates.io `uplink` 0.11.0 (blocking FFI, `!Send`).
-
-### Added
-
-- Multi-segment upload/download, including objects larger than one 64 MiB segment
-- Object list, stat, delete, copy, and move
-- Multipart uploads (`begin_upload` / `upload_part` / `commit_upload` / abort / list)
-- `revoke_access`, `update_object_metadata`, `upload_from` / `download_to`
-- Object Lock: retention, legal hold, and bucket lock configuration
-- Go↔Rust writer/reader size matrix test including `64MiB+1` (opt-in: gated on
-  `STORJ_INTEROP` plus a live grant; it was not run in CI for this release)
-
 ### Notes
 
 - MSRV is 1.85 (edition 2024)
@@ -119,3 +122,4 @@ not a drop-in for crates.io `uplink` 0.11.0 (blocking FFI, `!Send`).
   `cargo publish -p storj` is not possible yet
 - Edge / GatewayMT (`storj::edge`) is specified for 1.x and is not in this
   release
+
