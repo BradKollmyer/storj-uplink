@@ -61,6 +61,44 @@ async fn stat_delete_copy_move() {
 }
 
 #[tokio::test]
+async fn move_object_requires_delete() {
+    let mock = MockSatellite::start().await;
+    let parent = open_test_project(&mock).await;
+    let bucket = unique("mvdel");
+    parent.ensure_bucket(&bucket).await.unwrap();
+    upload(&parent, &bucket, "src", b"payload").await;
+
+    let no_delete = mock
+        .access()
+        .share(
+            Permission {
+                allow_download: true,
+                allow_upload: true,
+                allow_list: true,
+                allow_delete: false,
+                ..Permission::default()
+            },
+            &[],
+        )
+        .expect("share upload-without-delete");
+    let restricted = Project::open(&no_delete).await.expect("open restricted");
+    let err = restricted
+        .move_object(&bucket, "src", &bucket, "dst")
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::PermissionDenied);
+
+    parent
+        .move_object(&bucket, "src", &bucket, "dst")
+        .await
+        .expect("full grant can still move");
+    parent
+        .stat_object(&bucket, "dst")
+        .await
+        .expect("moved object exists");
+}
+
+#[tokio::test]
 async fn delete_object_returns_none_without_read() {
     let mock = MockSatellite::start().await;
     let project = open_test_project(&mock).await;

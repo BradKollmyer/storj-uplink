@@ -1224,6 +1224,7 @@ fn begin_move(
     req: BeginMoveObjectRequest,
     state: &Mutex<MockState>,
 ) -> Result<BeginMoveObjectResponse, (u64, String)> {
+    check_action(&req.header, Action::Delete)?;
     let copy = begin_copy(
         BeginCopyObjectRequest {
             header: req.header,
@@ -1251,7 +1252,7 @@ fn finish_move(
     let mut st = state.lock().expect("mock state");
     check_key(&req.header, &st)?;
     check_action(&req.header, Action::Write)?;
-    check_action(&req.header, Action::Write)?;
+    check_action(&req.header, Action::Delete)?;
     let dest = utf8_name(&req.new_bucket)?;
     if !st.buckets.contains_key(&dest) {
         return Err((RPC_NOT_FOUND, format!("bucket not found: {dest}")));
