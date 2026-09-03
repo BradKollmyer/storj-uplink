@@ -3,7 +3,7 @@
 use std::time::{Duration, SystemTime};
 use storj::{
     BucketObjectLockConfiguration, DefaultRetention, ErrorKind, Permission, Project, Retention,
-    RetentionMode, SetObjectRetentionOptions,
+    RetentionMode, SetObjectRetentionOptions, UploadOptions,
 };
 use storj_test::MockSatellite;
 use tokio::io::AsyncWriteExt;
@@ -161,6 +161,112 @@ async fn put_get_retention_and_legal_hold() {
         .await
         .unwrap_err();
     assert_eq!(no_bucket.kind(), ErrorKind::BucketNotFound);
+}
+
+#[tokio::test]
+async fn begin_object_retention_and_legal_hold_applied_at_commit() {
+    let mock = MockSatellite::start().await;
+    let project = open_test_project(&mock).await;
+    let bucket = unique_bucket();
+    project.create_bucket(&bucket).await.expect("create bucket");
+    project
+        .set_bucket_object_lock_configuration(
+            &bucket,
+            BucketObjectLockConfiguration {
+                enabled: true,
+                default_retention: None,
+            },
+        )
+        .await
+        .expect("enable lock");
+
+    let until = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+    let retention = Retention {
+        mode: RetentionMode::Governance,
+        retain_until: until,
+    };
+    let key = "locked-at-create";
+    let mut upload = project
+        .upload_object(
+            &bucket,
+            key,
+            UploadOptions {
+                retention: Some(retention.clone()),
+                legal_hold: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("upload_object");
+    upload.write_all(b"lock-at-create").await.expect("write");
+    upload.commit().await.expect("commit");
+
+    assert_eq!(
+        project
+            .get_object_retention(&bucket, key, None)
+            .await
+            .expect("get retention"),
+        Some(retention)
+    );
+    assert!(
+        project
+            .get_object_legal_hold(&bucket, key, None)
+            .await
+            .expect("get legal hold")
+    );
+}
+
+#[tokio::test]
+async fn begin_object_retention_rejected_without_bucket_lock() {
+    let mock = MockSatellite::start().await;
+    let project = open_test_project(&mock).await;
+    let bucket = unique_bucket();
+    project.create_bucket(&bucket).await.expect("create bucket");
+
+    let err = match project
+        .upload_object(
+            &bucket,
+            "k",
+            UploadOptions {
+                retention: Some(Retention {
+                    mode: RetentionMode::Compliance,
+                    retain_until: SystemTime::UNIX_EPOCH + Duration::from_secs(60),
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+    {
+        Ok(_) => panic!("expected BeginObject retention rejection"),
+        Err(e) => e,
+    };
+    assert_eq!(err.kind(), ErrorKind::Protocol);
+    assert!(
+        err.to_string()
+            .contains("object lock is not enabled for this bucket"),
+        "{err}"
+    );
+
+    let err = match project
+        .upload_object(
+            &bucket,
+            "k",
+            UploadOptions {
+                legal_hold: true,
+                ..Default::default()
+            },
+        )
+        .await
+    {
+        Ok(_) => panic!("expected BeginObject legal-hold rejection"),
+        Err(e) => e,
+    };
+    assert_eq!(err.kind(), ErrorKind::Protocol);
+    assert!(
+        err.to_string()
+            .contains("object lock is not enabled for this bucket"),
+        "{err}"
+    );
 }
 
 #[tokio::test]

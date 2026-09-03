@@ -82,6 +82,8 @@ struct PendingObject {
     encryption_parameters: Option<storj_proto::encryption::EncryptionParameters>,
     segments: Vec<StoredSegment>,
     in_flight: HashMap<Vec<u8>, InFlightSegment>,
+    retention: Option<Retention>,
+    legal_hold: bool,
 }
 
 struct InFlightSegment {
@@ -829,8 +831,19 @@ fn begin_object(
     check_key(&req.header, &st)?;
     check_action(&req.header, Action::Write)?;
     let name = utf8_name(&req.bucket)?;
-    if !st.buckets.contains_key(&name) {
-        return Err((RPC_NOT_FOUND, format!("bucket not found: {name}")));
+    let rec = st
+        .buckets
+        .get(&name)
+        .ok_or_else(|| (RPC_NOT_FOUND, format!("bucket not found: {name}")))?;
+    // Satellite `validateBucketObjectLockStatus`: retention / legal hold on
+    // BeginObject require Object Lock enabled on the bucket.
+    let retention = req.retention.filter(|r| r.mode != 0);
+    let legal_hold = req.legal_hold;
+    if (retention.is_some() || legal_hold) && !rec.lock_config.as_ref().is_some_and(|c| c.enabled) {
+        return Err((
+            RPC_OBJECT_LOCK_BUCKET_CONFIG_MISSING,
+            "object lock is not enabled for this bucket".into(),
+        ));
     }
     st.next_id += 1;
     let stream_id = st.next_id.to_be_bytes().to_vec();
@@ -853,6 +866,8 @@ fn begin_object(
             )),
             segments: Vec::new(),
             in_flight: HashMap::new(),
+            retention,
+            legal_hold,
         },
     );
     Ok(BeginObjectResponse {
@@ -919,6 +934,18 @@ fn commit_object(
     };
     if let Some(rec) = st.buckets.get_mut(&pending.bucket) {
         rec.objects += 1;
+        let lock_key = (pending.enc_key.clone(), Vec::new());
+        if pending.retention.is_some() || pending.legal_hold {
+            rec.object_locks.insert(
+                lock_key,
+                ObjectLockRec {
+                    retention: pending.retention,
+                    legal_hold: pending.legal_hold,
+                },
+            );
+        } else {
+            rec.object_locks.remove(&lock_key);
+        }
     }
     st.committed.insert(
         (pending.bucket, pending.enc_key),
