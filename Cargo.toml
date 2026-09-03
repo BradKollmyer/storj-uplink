@@ -21,7 +21,7 @@ storj-test = { path = "crates/storj-test" }
 storj-uplink = { path = "crates/storj-uplink" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "time", "net", "sync"] }
 bytes = "1"
-prost = "0.13"
+prost = "0.14"
 prost-types = "0.13"
 thiserror = "2"
 zstd = "0.13"
