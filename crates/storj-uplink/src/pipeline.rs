@@ -129,23 +129,28 @@ pub fn encrypt_remote(
 
 /// Zero-pad `data` so its length is a multiple of `stripe_size`.
 #[must_use]
-pub fn pad_to_stripe(data: &[u8], stripe_size: usize) -> Vec<u8> {
-    if stripe_size == 0 {
-        return data.to_vec();
+/// Go `eestream.CalcPieceSize`: the piece size the satellite expects for an
+/// encrypted segment of `encrypted_size` bytes. The `+ 4` is the padding
+/// length trailer that [`storj_encryption::pad`] always appends before
+/// erasure coding, so an exact stripe multiple still gains a stripe.
+pub fn calc_piece_size(encrypted_size: i64, rs: &Redundancy) -> i64 {
+    let stripe = rs.stripe_size() as i64;
+    if stripe == 0 || rs.k == 0 {
+        return 0;
     }
-    let rem = data.len() % stripe_size;
-    if rem == 0 {
-        return data.to_vec();
-    }
-    let mut out = data.to_vec();
-    out.resize(data.len() + (stripe_size - rem), 0);
-    out
+    let stripes = (encrypted_size + storj_encryption::UINT32_SIZE as i64 + stripe - 1) / stripe;
+    stripes * stripe / rs.k as i64
 }
 
 /// Encode padded ciphertext into `n` pieces (concatenation of per-stripe shares).
 pub fn encode_pieces(encrypted: &[u8], rs: &Redundancy) -> Result<Vec<Vec<u8>>> {
     let stripe = rs.stripe_size();
-    let padded = pad_to_stripe(encrypted, stripe);
+    // Go `segmentupload`: `encryption.PadReader(segment, stripeSize)` pads the
+    // *encrypted* segment with the length-trailer padding (at least 4 bytes,
+    // total a multiple of the stripe), so a segment that is already an exact
+    // stripe multiple still gains a whole stripe. The satellite verifies
+    // piece sizes against `CalcPieceSize`, which assumes exactly this.
+    let padded = storj_encryption::pad(encrypted, stripe)?;
     let codec = ReedSolomon::new(rs.k, rs.n, rs.share_size)?;
     if padded.is_empty() {
         return Ok(vec![Vec::new(); rs.n]);
@@ -354,6 +359,49 @@ pub fn decrypt_user_data_full(
         SerializableMeta::decode(info.metadata.as_slice())?
     };
     Ok((meta, info, custom))
+}
+
+#[cfg(test)]
+mod piece_size_tests {
+    use super::*;
+
+    fn rs() -> Redundancy {
+        Redundancy::from_scheme(&storj_proto::pointerdb::RedundancyScheme {
+            r#type: 1,
+            min_req: 2,
+            total: 4,
+            repair_threshold: 3,
+            success_threshold: 3,
+            erasure_share_size: 32,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn pieces_match_go_calc_piece_size_including_exact_stripe_multiples() {
+        let rs = rs();
+        let stripe = rs.stripe_size();
+        for len in [
+            0usize,
+            1,
+            stripe - 5,
+            stripe - 4,
+            stripe - 3,
+            stripe,
+            stripe + 1,
+            3 * stripe,
+        ] {
+            let data = vec![0xabu8; len];
+            let pieces = encode_pieces(&data, &rs).unwrap();
+            let want = calc_piece_size(len as i64, &rs) as usize;
+            assert_eq!(pieces[0].len(), want, "encrypted len {len}");
+        }
+        // An exact stripe multiple gains a whole stripe for the trailer.
+        assert_eq!(
+            calc_piece_size(stripe as i64, &rs),
+            2 * rs.share_size as i64
+        );
+    }
 }
 
 #[cfg(test)]

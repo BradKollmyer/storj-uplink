@@ -541,7 +541,11 @@ mod tests {
         let pieces = encode_pieces(&data, &rs).unwrap();
         let shares: Vec<(i32, Vec<u8>)> = vec![(1, pieces[1].clone()), (3, pieces[3].clone())];
         let got = decode_encrypted(&shares, &rs).unwrap();
-        assert_eq!(got, data);
+        assert_eq!(
+            &got[..data.len()],
+            &data[..],
+            "decoded prefix must be the encrypted data; the rest is the Go padding trailer"
+        );
         let too_few = vec![(0, pieces[0].clone())];
         assert!(decode_encrypted(&too_few, &rs).is_err());
     }
