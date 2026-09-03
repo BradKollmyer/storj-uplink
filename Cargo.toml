@@ -33,7 +33,7 @@ base64 = "0.22"
 hmac = "0.12"
 sha2 = "0.10"
 blake3 = "1"
-ed25519-dalek = { version = "2", features = ["rand_core"] }
+ed25519-dalek = { version = "3", features = ["rand_core"] }
 rand = "0.8"
 futures-core = "0.3"
 futures-util = "0.3"
