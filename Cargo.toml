@@ -22,7 +22,7 @@ storj-uplink = { path = "crates/storj-uplink" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "time", "net", "sync"] }
 bytes = "1"
 prost = "0.13"
-prost-types = "0.13"
+prost-types = "0.14"
 thiserror = "2"
 zstd = "0.13"
 zeroize = { version = "1", features = ["derive"] }
