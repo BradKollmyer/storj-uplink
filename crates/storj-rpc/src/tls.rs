@@ -12,7 +12,7 @@ use rustls::{
     ClientConfig, DigitallySignedStruct, DistinguishedName, Error as RustlsError, SignatureScheme,
 };
 
-use crate::identity::{Identity, IdentityError, NodeId, verify_cert_pair};
+use crate::identity::{Identity, IdentityError, NodeId, verify_chain};
 
 fn provider() -> Arc<CryptoProvider> {
     Arc::new(rustls::crypto::aws_lc_rs::default_provider())
@@ -54,7 +54,11 @@ impl ServerCertVerifier for NodeIdVerifier {
         let ca = intermediates
             .first()
             .ok_or_else(|| cert_err("invalid certificate chain: missing CA"))?;
-        verify_cert_pair(end_entity.as_ref(), ca.as_ref()).map_err(tls_err)?;
+        // Go `VerifyPeerCertChains`: leaf <- CA <- ... <- self-signed root.
+        // Production peers are signed identities with a signer above the CA.
+        let mut chain: Vec<&[u8]> = vec![end_entity.as_ref()];
+        chain.extend(intermediates.iter().map(|c| c.as_ref()));
+        verify_chain(&chain).map_err(tls_err)?;
         let got = NodeId::from_certificate_der(ca.as_ref()).map_err(tls_err)?;
         if got != self.expected {
             return Err(cert_err("peer ID did not match requested ID"));
@@ -114,10 +118,12 @@ impl ClientCertVerifier for AnyStorjClientVerifier {
         intermediates: &[CertificateDer<'_>],
         _now: UnixTime,
     ) -> Result<ClientCertVerified, RustlsError> {
-        let ca = intermediates
-            .first()
-            .ok_or_else(|| cert_err("invalid certificate chain: missing CA"))?;
-        verify_cert_pair(end_entity.as_ref(), ca.as_ref()).map_err(tls_err)?;
+        if intermediates.is_empty() {
+            return Err(cert_err("invalid certificate chain: missing CA"));
+        }
+        let mut chain: Vec<&[u8]> = vec![end_entity.as_ref()];
+        chain.extend(intermediates.iter().map(|c| c.as_ref()));
+        verify_chain(&chain).map_err(tls_err)?;
         Ok(ClientCertVerified::assertion())
     }
 
