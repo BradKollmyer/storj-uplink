@@ -96,7 +96,7 @@ fn validate_permission(permission: &Permission) -> Result<(), Error> {
 
 fn random_nonce() -> Result<Vec<u8>, Error> {
     let mut nonce = [0u8; 4];
-    getrandom::getrandom(&mut nonce)
+    getrandom::fill(&mut nonce)
         .map_err(|e| Error::new(format!("unable to generate nonce: {e}")))?;
     Ok(nonce.to_vec())
 }
