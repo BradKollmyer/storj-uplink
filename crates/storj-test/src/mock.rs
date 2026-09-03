@@ -153,7 +153,8 @@ pub struct MockSatellite {
 impl MockSatellite {
     /// Bind `127.0.0.1:0`, serve DRPC over TLS with NodeID pinning.
     pub async fn start() -> Self {
-        let identity = Identity::generate().expect("mock satellite identity");
+        // Signed identity: [leaf, CA, signer], as production satellites present.
+        let identity = Identity::generate_signed().expect("mock satellite identity");
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind mock satellite");

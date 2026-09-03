@@ -37,7 +37,7 @@ pub struct MockStorageNode {
 impl MockStorageNode {
     /// Bind `127.0.0.1:0` and serve piecestore over TLS.
     pub async fn start(satellite_cert: Vec<u8>) -> Self {
-        let identity = Identity::generate().expect("mock SN identity");
+        let identity = Identity::generate_signed().expect("mock SN identity");
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind mock SN");

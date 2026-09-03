@@ -130,12 +130,26 @@ pub struct Identity {
     id: NodeId,
     leaf: CertificateDer<'static>,
     ca: CertificateDer<'static>,
+    /// Certificates above the CA (Go "signed identity": the Storj signer that
+    /// signed the CA, then any further parents). Empty for unsigned identities.
+    parents: Vec<CertificateDer<'static>>,
     key_pkcs8: Vec<u8>,
 }
 
 impl Identity {
     /// Generate an ephemeral identity (Go `NewFullIdentity` with difficulty 0).
     pub fn generate() -> Result<Self, IdentityError> {
+        Self::generate_with_signer(false)
+    }
+
+    /// Generate an ephemeral *signed* identity: the CA is signed by a fresh
+    /// self-signed signer certificate, so the chain is `[leaf, CA, signer]`
+    /// like production satellites and storage nodes present.
+    pub fn generate_signed() -> Result<Self, IdentityError> {
+        Self::generate_with_signer(true)
+    }
+
+    fn generate_with_signer(signed: bool) -> Result<Self, IdentityError> {
         let ca_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)
             .map_err(|e| IdentityError::Certificate(e.to_string()))?;
         let mut ca_params = CertificateParams::new(Vec::<String>::new())
@@ -148,9 +162,29 @@ impl Identity {
             IDENTITY_VERSION_OID_COMPONENTS,
             vec![ID_VERSION_V0],
         )];
-        let ca_cert = ca_params
-            .self_signed(&ca_key)
-            .map_err(|e| IdentityError::Certificate(e.to_string()))?;
+        let mut parents = Vec::new();
+        let ca_cert = if signed {
+            let signer_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)
+                .map_err(|e| IdentityError::Certificate(e.to_string()))?;
+            let mut signer_params = CertificateParams::new(Vec::<String>::new())
+                .map_err(|e| IdentityError::Certificate(e.to_string()))?;
+            signer_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+            signer_params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
+            signer_params.extended_key_usages.clear();
+            signer_params.distinguished_name = storj_dn();
+            let signer_cert = signer_params
+                .self_signed(&signer_key)
+                .map_err(|e| IdentityError::Certificate(e.to_string()))?;
+            let ca_cert = ca_params
+                .signed_by(&ca_key, &signer_cert, &signer_key)
+                .map_err(|e| IdentityError::Certificate(e.to_string()))?;
+            parents.push(signer_cert.der().clone());
+            ca_cert
+        } else {
+            ca_params
+                .self_signed(&ca_key)
+                .map_err(|e| IdentityError::Certificate(e.to_string()))?
+        };
 
         let leaf_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)
             .map_err(|e| IdentityError::Certificate(e.to_string()))?;
@@ -177,6 +211,7 @@ impl Identity {
             id,
             leaf: leaf_der,
             ca: ca_der,
+            parents,
             key_pkcs8: leaf_key.serialize_der(),
         })
     }
@@ -187,10 +222,12 @@ impl Identity {
         self.id
     }
 
-    /// Leaf then CA (Go `FullIdentity.Chain`).
+    /// Leaf, CA, then any signer/parent certs (Go `FullIdentity.Chain`).
     #[must_use]
     pub fn cert_chain(&self) -> Vec<CertificateDer<'static>> {
-        vec![self.leaf.clone(), self.ca.clone()]
+        let mut chain = vec![self.leaf.clone(), self.ca.clone()];
+        chain.extend(self.parents.iter().cloned());
+        chain
     }
 
     /// Leaf PKCS#8 private key for rustls.
@@ -233,12 +270,15 @@ impl Identity {
         })?;
         let leaf = certs[0].clone();
         let ca = certs[1].clone();
-        verify_cert_pair(&leaf, &ca)?;
+        let chain: Vec<&[u8]> = certs.iter().map(|c| c.as_ref()).collect();
+        verify_chain(&chain)?;
+        let parents: Vec<CertificateDer<'static>> = certs[2..].to_vec();
         let id = NodeId::from_certificate_der(&ca)?;
         Ok(Self {
             id,
             leaf,
             ca,
+            parents,
             key_pkcs8,
         })
     }
@@ -341,12 +381,27 @@ fn double_sha256(data: &[u8]) -> [u8; NODE_ID_SIZE] {
     Sha256::digest(mid).into()
 }
 
-/// Verify leaf is signed by CA and CA is self-signed (Go `VerifyPeerCertChains`).
-pub(crate) fn verify_cert_pair(leaf_der: &[u8], ca_der: &[u8]) -> Result<(), IdentityError> {
-    let leaf = parse_cert(leaf_der)?;
-    let ca = parse_cert(ca_der)?;
-    verify_signed_by(&leaf, &ca)?;
-    verify_signed_by(&ca, &ca)?;
+/// Go `peertls.VerifyPeerCertChains` / `verifyChainSignatures`: every
+/// certificate must be signed by the next one in the chain and the last one
+/// must be self-signed. Signed identities (production satellites and storage
+/// nodes) present `[leaf, CA, signer]`, where the CA is signed by Storj's
+/// signer rather than by itself; unsigned identities present `[leaf, CA]`.
+pub(crate) fn verify_chain(chain_der: &[&[u8]]) -> Result<(), IdentityError> {
+    if chain_der.len() < 2 {
+        return Err(IdentityError::Certificate(
+            "invalid certificate chain: missing CA".into(),
+        ));
+    }
+    let certs = chain_der
+        .iter()
+        .map(|der| parse_cert(der))
+        .collect::<Result<Vec<_>, _>>()?;
+    for i in 0..certs.len() {
+        match certs.get(i + 1) {
+            Some(parent) => verify_signed_by(&certs[i], parent)?,
+            None => verify_signed_by(&certs[i], &certs[i])?,
+        }
+    }
     Ok(())
 }
 
@@ -448,7 +503,32 @@ mod tests {
             ident.node_id(),
             NodeId::from_certificate_der(ident.ca_der()).unwrap()
         );
-        verify_cert_pair(ident.leaf_der(), ident.ca_der()).unwrap();
+        verify_chain(&[ident.leaf_der().as_ref(), ident.ca_der().as_ref()]).unwrap();
+    }
+
+    #[test]
+    fn signed_identity_chain_verifies_like_go_peertls() {
+        let ident = Identity::generate_signed().expect("signed identity");
+        let chain = ident.cert_chain();
+        assert_eq!(chain.len(), 3, "leaf, CA, signer");
+        let ders: Vec<&[u8]> = chain.iter().map(|c| c.as_ref()).collect();
+        verify_chain(&ders).expect("leaf<-CA<-signer, signer self-signed");
+        // The CA of a signed identity is not self-signed: a verifier that
+        // only accepts [leaf, CA] (1.0.0 behaviour) rejects production peers.
+        assert!(verify_chain(&ders[..2]).is_err());
+        // Skipping the CA breaks the signature link.
+        assert!(verify_chain(&[ders[0], ders[2]]).is_err());
+        // NodeID still comes from the CA (index 1), not the signer.
+        assert_eq!(
+            NodeId::from_certificate_der(&chain[1]).unwrap(),
+            ident.node_id()
+        );
+        // Unsigned identities keep verifying.
+        let plain = Identity::generate().expect("identity");
+        let chain = plain.cert_chain();
+        assert_eq!(chain.len(), 2);
+        let ders: Vec<&[u8]> = chain.iter().map(|c| c.as_ref()).collect();
+        verify_chain(&ders).expect("leaf<-CA self-signed");
     }
 
     #[test]
