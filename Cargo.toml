@@ -29,7 +29,7 @@ zeroize = { version = "1", features = ["derive"] }
 aes-gcm = "0.10"
 crypto_secretbox = { version = "0.1", default-features = false, features = ["alloc", "salsa20"] }
 argon2 = "0.5"
-base64 = "0.22"
+base64 = "0.23"
 hmac = "0.12"
 sha2 = "0.10"
 blake3 = "1"
