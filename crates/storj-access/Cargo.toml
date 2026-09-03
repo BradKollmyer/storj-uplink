@@ -4,9 +4,9 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Access grant parse, restrict, and serialize (workspace-internal, unpublished)"
+description = "Access grant parse, restrict, and serialize"
 repository.workspace = true
-publish = false
+homepage.workspace = true
 
 [dependencies]
 bs58.workspace = true

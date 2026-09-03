@@ -9,16 +9,17 @@ rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 version = "1.0.0"
 repository = "https://github.com/BradKollmyer/storj-uplink"
+homepage = "https://github.com/BradKollmyer/storj-uplink"
 
 [workspace.dependencies]
-storj = { path = "crates/storj" }
-storj-access = { path = "crates/storj-access" }
-storj-ec = { path = "crates/storj-ec" }
-storj-encryption = { path = "crates/storj-encryption" }
-storj-proto = { path = "crates/storj-proto" }
-storj-rpc = { path = "crates/storj-rpc" }
+storj = { path = "crates/storj", version = "1.0.0" }
+storj-access = { path = "crates/storj-access", version = "1.0.0" }
+storj-ec = { path = "crates/storj-ec", version = "1.0.0" }
+storj-encryption = { path = "crates/storj-encryption", version = "1.0.0" }
+storj-proto = { path = "crates/storj-proto", version = "1.0.0" }
+storj-rpc = { path = "crates/storj-rpc", version = "1.0.0" }
 storj-test = { path = "crates/storj-test" }
-storj-uplink = { path = "crates/storj-uplink" }
+storj-uplink = { path = "crates/storj-uplink", version = "1.0.0" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "time", "net", "sync"] }
 bytes = "1"
 prost = "0.14"

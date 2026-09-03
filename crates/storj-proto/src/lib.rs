@@ -1,7 +1,8 @@
 //! Vendored Storj protobuf types and CompressedBatch zstd codec.
 //!
-//! Workspace-internal (`publish = false`). Types are generated from
-//! `proto/*.proto` (pin in `proto/README.md`) and checked in under `gen/`.
+//! Implementation detail of the `storj` crate; not a stable public API.
+//! Depend on `storj` instead. Types are generated from `proto/*.proto` (pin in
+//! `proto/README.md`) and checked in under `gen/`.
 
 #![deny(clippy::undocumented_unsafe_blocks)]
 

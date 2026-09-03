@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 description = "Path HD keys, AES-GCM/Secretbox content transformers, Argon2id root key, and encryption store"
 repository.workspace = true
-publish = false
+homepage.workspace = true
 
 [dependencies]
 aes-gcm.workspace = true

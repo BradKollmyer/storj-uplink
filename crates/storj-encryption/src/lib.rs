@@ -1,6 +1,9 @@
 //! Path encryption, HD key derivation, encryption store, and content-block
 //! transformers (AES-256-GCM, NaCl secretbox).
 //!
+//! Implementation detail of the `storj` crate; not a stable public API.
+//! Depend on `storj` instead.
+//!
 //! Matches `storj.io/common/encryption` (`DeriveRootKey`, `DeriveKey`, `Store`,
 //! `EncryptPath` / `DecryptPath`, `Transformer`, `Increment`, `Pad`,
 //! `CalcEncryptedSize`, `CalcEncompassingBlocks`).

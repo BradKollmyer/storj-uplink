@@ -1,6 +1,7 @@
 //! Access-grant parse, restrict, and serialize.
 //!
-//! Workspace-internal (`publish = false`). Callers should use `storj` re-exports.
+//! Implementation detail of the `storj` crate; not a stable public API.
+//! Depend on `storj` instead.
 
 mod base58;
 mod grant;

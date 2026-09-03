@@ -8,8 +8,8 @@
 //! Not a wrapper around `uplink-c`, and not a drop-in for crates.io `uplink`
 //! 0.11.0 (blocking FFI, `!Send`). Spec: `docs/design-native-uplink.md`.
 //!
-//! Internal crates are unpublished; depend on this crate via git or path.
-//! Callers need their own Tokio runtime (`tokio` is not re-exported).
+//! Depend on this crate from crates.io (`storj = "1.0"`). Callers need their
+//! own Tokio runtime (`tokio` is not re-exported).
 //!
 //! MSRV 1.85, edition 2024. Dual-licensed MIT OR Apache-2.0.
 //!

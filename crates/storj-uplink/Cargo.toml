@@ -4,9 +4,9 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Piecestore client, order limits, and SN connection pool (workspace-internal, unpublished)"
+description = "Piecestore client, order limits, and SN connection pool"
 repository.workspace = true
-publish = false
+homepage.workspace = true
 
 [dependencies]
 storj-access.workspace = true

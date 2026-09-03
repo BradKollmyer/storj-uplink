@@ -6,7 +6,12 @@ rust-version.workspace = true
 license.workspace = true
 description = "Native Rust Uplink client for the Storj decentralized object store"
 repository.workspace = true
+homepage.workspace = true
 readme = "../../README.md"
+documentation = "https://docs.rs/storj"
+keywords = ["storj", "object-storage", "decentralized"]
+categories = ["network-programming", "asynchronous", "cryptography"]
+exclude = ["tests/**"]
 
 [dependencies]
 tokio.workspace = true

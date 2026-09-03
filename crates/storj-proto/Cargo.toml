@@ -4,9 +4,9 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Vendored Storj protobuf types and CompressedBatch zstd codec (workspace-internal, unpublished)"
+description = "Vendored Storj protobuf types and CompressedBatch zstd codec"
 repository.workspace = true
-publish = false
+homepage.workspace = true
 
 [dependencies]
 prost.workspace = true

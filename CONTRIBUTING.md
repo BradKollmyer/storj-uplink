@@ -46,11 +46,24 @@ a Go toolchain requirement to `cargo build` of dependents.
 
 ## Public API
 
-The published (git/path) surface is `storj::*` only. Internal crates stay
-`publish = false`. Do not expand the public API without a CHANGELOG entry.
+The published surface is `storj::*` only. Implementation crates are on
+crates.io so Cargo can resolve them; do not treat their APIs as stable.
+`storj-test` stays `publish = false`. Do not expand the public API without a
+CHANGELOG entry.
 
 ## Packaging
 
-Do not `cargo publish -p storj` yet: internal crates are path-only and
-`publish = false`, so the facade cannot be packaged for crates.io. Consume 1.0
-via git or path until internals are published.
+Publish in dependency order. Never publish `storj-test`.
+
+```bash
+cargo publish -p storj-proto
+cargo publish -p storj-ec
+cargo publish -p storj-encryption
+cargo publish -p storj-rpc
+cargo publish -p storj-access
+cargo publish -p storj-uplink
+cargo publish -p storj
+```
+
+Workspace path deps include `version` so Cargo rewrites them to registry deps
+on publish. Wait for the index if a later crate cannot yet see an earlier one.
