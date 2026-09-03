@@ -23,10 +23,12 @@ _IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
 def _is_ident_start(ch: str) -> bool:
+    """Return True if `ch` can start a Rust identifier."""
     return ch.isalpha() or ch == "_"
 
 
 def _is_ident_cont(ch: str) -> bool:
+    """Return True if `ch` can continue a Rust identifier."""
     return ch.isalnum() or ch == "_"
 
 
@@ -37,12 +39,15 @@ class _RustScan:
         self.line = 1
 
     def eof(self) -> bool:
+        """Return True when the cursor is past the last character."""
         return self.i >= len(self.s)
 
     def ch(self) -> str:
+        """Return the current character, or empty string at EOF."""
         return self.s[self.i] if self.i < len(self.s) else ""
 
     def starts(self, token: str) -> bool:
+        """Return True if `token` starts at the cursor."""
         return self.s.startswith(token, self.i)
 
     def bump(self) -> str:
@@ -150,6 +155,7 @@ class _RustScan:
         return False
 
     def try_ident(self, want: str) -> bool:
+        """Consume `want` if it is the next identifier; otherwise leave the cursor."""
         if not self.starts(want):
             return False
         end = self.i + len(want)
@@ -160,6 +166,7 @@ class _RustScan:
         return True
 
     def try_cfg_test_attr(self) -> bool:
+        """Consume a `#[cfg(test)]` attribute at the cursor, if present."""
         if self.ch() != "#":
             return False
         saved = (self.i, self.line)
@@ -195,6 +202,7 @@ class _RustScan:
         return True
 
     def skip_balanced_braces(self) -> None:
+        """Skip a `{ ... }` group, ignoring braces inside strings and comments."""
         if self.ch() != "{":
             return
         depth = 0
@@ -266,12 +274,14 @@ def _item_level_cfg_test_mods(text: str) -> list[tuple[int, int]]:
 
 
 def _is_trivia(text: str) -> bool:
+    """Return True if `text` is only whitespace and comments."""
     sc = _RustScan(text)
     sc.skip_trivia()
     return sc.eof()
 
 
 def test_cutoff(path: Path) -> int | None:
+    """First line of a trailing `#[cfg(test)] mod` in `path`, if any."""
     try:
         text = path.read_text(encoding="utf-8")
     except OSError:
@@ -280,6 +290,7 @@ def test_cutoff(path: Path) -> int | None:
 
 
 def test_cutoff_text(text: str) -> int | None:
+    """First line of a trailing `#[cfg(test)] mod` in source text, if any."""
     spans = _item_level_cfg_test_mods(text)
     if not spans:
         return None
@@ -297,6 +308,7 @@ def test_cutoff_text(text: str) -> int | None:
 
 
 def _span_start_idx(text: str, line: int) -> int:
+    """Byte offset of the start of 1-based `line` in `text`."""
     if line <= 1:
         return 0
     seen = 1
@@ -309,17 +321,20 @@ def _span_start_idx(text: str, line: int) -> int:
 
 
 def uri_path(uri: str) -> str:
+    """Strip a `file://` prefix from a SARIF artifact URI."""
     if uri.startswith("file://"):
         uri = uri[len("file://") :]
     return uri
 
 
 def is_tests_dir(uri: str) -> bool:
+    """Return True if the URI is under a `tests/` directory."""
     p = uri_path(uri).replace("\\", "/")
     return "/tests/" in p or p.endswith("/tests")
 
 
 def location_in_tests(loc: dict, cutoffs: dict[str, int | None], repo: Path) -> bool:
+    """Return True if this SARIF location is in tests/ or a trailing test module."""
     phys = loc.get("physicalLocation") or {}
     art = phys.get("artifactLocation") or {}
     uri = art.get("uri") or ""
@@ -335,6 +350,7 @@ def location_in_tests(loc: dict, cutoffs: dict[str, int | None], repo: Path) -> 
 
 
 def result_in_tests(result: dict, cutoffs: dict[str, int | None], repo: Path) -> bool:
+    """Return True if every location on this result is in test code."""
     locs = result.get("locations") or []
     if not locs:
         return False
@@ -395,6 +411,7 @@ def _code_ident_spans(line: str) -> list[tuple[int, int, str]]:
 def _region_hits_ident(
     line: str, ident: str, start_col: int | None, end_col: int | None
 ) -> bool:
+    """Return True if `ident` is a code token overlapping the SARIF columns."""
     spans = [s for s in _code_ident_spans(line) if s[2] == ident]
     if not spans:
         return False
@@ -474,6 +491,7 @@ def is_documented_crypto_fp_text(
     start_col: int | None = None,
     end_col: int | None = None,
 ) -> bool:
+    """Return True if this span is `ZERO_NONCE` or inside `csprng_bytes`."""
     lines = text.splitlines()
     if start_line < 1 or start_line > len(lines):
         return False
@@ -493,6 +511,7 @@ def is_documented_crypto_fp(
     start_col: int | None = None,
     end_col: int | None = None,
 ) -> bool:
+    """File-backed wrapper for `is_documented_crypto_fp_text`."""
     try:
         return is_documented_crypto_fp_text(
             path.read_text(encoding="utf-8"), start_line, start_col, end_col
@@ -502,6 +521,7 @@ def is_documented_crypto_fp(
 
 
 def _result_rule_id(result: dict) -> str:
+    """Read a SARIF result's rule id from `ruleId` or nested `rule`."""
     if isinstance(result.get("ruleId"), str):
         return result["ruleId"]
     rule = result.get("rule")
@@ -513,6 +533,7 @@ def _result_rule_id(result: dict) -> str:
 
 
 def location_documented_crypto_fp(loc: dict, repo: Path) -> bool:
+    """Return True if this SARIF location is a documented crypto false positive."""
     phys = loc.get("physicalLocation") or {}
     art = phys.get("artifactLocation") or {}
     uri = art.get("uri") or ""
@@ -529,6 +550,7 @@ def location_documented_crypto_fp(loc: dict, repo: Path) -> bool:
 
 
 def result_documented_crypto_fp(result: dict, repo: Path) -> bool:
+    """Return True if this hard-coded-crypto result is a documented false positive."""
     if _CRYPTO_RULE not in _result_rule_id(result):
         return False
     locs = result.get("locations") or []
@@ -538,6 +560,7 @@ def result_documented_crypto_fp(result: dict, repo: Path) -> bool:
 
 
 def filter_sarif(data: dict, repo: Path) -> tuple[int, int]:
+    """Drop test-only and documented-FP results. Return (kept, dropped)."""
     kept = 0
     dropped = 0
     cutoffs: dict[str, int | None] = {}
@@ -557,6 +580,7 @@ def filter_sarif(data: dict, repo: Path) -> tuple[int, int]:
 
 
 def _self_test() -> None:
+    """In-process regressions for test-mod cutoff and documented crypto FPs."""
     # String / raw-string / comment markers must not hide later production.
     src = '''
 fn prod_before() {}
@@ -686,6 +710,7 @@ const KEY: [u8; 32] = [0; 32];
 
 
 def main() -> int:
+    """Run `--self-test` or filter the SARIF file given as argv[1]."""
     if len(sys.argv) == 2 and sys.argv[1] == "--self-test":
         _self_test()
         return 0
