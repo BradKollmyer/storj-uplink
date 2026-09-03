@@ -1479,6 +1479,26 @@ fn commit_segment(
         ));
     }
     st.last_commit_segment_id = Some(req.segment_id.clone());
+    // Satellite `validateRemoteSegment`: every reported piece must be exactly
+    // eestream.CalcPieceSize(size_encrypted_data) bytes (the +4 is the
+    // padding trailer the uplink appends before erasure coding).
+    {
+        let scheme = test_scheme();
+        let stripe = i64::from(scheme.min_req) * i64::from(scheme.erasure_share_size);
+        let stripes = (req.size_encrypted_data + 4 + stripe - 1) / stripe;
+        let expected = stripes * stripe / i64::from(scheme.min_req);
+        for result in &req.upload_result {
+            let provided = result.hash.as_ref().map_or(0, |h| h.piece_size);
+            if provided != expected {
+                return Err((
+                    RPC_INVALID_ARGUMENT,
+                    format!(
+                        "piece sizes are invalid: pointer verification: expected size is different from provided ({expected} != {provided})"
+                    ),
+                ));
+            }
+        }
+    }
     let stream_id = st.segment_to_stream.get(&req.segment_id).cloned();
     if let Some(sid) = stream_id {
         if let Some(pending) = st.pending.get_mut(&sid) {
