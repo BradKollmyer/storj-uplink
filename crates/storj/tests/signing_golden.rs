@@ -8,7 +8,7 @@
 use prost::Message;
 use storj_proto::orders::{Order, OrderLimit, PieceHash};
 use storj_uplink::orders::{
-    PiecePublicKey, verify_order, verify_order_limit, verify_piece_hash_node,
+    PiecePublicKey, encode_order_limit, verify_order, verify_order_limit, verify_piece_hash_node,
     verify_piece_hash_uplink,
 };
 
@@ -73,4 +73,22 @@ fn node_id_comes_from_the_ca_certificate() {
     let ca = hex_field(&line, "satellite_ca_der");
     let id = storj_rpc::NodeId::from_certificate_der(&ca).expect("node id");
     assert_eq!(id.to_string(), field(&line, "satellite_node_id"));
+}
+
+/// A production-shaped limit (encrypted metadata, zero piece expiration,
+/// deprecated satellite address): the Rust signing encoding must match Go's
+/// `EncodeOrderLimit` byte for byte, and the signature must verify.
+#[test]
+fn full_order_limit_signing_bytes_match_go() {
+    let line = fixture();
+    let limit = OrderLimit::decode(hex_field(&line, "order_limit_full").as_slice()).expect("proto");
+    let want = hex_field(&line, "order_limit_full_signing_bytes");
+    let got = encode_order_limit(&limit);
+    assert_eq!(
+        hex::encode(&got),
+        hex::encode(&want),
+        "Rust signing bytes differ from Go EncodeOrderLimit"
+    );
+    let leaf = hex_field(&line, "satellite_leaf_der");
+    verify_order_limit(&limit, &leaf).expect("Go-signed full order limit verifies");
 }
