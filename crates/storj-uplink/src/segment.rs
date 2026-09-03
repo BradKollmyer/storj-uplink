@@ -348,6 +348,10 @@ where
             job.rs.o
         )));
     }
+    // The satellite's metabase requires CommitSegment pieces sorted by piece
+    // number ("pieces should be ordered"); long-tail completion order is not.
+    successes.sort_by_key(|s| s.piece_num);
+    successes.dedup_by_key(|s| s.piece_num);
     Ok((job.segment_id, successes))
 }
 
