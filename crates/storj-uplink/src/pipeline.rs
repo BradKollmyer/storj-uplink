@@ -127,8 +127,6 @@ pub fn encrypt_remote(
     Ok(transform_padded(encrypter.as_ref(), plain)?)
 }
 
-/// Zero-pad `data` so its length is a multiple of `stripe_size`.
-#[must_use]
 /// Go `eestream.CalcPieceSize`: the piece size the satellite expects for an
 /// encrypted segment of `encrypted_size` bytes. The `+ 4` is the padding
 /// length trailer that [`storj_encryption::pad`] always appends before
