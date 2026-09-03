@@ -18,8 +18,8 @@ import re
 import sys
 from pathlib import Path
 
-_FN_RE = re.compile(r"^(?:pub(?:\([^)]+\))?\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)")
 _CRYPTO_RULE = "hard-coded-cryptographic-value"
+_IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
 def _is_ident_start(ch: str) -> bool:
@@ -341,28 +341,162 @@ def result_in_tests(result: dict, cutoffs: dict[str, int | None], repo: Path) ->
     return all(location_in_tests(loc, cutoffs, repo) for loc in locs)
 
 
-def _enclosing_fn_name(lines: list[str], start_line: int) -> str | None:
-    for i in range(start_line, 0, -1):
-        m = _FN_RE.match(lines[i - 1])
+def _code_ident_spans(line: str) -> list[tuple[int, int, str]]:
+    """0-based [start, end) identifier spans in code, skipping comments/strings."""
+    spans: list[tuple[int, int, str]] = []
+    i = 0
+    n = len(line)
+    while i < n:
+        if line.startswith("//", i):
+            break
+        if line.startswith("/*", i):
+            end = line.find("*/", i + 2)
+            i = n if end < 0 else end + 2
+            continue
+        ch = line[i]
+        if ch in "bc" and i + 1 < n and line[i + 1] in '"r':
+            i += 1
+            ch = line[i]
+        if ch == "r" and i + 1 < n and line[i + 1] in '#"':
+            i += 1
+            hashes = 0
+            while i < n and line[i] == "#":
+                hashes += 1
+                i += 1
+            if i < n and line[i] == '"':
+                i += 1
+                close = '"' + ("#" * hashes)
+                j = line.find(close, i)
+                i = n if j < 0 else j + len(close)
+            continue
+        if ch == '"':
+            i += 1
+            while i < n:
+                if line[i] == "\\":
+                    i += 2
+                    continue
+                if line[i] == '"':
+                    i += 1
+                    break
+                i += 1
+            continue
+        if ch == "'":
+            i += 1
+            continue
+        m = _IDENT_RE.match(line, i)
         if m:
-            return m.group(1)
+            spans.append((m.start(), m.end(), m.group()))
+            i = m.end()
+            continue
+        i += 1
+    return spans
+
+
+def _region_hits_ident(
+    line: str, ident: str, start_col: int | None, end_col: int | None
+) -> bool:
+    spans = [s for s in _code_ident_spans(line) if s[2] == ident]
+    if not spans:
+        return False
+    if start_col is None:
+        return True
+    a = start_col - 1
+    b = (end_col - 1) if end_col is not None else a + 1
+    if b <= a:
+        b = a + 1
+    return any(s < b and e > a for s, e, _ in spans)
+
+
+def _item_fn_body_lines(text: str, name: str) -> tuple[int, int] | None:
+    """Line range (inclusive) of an item-level `fn name ... { ... }`."""
+    sc = _RustScan(text)
+    depth = 0
+    while not sc.eof():
+        sc.skip_trivia()
+        if sc.eof():
+            break
+        if sc.skip_literal_or_ident_prefix():
+            continue
+        if sc.ch() == "'":
+            sc.skip_char_or_lifetime()
+            continue
+        if sc.ch() == "{":
+            depth += 1
+            sc.bump()
+            continue
+        if sc.ch() == "}":
+            depth = max(0, depth - 1)
+            sc.bump()
+            continue
+        if depth == 0:
+            saved = (sc.i, sc.line)
+            start_line = sc.line
+            if sc.try_ident("pub"):
+                sc.skip_trivia()
+                if sc.ch() == "(":
+                    while not sc.eof() and sc.ch() != ")":
+                        sc.bump()
+                    if sc.ch() == ")":
+                        sc.bump()
+                    sc.skip_trivia()
+            if sc.try_ident("fn"):
+                sc.skip_trivia()
+                ident_i = sc.i
+                while _is_ident_cont(sc.ch()):
+                    sc.bump()
+                ident = sc.s[ident_i : sc.i]
+                if ident == name:
+                    while not sc.eof():
+                        if sc.skip_literal_or_ident_prefix():
+                            continue
+                        if sc.ch() in " \t\r\n":
+                            sc.skip_trivia()
+                            continue
+                        if sc.starts("//"):
+                            sc.skip_line_comment()
+                            continue
+                        if sc.starts("/*"):
+                            sc.skip_block_comment()
+                            continue
+                        if sc.ch() == "{":
+                            sc.skip_balanced_braces()
+                            return (start_line, sc.line)
+                        sc.bump()
+                    return None
+            sc.i, sc.line = saved
+        sc.bump()
     return None
 
 
-def is_documented_crypto_fp_text(text: str, start_line: int) -> bool:
+def is_documented_crypto_fp_text(
+    text: str,
+    start_line: int,
+    start_col: int | None = None,
+    end_col: int | None = None,
+) -> bool:
     lines = text.splitlines()
     if start_line < 1 or start_line > len(lines):
         return False
     line = lines[start_line - 1]
-    # Named protocol constant (Go storj.Nonce{}), including call sites.
-    if "ZERO_NONCE" in line:
+    if _region_hits_ident(line, "ZERO_NONCE", start_col, end_col):
         return True
-    return _enclosing_fn_name(lines, start_line) == "csprng_bytes"
+    rng = _item_fn_body_lines(text, "csprng_bytes")
+    if rng is None:
+        return False
+    lo, hi = rng
+    return lo <= start_line <= hi
 
 
-def is_documented_crypto_fp(path: Path, start_line: int) -> bool:
+def is_documented_crypto_fp(
+    path: Path,
+    start_line: int,
+    start_col: int | None = None,
+    end_col: int | None = None,
+) -> bool:
     try:
-        return is_documented_crypto_fp_text(path.read_text(encoding="utf-8"), start_line)
+        return is_documented_crypto_fp_text(
+            path.read_text(encoding="utf-8"), start_line, start_col, end_col
+        )
     except OSError:
         return False
 
@@ -382,10 +516,16 @@ def location_documented_crypto_fp(loc: dict, repo: Path) -> bool:
     phys = loc.get("physicalLocation") or {}
     art = phys.get("artifactLocation") or {}
     uri = art.get("uri") or ""
-    start = (phys.get("region") or {}).get("startLine")
+    region = phys.get("region") or {}
+    start = region.get("startLine")
     if start is None:
         return False
-    return is_documented_crypto_fp(repo / uri_path(uri), start)
+    return is_documented_crypto_fp(
+        repo / uri_path(uri),
+        start,
+        region.get("startColumn"),
+        region.get("endColumn"),
+    )
 
 
 def result_documented_crypto_fp(result: dict, repo: Path) -> bool:
@@ -484,11 +624,63 @@ fn csprng_bytes<const N: usize>() -> [u8; N] {
     let mut bytes = [0u8; N];
     bytes
 }
+const KEY: [u8; 32] = [0; 32];
 """
     assert is_documented_crypto_fp_text(crypto, 2)
     assert not is_documented_crypto_fp_text(crypto, 4)
     assert is_documented_crypto_fp_text(crypto, 7)
+    assert not is_documented_crypto_fp_text(crypto, 10)
     assert is_documented_crypto_fp_text("encrypt(&ZERO_NONCE)\n", 1)
+    # Comment beside an unrelated key must not match ZERO_NONCE.
+    assert not is_documented_crypto_fp_text(
+        "let key = [0u8; 32]; // ZERO_NONCE protocol constant\n", 1
+    )
+    assert not is_documented_crypto_fp_text(
+        "let key = [0u8; 32]; // ZERO_NONCE protocol constant\n",
+        1,
+        start_col=11,
+        end_col=20,
+    )
+
+    import tempfile
+
+    td = Path(tempfile.mkdtemp())
+    (td / "lib.rs").write_text(crypto)
+    sarif = {
+        "runs": [
+            {
+                "results": [
+                    {
+                        "ruleId": "rust/hard-coded-cryptographic-value",
+                        "locations": [
+                            {
+                                "physicalLocation": {
+                                    "artifactLocation": {"uri": "lib.rs"},
+                                    "region": {"startLine": 7},
+                                }
+                            }
+                        ],
+                    },
+                    {
+                        "ruleId": "rust/hard-coded-cryptographic-value",
+                        "locations": [
+                            {
+                                "physicalLocation": {
+                                    "artifactLocation": {"uri": "lib.rs"},
+                                    "region": {"startLine": 10},
+                                }
+                            }
+                        ],
+                    },
+                ]
+            }
+        ]
+    }
+    kept, dropped = filter_sarif(sarif, td)
+    assert dropped == 1 and kept == 1, (kept, dropped)
+    assert sarif["runs"][0]["results"][0]["locations"][0]["physicalLocation"][
+        "region"
+    ]["startLine"] == 10
 
     print("filter-test-alerts: self-test ok")
 
