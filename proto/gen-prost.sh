@@ -14,7 +14,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-prost-build = "=0.13.5"
+prost-build = "=0.14.4"
 protoc-bin-vendored = "3"
 EOF
 

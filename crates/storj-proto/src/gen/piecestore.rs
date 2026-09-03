@@ -7,7 +7,7 @@
 ///       Chunk ->
 ///    PieceHash signed by uplink ->
 ///       <- PieceHash signed by storage node
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct PieceUploadRequest {
     /// first message to show that we are allowed to upload
     #[prost(message, optional, tag = "1")]
@@ -29,7 +29,7 @@ pub struct PieceUploadRequest {
 /// Nested message and enum types in `PieceUploadRequest`.
 pub mod piece_upload_request {
     /// data message
-    #[derive(Clone, PartialEq, ::prost::Message)]
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
     pub struct Chunk {
         #[prost(int64, tag = "1")]
         pub offset: i64,
@@ -37,7 +37,7 @@ pub mod piece_upload_request {
         pub data: ::prost::alloc::vec::Vec<u8>,
     }
 }
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct PieceUploadResponse {
     #[prost(message, optional, tag = "1")]
     pub done: ::core::option::Option<super::orders::PieceHash>,
@@ -53,7 +53,7 @@ pub struct PieceUploadResponse {
 ///       Order -> (async)
 ///    go repeated
 ///       <- PieceDownloadResponse.Chunk
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct PieceDownloadRequest {
     /// first message to show that we are allowed to upload
     #[prost(message, optional, tag = "1")]
@@ -73,7 +73,7 @@ pub struct PieceDownloadRequest {
 /// Nested message and enum types in `PieceDownloadRequest`.
 pub mod piece_download_request {
     /// Chunk that we wish to download
-    #[derive(Clone, Copy, PartialEq, ::prost::Message)]
+    #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
     pub struct Chunk {
         #[prost(int64, tag = "1")]
         pub offset: i64,
@@ -81,7 +81,7 @@ pub mod piece_download_request {
         pub chunk_size: i64,
     }
 }
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct PieceDownloadResponse {
     #[prost(message, optional, tag = "1")]
     pub chunk: ::core::option::Option<piece_download_response::Chunk>,
@@ -95,7 +95,7 @@ pub struct PieceDownloadResponse {
 /// Nested message and enum types in `PieceDownloadResponse`.
 pub mod piece_download_response {
     /// Chunk response for download request
-    #[derive(Clone, PartialEq, ::prost::Message)]
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
     pub struct Chunk {
         #[prost(int64, tag = "1")]
         pub offset: i64,
@@ -103,26 +103,26 @@ pub mod piece_download_response {
         pub data: ::prost::alloc::vec::Vec<u8>,
     }
 }
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct PieceDeleteRequest {
     #[prost(message, optional, tag = "1")]
     pub limit: ::core::option::Option<super::orders::OrderLimit>,
 }
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct PieceDeleteResponse {}
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DeletePiecesRequest {
     #[prost(bytes = "vec", repeated, tag = "1")]
     pub piece_ids: ::prost::alloc::vec::Vec<::prost::alloc::vec::Vec<u8>>,
 }
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DeletePiecesResponse {
     #[prost(int64, tag = "1")]
     pub unhandled_count: i64,
 }
 /// RetainRequest contains bloom filter. It's either sent together (time + filter) or in multiple chunks, where
 /// first message contains time + first part of the filter, and the last part contains the hash (to double check if all pieces are arrived).
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RetainRequest {
     #[prost(message, optional, tag = "1")]
     pub creation_date: ::core::option::Option<::prost_types::Timestamp>,
@@ -133,14 +133,14 @@ pub struct RetainRequest {
     #[prost(bytes = "vec", tag = "4")]
     pub hash: ::prost::alloc::vec::Vec<u8>,
 }
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RetainResponse {}
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RestoreTrashRequest {}
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RestoreTrashResponse {}
 /// PieceHeader is used in piece storage to keep track of piece attributes.
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct PieceHeader {
     /// the storage format version being used for this piece. The piece filename should agree with this.
     /// The inclusion of this field is intended to aid repairability when filenames are damaged.
@@ -194,12 +194,12 @@ pub mod piece_header {
         }
     }
 }
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ExistsRequest {
     #[prost(bytes = "vec", repeated, tag = "1")]
     pub piece_ids: ::prost::alloc::vec::Vec<::prost::alloc::vec::Vec<u8>>,
 }
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ExistsResponse {
     /// input piece ids indices of the missing pieces
     #[prost(uint32, repeated, tag = "1")]

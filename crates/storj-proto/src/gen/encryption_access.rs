@@ -13,7 +13,7 @@ pub struct EncryptionAccess {
 }
 /// Nested message and enum types in `EncryptionAccess`.
 pub mod encryption_access {
-    #[derive(Clone, PartialEq, ::prost::Message)]
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
     pub struct StoreEntry {
         #[prost(bytes = "vec", tag = "1")]
         pub bucket: ::prost::alloc::vec::Vec<u8>,
