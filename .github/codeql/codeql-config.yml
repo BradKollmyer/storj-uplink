@@ -1,0 +1,10 @@
+name: storj-uplink
+# Integration tests and goldens pin Go vectors with fixed passphrases/keys/nonces.
+# In-crate `#[cfg(test)]` modules are stripped from the SARIF by
+# `filter-test-alerts.py` (column-0 `#[cfg(test)]` through EOF).
+paths-ignore:
+  - "crates/storj/tests/**"
+  - "crates/*/tests/**"
+  - "fuzz/**"
+  - "scripts/**"
+  - "crates/storj-proto/src/gen/**"

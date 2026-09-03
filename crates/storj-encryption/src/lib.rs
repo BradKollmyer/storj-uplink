@@ -21,7 +21,7 @@ mod store;
 mod transform;
 
 pub use aesgcm::{AES_GCM_TAG_SIZE, AesGcmDecrypter, AesGcmEncrypter};
-pub use cipher::{AES_GCM_NONCE_SIZE, CipherSuite, NONCE_SIZE, decrypt, encrypt};
+pub use cipher::{AES_GCM_NONCE_SIZE, CipherSuite, NONCE_SIZE, ZERO_NONCE, decrypt, encrypt};
 pub use error::{Error, ErrorKind, Result};
 pub use key::{
     ARGON2_MEMORY_KIB, ARGON2_OUTPUT_LEN, ARGON2_PARALLELISM_DERIVE, ARGON2_PARALLELISM_REQUEST,

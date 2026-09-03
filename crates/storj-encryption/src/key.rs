@@ -125,9 +125,7 @@ pub fn derive_nonce(derived_key: &Key) -> [u8; 24] {
     mac.update(NONCE_HMAC_INFO);
     // The full 64-byte MAC contains the derived key material; wipe it.
     let full = Zeroizing::new(<[u8; 64]>::from(mac.finalize().into_bytes()));
-    let mut out = [0u8; 24];
-    out.copy_from_slice(&full[..24]);
-    out
+    mac_prefix(&full[..])
 }
 
 fn hmac_sha256(key: &[u8], data: &[u8]) -> Result<[u8; 32]> {
@@ -144,9 +142,13 @@ fn hmac_sha512(key: &[u8]) -> HmacSha512 {
 fn truncate_key(mac: HmacSha512) -> Key {
     // The first 32 bytes *are* the derived key; wipe the whole 64-byte MAC.
     let full = Zeroizing::new(<[u8; 64]>::from(mac.finalize().into_bytes()));
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&full[..32]);
-    Key { bytes: out }
+    Key {
+        bytes: mac_prefix(&full[..]),
+    }
+}
+
+fn mac_prefix<const N: usize>(mac: &[u8]) -> [u8; N] {
+    mac[..N].try_into().expect("HMAC-SHA512 output is 64 bytes")
 }
 
 #[cfg(test)]

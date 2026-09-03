@@ -8,6 +8,15 @@ pub const NONCE_SIZE: usize = 24;
 /// AES-GCM nonce size (`AESGCMNonceSize`).
 pub const AES_GCM_NONCE_SIZE: usize = 12;
 
+/// All-zero Storj nonce (`storj.Nonce{}`).
+///
+/// Stream metadata and part ETags are encrypted with this nonce; content
+/// nonces start here and increment by segment position (`nonceForPosition`).
+/// Uniqueness is the random content/metadata key, not the nonce. Matching
+/// Go is required for interop.
+// codeql[rust/hard-coded-cryptographic-value]: Storj protocol nonce (Go storj.Nonce{}); uniqueness is the per-object key.
+pub const ZERO_NONCE: [u8; NONCE_SIZE] = [0; NONCE_SIZE];
+
 /// Path/content cipher identifier. Unknown values are preserved.
 ///
 /// Matches `storj.CipherSuite`.

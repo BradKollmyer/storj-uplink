@@ -3,12 +3,12 @@
 //! Matches `storj.io/common/encryption` (`Transformer`, `Increment`,
 //! `CalcEncompassingBlocks`, `CalcEncryptedSize`).
 
-use crate::aesgcm::{AesGcmDecrypter, AesGcmEncrypter, to_aes_gcm_nonce};
+use crate::aesgcm::{AES_GCM_TAG_SIZE, AesGcmDecrypter, AesGcmEncrypter, to_aes_gcm_nonce};
 use crate::cipher::{CipherSuite, NONCE_SIZE};
 use crate::error::{Error, ErrorKind, Result};
 use crate::key::Key;
 use crate::pad::{UINT32_SIZE, pad, unpad};
-use crate::secretbox::{SecretboxDecrypter, SecretboxEncrypter};
+use crate::secretbox::{SECRETBOX_OVERHEAD, SecretboxDecrypter, SecretboxEncrypter};
 
 /// Uplink default encrypted block size (`29 * 256 = 7424`, including AEAD tag).
 pub const DEFAULT_ENCRYPTED_BLOCK_SIZE: usize = 29 * 256;
@@ -106,6 +106,48 @@ pub fn calc_encompassing_blocks(offset: i64, length: i64, block_size: usize) -> 
     }
 }
 
+/// Encrypter `(in_block, out_block)` for `encrypted_block_size` (includes AEAD tag).
+///
+/// Used by [`calc_encrypted_size`] so size math does not construct a dummy
+/// key or nonce.
+fn encrypter_io_blocks(cipher: CipherSuite, encrypted_block_size: usize) -> Result<(usize, usize)> {
+    match cipher {
+        CipherSuite::NULL => Ok((1, 1)),
+        CipherSuite::AES_GCM => {
+            if encrypted_block_size <= AES_GCM_TAG_SIZE {
+                return Err(Error::new(
+                    ErrorKind::InvalidConfig,
+                    format!("encrypted block size {encrypted_block_size} too small"),
+                ));
+            }
+            Ok((
+                encrypted_block_size - AES_GCM_TAG_SIZE,
+                encrypted_block_size,
+            ))
+        }
+        CipherSuite::SECRET_BOX => {
+            if encrypted_block_size <= SECRETBOX_OVERHEAD {
+                return Err(Error::new(
+                    ErrorKind::InvalidConfig,
+                    format!("encrypted block size {encrypted_block_size} too small"),
+                ));
+            }
+            Ok((
+                encrypted_block_size - SECRETBOX_OVERHEAD,
+                encrypted_block_size,
+            ))
+        }
+        CipherSuite::NULL_BASE64_URL => Err(Error::new(
+            ErrorKind::InvalidConfig,
+            "base64 encoding not supported for this operation",
+        )),
+        other => Err(Error::new(
+            ErrorKind::InvalidConfig,
+            format!("encryption type {} is not supported", other.0),
+        )),
+    }
+}
+
 /// Cipher data size after padding + encrypting `data_size` bytes.
 pub fn calc_encrypted_size(data_size: i64, parameters: EncryptionParameters) -> Result<i64> {
     let block_size = match parameters.cipher_suite {
@@ -117,22 +159,22 @@ pub fn calc_encrypted_size(data_size: i64, parameters: EncryptionParameters) -> 
             )
         })?,
     };
-    let transformer = new_encrypter(
-        parameters.cipher_suite,
-        &Key::from_bytes([0u8; 32]),
-        &[0u8; NONCE_SIZE],
-        block_size,
-    )?;
-    Ok(calc_transformer_encrypted_size(
-        data_size,
-        transformer.as_ref(),
-    ))
+    let (in_block, out_block) = encrypter_io_blocks(parameters.cipher_suite, block_size)?;
+    Ok(encrypted_size_from_blocks(data_size, in_block, out_block))
 }
 
 /// `CalcTransformerEncryptedSize`: includes the 4-byte padding trailer.
 pub fn calc_transformer_encrypted_size(data_size: i64, transformer: &dyn Transformer) -> i64 {
-    let in_block = i64::try_from(transformer.in_block_size()).expect("block size fits i64");
-    let out_block = i64::try_from(transformer.out_block_size()).expect("block size fits i64");
+    encrypted_size_from_blocks(
+        data_size,
+        transformer.in_block_size(),
+        transformer.out_block_size(),
+    )
+}
+
+fn encrypted_size_from_blocks(data_size: i64, in_block: usize, out_block: usize) -> i64 {
+    let in_block = i64::try_from(in_block).expect("block size fits i64");
+    let out_block = i64::try_from(out_block).expect("block size fits i64");
     let blocks =
         (data_size + i64::try_from(UINT32_SIZE).expect("4 fits") + in_block - 1) / in_block;
     blocks * out_block
