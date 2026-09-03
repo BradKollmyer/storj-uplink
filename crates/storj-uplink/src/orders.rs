@@ -2,7 +2,8 @@
 //!
 //! Matches Go `storj.io/common/signing`:
 //! - Satellite and storage-node signatures are ECDSA P-256 over SHA-256
-//!   (`pkcrypto.HashAndSign`) using the identity CA key.
+//!   (`pkcrypto.HashAndSign`) using the identity leaf key
+//!   (`peer_certificates()[0]`). NodeID comes from the CA (index 1).
 //! - Uplink order and piece-hash signatures are Ed25519 over the signing
 //!   protobuf (`PiecePrivateKey.Sign`).
 //!

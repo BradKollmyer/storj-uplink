@@ -59,7 +59,8 @@ impl<T> Client<T> {
     /// Wrap an established SN connection.
     ///
     /// `satellite_cert_der` verifies order limits. `peer_cert_der` is the storage
-    /// node's CA (from TLS) used to verify the signed piece hash it returns.
+    /// node's leaf certificate (`peer_certificates()[0]`) used to verify the
+    /// signed piece hash it returns. NodeID comes from the CA.
     #[must_use]
     pub fn new(conn: Conn<T>, satellite_cert_der: Vec<u8>, peer_cert_der: Vec<u8>) -> Self {
         Self {
