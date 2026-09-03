@@ -45,7 +45,7 @@ jobs:
           category: "/language:${{ matrix.language }}"
           output: sarif-results
           upload: false
-      - name: Drop test-only alerts
+      - name: Filter test and documented false-positive alerts
         if: matrix.language == 'rust'
         run: |
           python3 .github/codeql/filter-test-alerts.py --self-test

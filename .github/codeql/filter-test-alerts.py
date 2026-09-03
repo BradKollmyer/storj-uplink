@@ -1,28 +1,35 @@
 #!/usr/bin/env python3
-"""Drop CodeQL results that sit in test code.
+"""Drop CodeQL results that sit in test code or documented false positives.
 
 Removes:
   * paths under a `tests/` directory
   * locations at or after a trailing item-level `#[cfg(test)] mod ...`
-    (unit tests in this repo live in modules at end of file)
+  * `rust/hard-coded-cryptographic-value` on `pub const ZERO_NONCE` or
+    inside `csprng_bytes` (Go `storj.Nonce{}` / CSPRNG scratch buffer)
 
-String literals and comments are ignored, so a file that mentions
-`#[cfg(test)]` in a raw string does not swallow later production alerts.
-`#[cfg(test)]` on items other than `mod` is not a cutoff.
+The hard-coded-crypto query stays enabled for every other production site.
+String literals and comments are ignored when finding the test-mod cutoff.
 """
 
 from __future__ import annotations
 
 import json
+import re
 import sys
 from pathlib import Path
 
+_CRYPTO_RULE = "hard-coded-cryptographic-value"
+_IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_CSPRNG_SCRATCH_RE = re.compile(r"let\s+mut\s+bytes\s*=\s*\[0u8;\s*N\]")
+
 
 def _is_ident_start(ch: str) -> bool:
+    """Return True if `ch` can start a Rust identifier."""
     return ch.isalpha() or ch == "_"
 
 
 def _is_ident_cont(ch: str) -> bool:
+    """Return True if `ch` can continue a Rust identifier."""
     return ch.isalnum() or ch == "_"
 
 
@@ -33,12 +40,15 @@ class _RustScan:
         self.line = 1
 
     def eof(self) -> bool:
+        """Return True when the cursor is past the last character."""
         return self.i >= len(self.s)
 
     def ch(self) -> str:
+        """Return the current character, or empty string at EOF."""
         return self.s[self.i] if self.i < len(self.s) else ""
 
     def starts(self, token: str) -> bool:
+        """Return True if `token` starts at the cursor."""
         return self.s.startswith(token, self.i)
 
     def bump(self) -> str:
@@ -146,6 +156,7 @@ class _RustScan:
         return False
 
     def try_ident(self, want: str) -> bool:
+        """Consume `want` if it is the next identifier; otherwise leave the cursor."""
         if not self.starts(want):
             return False
         end = self.i + len(want)
@@ -156,6 +167,7 @@ class _RustScan:
         return True
 
     def try_cfg_test_attr(self) -> bool:
+        """Consume a `#[cfg(test)]` attribute at the cursor, if present."""
         if self.ch() != "#":
             return False
         saved = (self.i, self.line)
@@ -191,6 +203,7 @@ class _RustScan:
         return True
 
     def skip_balanced_braces(self) -> None:
+        """Skip a `{ ... }` group, ignoring braces inside strings and comments."""
         if self.ch() != "{":
             return
         depth = 0
@@ -262,12 +275,14 @@ def _item_level_cfg_test_mods(text: str) -> list[tuple[int, int]]:
 
 
 def _is_trivia(text: str) -> bool:
+    """Return True if `text` is only whitespace and comments."""
     sc = _RustScan(text)
     sc.skip_trivia()
     return sc.eof()
 
 
 def test_cutoff(path: Path) -> int | None:
+    """First line of a trailing `#[cfg(test)] mod` in `path`, if any."""
     try:
         text = path.read_text(encoding="utf-8")
     except OSError:
@@ -276,6 +291,7 @@ def test_cutoff(path: Path) -> int | None:
 
 
 def test_cutoff_text(text: str) -> int | None:
+    """First line of a trailing `#[cfg(test)] mod` in source text, if any."""
     spans = _item_level_cfg_test_mods(text)
     if not spans:
         return None
@@ -293,6 +309,7 @@ def test_cutoff_text(text: str) -> int | None:
 
 
 def _span_start_idx(text: str, line: int) -> int:
+    """Byte offset of the start of 1-based `line` in `text`."""
     if line <= 1:
         return 0
     seen = 1
@@ -305,17 +322,20 @@ def _span_start_idx(text: str, line: int) -> int:
 
 
 def uri_path(uri: str) -> str:
+    """Strip a `file://` prefix from a SARIF artifact URI."""
     if uri.startswith("file://"):
         uri = uri[len("file://") :]
     return uri
 
 
 def is_tests_dir(uri: str) -> bool:
+    """Return True if the URI is under a `tests/` directory."""
     p = uri_path(uri).replace("\\", "/")
     return "/tests/" in p or p.endswith("/tests")
 
 
 def location_in_tests(loc: dict, cutoffs: dict[str, int | None], repo: Path) -> bool:
+    """Return True if this SARIF location is in tests/ or a trailing test module."""
     phys = loc.get("physicalLocation") or {}
     art = phys.get("artifactLocation") or {}
     uri = art.get("uri") or ""
@@ -331,13 +351,219 @@ def location_in_tests(loc: dict, cutoffs: dict[str, int | None], repo: Path) -> 
 
 
 def result_in_tests(result: dict, cutoffs: dict[str, int | None], repo: Path) -> bool:
+    """Return True if every location on this result is in test code."""
     locs = result.get("locations") or []
     if not locs:
         return False
     return all(location_in_tests(loc, cutoffs, repo) for loc in locs)
 
 
+def _code_ident_spans(line: str) -> list[tuple[int, int, str]]:
+    """0-based [start, end) identifier spans in code, skipping comments/strings."""
+    spans: list[tuple[int, int, str]] = []
+    i = 0
+    n = len(line)
+    while i < n:
+        if line.startswith("//", i):
+            break
+        if line.startswith("/*", i):
+            end = line.find("*/", i + 2)
+            i = n if end < 0 else end + 2
+            continue
+        ch = line[i]
+        if ch in "bc" and i + 1 < n and line[i + 1] in '"r':
+            i += 1
+            ch = line[i]
+        if ch == "r" and i + 1 < n and line[i + 1] in '#"':
+            i += 1
+            hashes = 0
+            while i < n and line[i] == "#":
+                hashes += 1
+                i += 1
+            if i < n and line[i] == '"':
+                i += 1
+                close = '"' + ("#" * hashes)
+                j = line.find(close, i)
+                i = n if j < 0 else j + len(close)
+            continue
+        if ch == '"':
+            i += 1
+            while i < n:
+                if line[i] == "\\":
+                    i += 2
+                    continue
+                if line[i] == '"':
+                    i += 1
+                    break
+                i += 1
+            continue
+        if ch == "'":
+            i += 1
+            continue
+        m = _IDENT_RE.match(line, i)
+        if m:
+            spans.append((m.start(), m.end(), m.group()))
+            i = m.end()
+            continue
+        i += 1
+    return spans
+
+
+def _region_hits_ident(
+    line: str, ident: str, start_col: int | None, end_col: int | None
+) -> bool:
+    """Return True if `ident` is a code token overlapping the SARIF columns."""
+    spans = [s for s in _code_ident_spans(line) if s[2] == ident]
+    if not spans:
+        return False
+    if start_col is None:
+        return True
+    a = start_col - 1
+    b = (end_col - 1) if end_col is not None else a + 1
+    if b <= a:
+        b = a + 1
+    return any(s < b and e > a for s, e, _ in spans)
+
+
+def _item_fn_body_lines(text: str, name: str) -> tuple[int, int] | None:
+    """Line range (inclusive) of an item-level `fn name ... { ... }`."""
+    sc = _RustScan(text)
+    depth = 0
+    while not sc.eof():
+        sc.skip_trivia()
+        if sc.eof():
+            break
+        if sc.skip_literal_or_ident_prefix():
+            continue
+        if sc.ch() == "'":
+            sc.skip_char_or_lifetime()
+            continue
+        if sc.ch() == "{":
+            depth += 1
+            sc.bump()
+            continue
+        if sc.ch() == "}":
+            depth = max(0, depth - 1)
+            sc.bump()
+            continue
+        if depth == 0:
+            saved = (sc.i, sc.line)
+            start_line = sc.line
+            if sc.try_ident("pub"):
+                sc.skip_trivia()
+                if sc.ch() == "(":
+                    while not sc.eof() and sc.ch() != ")":
+                        sc.bump()
+                    if sc.ch() == ")":
+                        sc.bump()
+                    sc.skip_trivia()
+            if sc.try_ident("fn"):
+                sc.skip_trivia()
+                ident_i = sc.i
+                while _is_ident_cont(sc.ch()):
+                    sc.bump()
+                ident = sc.s[ident_i : sc.i]
+                if ident == name:
+                    while not sc.eof():
+                        if sc.skip_literal_or_ident_prefix():
+                            continue
+                        if sc.ch() in " \t\r\n":
+                            sc.skip_trivia()
+                            continue
+                        if sc.starts("//"):
+                            sc.skip_line_comment()
+                            continue
+                        if sc.starts("/*"):
+                            sc.skip_block_comment()
+                            continue
+                        if sc.ch() == "{":
+                            sc.skip_balanced_braces()
+                            return (start_line, sc.line)
+                        sc.bump()
+                    return None
+            sc.i, sc.line = saved
+        sc.bump()
+    return None
+
+
+def is_documented_crypto_fp_text(
+    text: str,
+    start_line: int,
+    start_col: int | None = None,
+    end_col: int | None = None,
+) -> bool:
+    """Return True if this span is `ZERO_NONCE` or the `csprng_bytes` scratch init."""
+    lines = text.splitlines()
+    if start_line < 1 or start_line > len(lines):
+        return False
+    line = lines[start_line - 1]
+    if _region_hits_ident(line, "ZERO_NONCE", start_col, end_col):
+        return True
+    if not _CSPRNG_SCRATCH_RE.search(line.split("//", 1)[0]):
+        return False
+    rng = _item_fn_body_lines(text, "csprng_bytes")
+    if rng is None:
+        return False
+    lo, hi = rng
+    return lo <= start_line <= hi
+
+
+def is_documented_crypto_fp(
+    path: Path,
+    start_line: int,
+    start_col: int | None = None,
+    end_col: int | None = None,
+) -> bool:
+    """File-backed wrapper for `is_documented_crypto_fp_text`."""
+    try:
+        return is_documented_crypto_fp_text(
+            path.read_text(encoding="utf-8"), start_line, start_col, end_col
+        )
+    except OSError:
+        return False
+
+
+def _result_rule_id(result: dict) -> str:
+    """Read a SARIF result's rule id from `ruleId` or nested `rule`."""
+    if isinstance(result.get("ruleId"), str):
+        return result["ruleId"]
+    rule = result.get("rule")
+    if isinstance(rule, dict):
+        return str(rule.get("id") or "")
+    if isinstance(rule, str):
+        return rule
+    return ""
+
+
+def location_documented_crypto_fp(loc: dict, repo: Path) -> bool:
+    """Return True if this SARIF location is a documented crypto false positive."""
+    phys = loc.get("physicalLocation") or {}
+    art = phys.get("artifactLocation") or {}
+    uri = art.get("uri") or ""
+    region = phys.get("region") or {}
+    start = region.get("startLine")
+    if start is None:
+        return False
+    return is_documented_crypto_fp(
+        repo / uri_path(uri),
+        start,
+        region.get("startColumn"),
+        region.get("endColumn"),
+    )
+
+
+def result_documented_crypto_fp(result: dict, repo: Path) -> bool:
+    """Return True if this hard-coded-crypto result is a documented false positive."""
+    if _CRYPTO_RULE not in _result_rule_id(result):
+        return False
+    locs = result.get("locations") or []
+    if not locs:
+        return False
+    return all(location_documented_crypto_fp(loc, repo) for loc in locs)
+
+
 def filter_sarif(data: dict, repo: Path) -> tuple[int, int]:
+    """Drop test-only and documented-FP results. Return (kept, dropped)."""
     kept = 0
     dropped = 0
     cutoffs: dict[str, int | None] = {}
@@ -345,7 +571,9 @@ def filter_sarif(data: dict, repo: Path) -> tuple[int, int]:
         results = run.get("results") or []
         filtered = []
         for result in results:
-            if result_in_tests(result, cutoffs, repo):
+            if result_in_tests(result, cutoffs, repo) or result_documented_crypto_fp(
+                result, repo
+            ):
                 dropped += 1
             else:
                 filtered.append(result)
@@ -355,6 +583,7 @@ def filter_sarif(data: dict, repo: Path) -> tuple[int, int]:
 
 
 def _self_test() -> None:
+    """In-process regressions for test-mod cutoff and documented crypto FPs."""
     # String / raw-string / comment markers must not hide later production.
     src = '''
 fn prod_before() {}
@@ -413,10 +642,93 @@ mod tests {
     line = test_cutoff_text(src5)
     assert line == 5, line
 
+    crypto = """
+pub const ZERO_NONCE: [u8; 24] = [0; 24];
+fn other() {
+    let key = [0u8; 32];
+}
+fn csprng_bytes<const N: usize>() -> [u8; N] {
+    let mut bytes = [0u8; N];
+    let extra = [0u8; 32];
+    bytes
+}
+const KEY: [u8; 32] = [0; 32];
+"""
+    assert is_documented_crypto_fp_text(crypto, 2)
+    assert not is_documented_crypto_fp_text(crypto, 4)
+    assert is_documented_crypto_fp_text(crypto, 7)
+    assert not is_documented_crypto_fp_text(crypto, 8)
+    assert not is_documented_crypto_fp_text(crypto, 11)
+    assert is_documented_crypto_fp_text("encrypt(&ZERO_NONCE)\n", 1)
+    # Comment beside an unrelated key must not match ZERO_NONCE.
+    assert not is_documented_crypto_fp_text(
+        "let key = [0u8; 32]; // ZERO_NONCE protocol constant\n", 1
+    )
+    assert not is_documented_crypto_fp_text(
+        "let key = [0u8; 32]; // ZERO_NONCE protocol constant\n",
+        1,
+        start_col=11,
+        end_col=20,
+    )
+
+    import tempfile
+
+    td = Path(tempfile.mkdtemp())
+    (td / "lib.rs").write_text(crypto)
+    sarif = {
+        "runs": [
+            {
+                "results": [
+                    {
+                        "ruleId": "rust/hard-coded-cryptographic-value",
+                        "locations": [
+                            {
+                                "physicalLocation": {
+                                    "artifactLocation": {"uri": "lib.rs"},
+                                    "region": {"startLine": 7},
+                                }
+                            }
+                        ],
+                    },
+                    {
+                        "ruleId": "rust/hard-coded-cryptographic-value",
+                        "locations": [
+                            {
+                                "physicalLocation": {
+                                    "artifactLocation": {"uri": "lib.rs"},
+                                    "region": {"startLine": 8},
+                                }
+                            }
+                        ],
+                    },
+                    {
+                        "ruleId": "rust/hard-coded-cryptographic-value",
+                        "locations": [
+                            {
+                                "physicalLocation": {
+                                    "artifactLocation": {"uri": "lib.rs"},
+                                    "region": {"startLine": 11},
+                                }
+                            }
+                        ],
+                    },
+                ]
+            }
+        ]
+    }
+    kept, dropped = filter_sarif(sarif, td)
+    assert dropped == 1 and kept == 2, (kept, dropped)
+    kept_lines = [
+        r["locations"][0]["physicalLocation"]["region"]["startLine"]
+        for r in sarif["runs"][0]["results"]
+    ]
+    assert kept_lines == [8, 11], kept_lines
+
     print("filter-test-alerts: self-test ok")
 
 
 def main() -> int:
+    """Run `--self-test` or filter the SARIF file given as argv[1]."""
     if len(sys.argv) == 2 and sys.argv[1] == "--self-test":
         _self_test()
         return 0
