@@ -47,6 +47,20 @@ unpublished.
   entries, and never rewrites non-UTF-8 bucket names.
 - Go-signed `OrderLimit`/`PieceHash` goldens (`signed_go.jsonl`) verify with the
   leaf certificate and are rejected by the CA certificate.
+- **Found by the first live runs against a production satellite** (the full
+  Go↔Rust size matrix, including 64 MiB+1, now passes there and against storj-sim):
+  - TLS peer verification accepts signed identity chains (`leaf, CA, signer`)
+    like Go `peertls`; 1.0.0 required the CA to be self-signed and could not
+    open a `Project` against a real satellite.
+  - Order-limit / piece-hash signing bytes omit Go-zero timestamps (year-1
+    seconds on the wire) and zero keys, matching `signing.EncodeOrderLimit`;
+    every limit without a piece expiration failed verification before.
+  - Encrypted segments are padded with Go's length-trailer padding before
+    erasure coding, so piece sizes match the satellite's `CalcPieceSize`.
+  - `CommitSegment` pieces are sorted by piece number (metabase rejects
+    unordered pieces).
+  - The mocks now present signed identity chains and enforce piece sizes and
+    ordering, so these paths are covered without a satellite.
 
 ### Added
 
