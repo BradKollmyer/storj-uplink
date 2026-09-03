@@ -51,7 +51,8 @@ STORJ_SIM=1 STORJ_INTEROP=1 STORJ_SIM_ACCESS=<grant> cargo test -p storj --test 
 The matrix test (`writer_reader_size_matrix`) runs all 24 writer×reader×size
 cells and reports a summary; it takes ~2 min against a local storj-sim and
 ~8 min against a production satellite. `crates/storj/tests/README.md` has the
-storj-sim recipe, including the two storj-sim patches it needs on macOS. The
+storj-sim recipe (`scripts/sim-pg.sh` starts Postgres via Docker or Apple
+Container), including the two storj-sim patches it needs on macOS. The
 nightly `interop` workflow runs both against the `STORJ_SIM_ACCESS` secret.
 
 Fuzz targets live in `fuzz/` (excluded from the workspace, needs nightly and `cargo-fuzz`).

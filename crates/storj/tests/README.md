@@ -47,10 +47,14 @@ cargo test -p storj --test encryption_golden --test grant_golden
 The Go↔Rust matrix runs in about two minutes against a local `storj-sim`
 network (vs. ~15 min against a live satellite). What worked on macOS:
 
+Postgres for the satellite can run under **Docker** or **Apple Container**
+([`container`](https://github.com/apple/container) CLI). On macOS, if Apple
+Container is installed it is preferred; otherwise Docker is used. Override
+with `CONTAINER_ENGINE=docker` or `CONTAINER_ENGINE=container`.
+
 ```bash
 # Postgres + Redis for the satellite
-docker run -d --name storj-sim-pg -e POSTGRES_USER=storj -e POSTGRES_PASSWORD=storj \
-  -e POSTGRES_DB=master -p 5433:5432 postgres:16
+bash scripts/sim-pg.sh        # storj-sim-pg on localhost:5433 (postgres:16)
 brew install redis            # storj-sim spawns redis-server itself
 
 # storj binaries (jobq and multinode are required by current storj-sim)
