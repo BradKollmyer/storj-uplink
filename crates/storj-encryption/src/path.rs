@@ -5,7 +5,7 @@
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE;
 
-use crate::cipher::{AES_GCM_NONCE_SIZE, CipherSuite, NONCE_SIZE, decrypt, encrypt};
+use crate::cipher::{AES_GCM_NONCE_SIZE, CipherSuite, NONCE_SIZE, ZERO_NONCE, decrypt, encrypt};
 use crate::error::{Error, ErrorKind, Result};
 use crate::key::{CONTENT_HMAC_INFO, Key, derive_key, derive_nonce};
 use crate::store::Store;
@@ -330,9 +330,20 @@ fn decrypt_path_component(comp: &[u8], cipher: CipherSuite, key: &Key) -> Result
         ));
     }
 
-    let mut nonce = [0u8; NONCE_SIZE];
-    nonce[..nonce_size].copy_from_slice(&data[..nonce_size]);
-    decrypt(&data[nonce_size..], cipher, key, &nonce)
+    decrypt(
+        &data[nonce_size..],
+        cipher,
+        key,
+        &nonce_from_prefix(&data[..nonce_size]),
+    )
+}
+
+/// Path components store the nonce prefix then ciphertext. AES-GCM uses 12
+/// bytes; secretbox uses 24. The unused suffix stays zero (Go `storj.Nonce`).
+fn nonce_from_prefix(prefix: &[u8]) -> [u8; NONCE_SIZE] {
+    let mut nonce = ZERO_NONCE;
+    nonce[..prefix.len()].copy_from_slice(prefix);
+    nonce
 }
 
 /// Empty component → `\x01`. Otherwise `\x02` + escaped bytes.

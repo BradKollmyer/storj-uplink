@@ -7,8 +7,8 @@ use prost::Message;
 use rand::TryRng;
 use storj_ec::ReedSolomon;
 use storj_encryption::{
-    CipherSuite, DEFAULT_ENCRYPTED_BLOCK_SIZE, Key, NONCE_SIZE, decrypt, encrypt, increment,
-    new_encrypter, transform_padded,
+    CipherSuite, DEFAULT_ENCRYPTED_BLOCK_SIZE, Key, NONCE_SIZE, ZERO_NONCE, decrypt, encrypt,
+    increment, new_encrypter, transform_padded,
 };
 use storj_proto::pointerdb::RedundancyScheme;
 
@@ -67,24 +67,25 @@ fn to_usize(v: i32, name: &str) -> Result<usize> {
     usize::try_from(v).map_err(|_| Error::protocol(format!("{name} {v} does not fit usize")))
 }
 
-/// Random 32-byte content/segment key.
-#[must_use]
-pub fn random_key() -> Key {
-    let mut bytes = [0u8; 32];
+fn csprng_bytes<const N: usize>() -> [u8; N] {
+    // codeql[rust/hard-coded-cryptographic-value]: entire buffer is overwritten with OS CSPRNG before return.
+    let mut bytes = [0u8; N];
     rand::rngs::SysRng
         .try_fill_bytes(&mut bytes)
         .expect("system RNG failed");
-    Key::from_bytes(bytes)
+    bytes
+}
+
+/// Random 32-byte content/segment key.
+#[must_use]
+pub fn random_key() -> Key {
+    Key::from_bytes(csprng_bytes())
 }
 
 /// Random 24-byte Storj nonce.
 #[must_use]
 pub fn random_nonce() -> [u8; NONCE_SIZE] {
-    let mut n = [0u8; NONCE_SIZE];
-    rand::rngs::SysRng
-        .try_fill_bytes(&mut n)
-        .expect("system RNG failed");
-    n
+    csprng_bytes()
 }
 
 /// Content-block starting nonce for a segment position (Go `nonceForPosition`).
@@ -92,7 +93,7 @@ pub fn random_nonce() -> [u8; NONCE_SIZE] {
 /// Increment is `(part_number << 32) | (index + 1)` so metadata can use zero.
 #[must_use]
 pub fn content_nonce(part_number: i32, index: i32) -> [u8; NONCE_SIZE] {
-    let mut n = [0u8; NONCE_SIZE];
+    let mut n = ZERO_NONCE;
     let amount = (i64::from(part_number) << 32) | (i64::from(index) + 1);
     let _ = increment(&mut n, amount);
     n
@@ -196,12 +197,9 @@ pub fn decrypt_key(
 
 /// Copy a Storj nonce from a protobuf bytes field (24 bytes, extra ignored).
 pub fn nonce_from_slice(b: &[u8]) -> Result<[u8; NONCE_SIZE]> {
-    if b.len() < NONCE_SIZE {
-        return Err(Error::protocol("nonce is shorter than 24 bytes"));
-    }
-    let mut n = [0u8; NONCE_SIZE];
-    n.copy_from_slice(&b[..NONCE_SIZE]);
-    Ok(n)
+    b.get(..NONCE_SIZE)
+        .and_then(|s| s.try_into().ok())
+        .ok_or_else(|| Error::protocol("nonce is shorter than 24 bytes"))
 }
 
 /// `pb.SerializableMeta` (custom metadata map).
@@ -282,7 +280,7 @@ pub fn encrypt_user_data(
         derived_content_key,
         &encrypted_metadata_nonce,
     )?;
-    let encrypted_stream_info = encrypt(&stream_info, cipher, &metadata_key, &[0u8; NONCE_SIZE])?;
+    let encrypted_stream_info = encrypt(&stream_info, cipher, &metadata_key, &ZERO_NONCE)?;
     let block = if encryption_block_size == 0 {
         DEFAULT_ENCRYPTED_BLOCK_SIZE
     } else {
@@ -296,8 +294,8 @@ pub fn encrypt_user_data(
     }
     .encode_to_vec();
     let encrypted_etag = encrypt(&[], cipher, &metadata_key, &{
-        let mut n = [0u8; NONCE_SIZE];
-        n[0] = 1;
+        let mut n = ZERO_NONCE;
+        let _ = increment(&mut n, 1);
         n
     })?;
 
@@ -352,7 +350,7 @@ pub fn decrypt_user_data_full(
         &meta.encrypted_stream_info,
         cipher,
         &metadata_key,
-        &[0u8; NONCE_SIZE],
+        &ZERO_NONCE,
     )?;
     let info = StreamInfo::decode(stream_info.as_slice())?;
     let custom = if info.metadata.is_empty() {

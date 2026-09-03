@@ -1,7 +1,7 @@
 //! Multipart upload ID encoding and part ETag encryption.
 
 use storj_access::{check_decode, check_encode};
-use storj_encryption::{CipherSuite, Key, NONCE_SIZE, decrypt, derive_key, encrypt};
+use storj_encryption::{CipherSuite, Key, ZERO_NONCE, decrypt, derive_key, encrypt};
 
 use crate::{Error, Result};
 
@@ -37,7 +37,7 @@ pub fn encrypt_etag(etag: &[u8], cipher: CipherSuite, segment_key: &Key) -> Resu
         return Ok(Vec::new());
     }
     let etag_key = derive_key(segment_key, ETAG_HMAC_INFO);
-    Ok(encrypt(etag, cipher, &etag_key, &[0u8; NONCE_SIZE])?)
+    Ok(encrypt(etag, cipher, &etag_key, &ZERO_NONCE)?)
 }
 
 /// Decrypt a part ETag stored on the last segment of a part.
@@ -50,12 +50,7 @@ pub fn decrypt_etag(
         return Ok(Vec::new());
     }
     let etag_key = derive_key(segment_key, ETAG_HMAC_INFO);
-    Ok(decrypt(
-        encrypted_etag,
-        cipher,
-        &etag_key,
-        &[0u8; NONCE_SIZE],
-    )?)
+    Ok(decrypt(encrypted_etag, cipher, &etag_key, &ZERO_NONCE)?)
 }
 
 #[cfg(test)]
@@ -108,16 +103,10 @@ mod tests {
         let etag = b"part-etag";
         let enc = encrypt_etag(etag, CipherSuite::AES_GCM, &key).unwrap();
         let expected_key = derive_key(&key, "storj-etag-v1");
-        let expected = encrypt(
-            etag,
-            CipherSuite::AES_GCM,
-            &expected_key,
-            &[0u8; NONCE_SIZE],
-        )
-        .unwrap();
+        let expected = encrypt(etag, CipherSuite::AES_GCM, &expected_key, &ZERO_NONCE).unwrap();
         assert_eq!(enc, expected);
         let legacy_key = derive_key(&key, "etag");
-        let legacy = encrypt(etag, CipherSuite::AES_GCM, &legacy_key, &[0u8; NONCE_SIZE]).unwrap();
+        let legacy = encrypt(etag, CipherSuite::AES_GCM, &legacy_key, &ZERO_NONCE).unwrap();
         assert_ne!(enc, legacy);
     }
 }
