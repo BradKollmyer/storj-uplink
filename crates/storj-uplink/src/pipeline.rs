@@ -4,7 +4,7 @@
 //! use padded block transformers then pad to the RS stripe size.
 
 use prost::Message;
-use rand::RngCore;
+use rand::TryRng;
 use storj_ec::ReedSolomon;
 use storj_encryption::{
     CipherSuite, DEFAULT_ENCRYPTED_BLOCK_SIZE, Key, NONCE_SIZE, decrypt, encrypt, increment,
@@ -71,7 +71,9 @@ fn to_usize(v: i32, name: &str) -> Result<usize> {
 #[must_use]
 pub fn random_key() -> Key {
     let mut bytes = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    rand::rngs::SysRng
+        .try_fill_bytes(&mut bytes)
+        .expect("system RNG failed");
     Key::from_bytes(bytes)
 }
 
@@ -79,7 +81,9 @@ pub fn random_key() -> Key {
 #[must_use]
 pub fn random_nonce() -> [u8; NONCE_SIZE] {
     let mut n = [0u8; NONCE_SIZE];
-    rand::rngs::OsRng.fill_bytes(&mut n);
+    rand::rngs::SysRng
+        .try_fill_bytes(&mut n)
+        .expect("system RNG failed");
     n
 }
 

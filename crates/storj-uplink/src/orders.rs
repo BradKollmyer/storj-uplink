@@ -12,6 +12,7 @@
 
 use ed25519_dalek::{Signature as EdSignature, Signer, SigningKey, Verifier, VerifyingKey};
 use prost::Message;
+use rand::TryRng;
 use sha2::{Digest, Sha256};
 use storj_proto::orders::{
     Order, OrderLimit, OrderLimitSigning, OrderSigning, PieceHash, PieceHashSigning,
@@ -110,7 +111,11 @@ impl PiecePrivateKey {
     /// Generate a new key pair.
     #[must_use]
     pub fn generate() -> Self {
-        Self(SigningKey::generate(&mut rand::rngs::OsRng))
+        let mut seed = [0u8; 32];
+        rand::rngs::SysRng
+            .try_fill_bytes(&mut seed)
+            .expect("system RNG failed");
+        Self(SigningKey::from_bytes(&seed))
     }
 
     /// Parse a 32-byte seed or 64-byte seed||public Go key.
