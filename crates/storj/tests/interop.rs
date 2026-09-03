@@ -123,23 +123,33 @@ async fn writer_reader_size_matrix() {
     let bucket = unique("interop");
     project.ensure_bucket(&bucket).await.expect("ensure_bucket");
 
-    for &(writer, reader) in INTEROP_SIDES {
-        for &size in INTEROP_SIZES {
-            let name = format!(
-                "{}->{}/{}",
-                writer.as_str(),
-                reader.as_str(),
-                size_label(size)
-            );
-            let key = format!("{}/{}", writer.as_str(), size_label(size));
-            let want = payload(size);
-            round_trip(writer, reader, &project, &grant, &bucket, &key, &want)
-                .await
-                .unwrap_or_else(|CellSkip(msg)| {
-                    panic!("go helper skipped despite live satellite ({name}): {msg}");
-                });
+    let body = {
+        let project = project.clone();
+        let grant = grant.clone();
+        let bucket = bucket.clone();
+        async move {
+            for &(writer, reader) in INTEROP_SIDES {
+                for &size in INTEROP_SIZES {
+                    let name = format!(
+                        "{}->{}/{}",
+                        writer.as_str(),
+                        reader.as_str(),
+                        size_label(size)
+                    );
+                    let key = format!("{}/{}", writer.as_str(), size_label(size));
+                    let want = payload(size);
+                    round_trip(writer, reader, &project, &grant, &bucket, &key, &want)
+                        .await
+                        .unwrap_or_else(|CellSkip(msg)| {
+                            panic!("go helper skipped despite live satellite ({name}): {msg}");
+                        });
+                }
+            }
         }
-    }
+    };
+    // Always delete the bucket and its objects (Go-written ones included),
+    // even if a cell panicked: this runs against a real project.
+    storj_test::with_bucket_cleanup(&project, &bucket, body).await;
 
     project.close().await.ok();
 }
