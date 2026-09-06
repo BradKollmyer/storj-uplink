@@ -168,7 +168,8 @@ fn withhold_tags(
         }
         let replace = topn
             .iter()
-            .find(|(_, c)| count > *c)
+            .min_by_key(|(_, c)| *c)
+            .filter(|(_, c)| count > *c)
             .map(|(k, _)| k.clone());
         if let Some(old) = replace {
             topn.remove(&old);
@@ -595,6 +596,29 @@ mod tests {
             Some(&req),
             &[tags(&[]), tags(&[]), tags(&[])]
         ));
+    }
+
+    #[test]
+    fn withhold_removes_the_largest_groups_regardless_of_hash_order() {
+        let mut pieces = Vec::new();
+        for (region, count) in [("a", 6), ("b", 5), ("c", 4), ("d", 3)] {
+            pieces.extend(std::iter::repeat_with(|| tags(&[("region", region)])).take(count));
+        }
+        // Each evaluation builds fresh randomized maps. The result must
+        // depend only on counts, never their iteration order.
+        for _ in 0..128 {
+            assert!(cohort_satisfied(Some(&withhold(2, 7)), &pieces));
+            assert!(!cohort_satisfied(Some(&withhold(2, 8)), &pieces));
+            let remaining = withhold_tags("region", 2, &pieces);
+            assert_eq!(remaining.len(), 7);
+            assert!(
+                remaining
+                    .iter()
+                    .all(|p| p["region"] == b"c" || p["region"] == b"d")
+            );
+        }
+        assert!(withhold_tags("region", 4, &pieces).is_empty());
+        assert_eq!(withhold_tags("region", 0, &pieces).len(), pieces.len());
     }
 
     #[test]
