@@ -28,6 +28,12 @@ const READ_CHUNK: usize = 64 * 1024;
 /// (Go `maxFrameOverhead`-style slack for the frame header).
 const MAX_BUFFERED: usize = MAX_PACKET_SIZE + 32;
 
+/// Stop probing once queued payload reaches this watermark. A final packet
+/// can add at most MAX_PACKET_SIZE, so queued payload stays below twice it.
+const PENDING_HIGH_WATER_BYTES: usize = MAX_PACKET_SIZE;
+/// Bound queue overhead even when the peer sends empty packets.
+const MAX_PENDING_PACKETS: usize = 256;
+
 fn timed_out() -> Error {
     Error::Io(io::Error::new(
         io::ErrorKind::TimedOut,
@@ -378,18 +384,31 @@ impl<T: AsyncRead + Unpin> Conn<T> {
 
     /// Non-blocking probe of the transport: drain whatever bytes are already
     /// readable, reassemble them, and queue complete packets for
-    /// [`Self::read_packet`]. Returns immediately when nothing is pending.
+    /// [`Self::read_packet`]. Returns when nothing is readable or the queue
+    /// reaches its payload/packet watermark, applying transport backpressure.
     ///
     /// Lets a sender notice a peer `Error`/`Close` in the middle of a
     /// streaming upload instead of only at `CloseSend` (Go's stream manager
     /// reads concurrently; we have one task per conn).
     async fn drain_ready(&mut self) -> Result<(), Error> {
+        let mut queued_bytes: usize = self.pending.iter().map(|pkt| pkt.data.len()).sum();
         loop {
             // Parse everything already buffered before touching the transport.
             loop {
+                // Apply backpressure until recv_msg/read_packet consumes the
+                // queued messages. Leave unread frames in the bounded input
+                // buffer or transport instead of draining an unbounded stream.
+                if queued_bytes >= PENDING_HIGH_WATER_BYTES
+                    || self.pending.len() >= MAX_PENDING_PACKETS
+                {
+                    return Ok(());
+                }
                 let before = self.unparsed().len();
                 match self.parse_one()? {
-                    Some(pkt) => self.pending.push_back(pkt),
+                    Some(pkt) => {
+                        queued_bytes += pkt.data.len();
+                        self.pending.push_back(pkt);
+                    }
                     // No progress: the buffer holds at most a partial frame.
                     None if self.unparsed().len() == before => break,
                     None => {}
@@ -600,6 +619,47 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Conn<T> {
 mod tests {
     use super::*;
     use crate::frame::{Frame, append_frame};
+
+    #[tokio::test]
+    async fn send_probe_bounds_queued_payload_and_empty_packets() {
+        for (payload_size, count) in [(64 * 1024, 130), (0, MAX_PENDING_PACKETS + 2)] {
+            let mut wire = Vec::new();
+            for message in 1..=count {
+                append_frame(
+                    &mut wire,
+                    &Frame {
+                        stream_id: 1,
+                        message_id: message as u64,
+                        kind: Kind::MESSAGE,
+                        done: true,
+                        control: false,
+                        data: vec![message as u8; payload_size],
+                    },
+                );
+            }
+            let (client_io, mut server_io) = tokio::io::duplex(wire.len());
+            server_io.write_all(&wire).await.unwrap();
+            let mut client = Conn::new(client_io);
+            let mut stream = client.open_stream("/stream").await.unwrap();
+            client.send_msg(&mut stream, b"order").await.unwrap();
+            let queued = client.pending.len();
+            assert!(queued < count);
+            assert!(queued <= MAX_PENDING_PACKETS);
+            let bytes: usize = client.pending.iter().map(|p| p.data.len()).sum();
+            assert!(bytes < PENDING_HIGH_WATER_BYTES + MAX_PACKET_SIZE);
+            client
+                .send_msg(&mut stream, b"another order")
+                .await
+                .unwrap();
+            assert_eq!(client.pending.len(), queued);
+            for message in 1..=count {
+                let data = client.recv_msg(&stream).await.unwrap();
+                assert_eq!(data, vec![message as u8; payload_size]);
+            }
+            assert!(client.pending.is_empty());
+            assert!(!client.is_poisoned());
+        }
+    }
 
     impl<T> Conn<T> {
         fn with_split_size(mut self, n: usize) -> Self {
