@@ -2,7 +2,12 @@
 
 `cargo-fuzz` targets for the parsers that consume untrusted bytes. The
 `fuzz` package is excluded from the workspace so it does not affect normal
-builds; it needs nightly Rust.
+builds. Running fuzzers needs nightly Rust; CI also checks that every target
+compiles on stable Rust:
+
+```bash
+cargo check --manifest-path fuzz/Cargo.toml --bins --locked
+```
 
 ```bash
 cargo install cargo-fuzz

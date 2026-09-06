@@ -298,7 +298,7 @@ fn id_less(a_stream: u64, a_message: u64, b_stream: u64, b_message: u64) -> bool
 /// Reconstructs packets from frames. IDs must be monotonically increasing
 /// (Go `Reader.ReadPacketUsing`).
 #[derive(Debug)]
-pub(crate) struct PacketAssembler {
+pub struct PacketAssembler {
     last_stream: u64,
     last_message: u64,
     current: Option<Packet>,
@@ -319,7 +319,9 @@ impl Default for PacketAssembler {
 }
 
 impl PacketAssembler {
-    pub(crate) fn push(&mut self, fr: Frame) -> Result<Option<Packet>, FrameError> {
+    /// Consume a frame, returning the completed packet when its last frame
+    /// arrives. Rejects regressing IDs, changing kinds, and oversized packets.
+    pub fn push(&mut self, fr: Frame) -> Result<Option<Packet>, FrameError> {
         if id_less(
             fr.stream_id,
             fr.message_id,

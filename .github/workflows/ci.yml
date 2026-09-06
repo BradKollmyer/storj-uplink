@@ -28,6 +28,8 @@ jobs:
         run: cargo fmt --all -- --check
       - name: clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: fuzz targets compile
+        run: cargo check --manifest-path fuzz/Cargo.toml --bins --locked
       - name: rustdoc
         env:
           RUSTDOCFLAGS: -D warnings
