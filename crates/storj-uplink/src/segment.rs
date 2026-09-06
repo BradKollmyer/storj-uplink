@@ -224,10 +224,10 @@ pub async fn dial_sn(
 }
 
 fn host_from_address(address: &str) -> &str {
-    if let Some(rest) = address.strip_prefix('[') {
-        if let Some((host, _)) = rest.split_once(']') {
-            return host;
-        }
+    if let Some(rest) = address.strip_prefix('[')
+        && let Some((host, _)) = rest.split_once(']')
+    {
+        return host;
     }
     match address.rsplit_once(':') {
         Some((host, port)) if port.chars().all(|c| c.is_ascii_digit()) => host,
@@ -468,10 +468,10 @@ async fn upload_one_piece(
     }
     impl Drop for RecycleOnDrop {
         fn drop(&mut self) {
-            if let Some(mut pooled) = self.pooled.take() {
-                if pooled.get().is_none_or(|t| t.conn.is_none()) {
-                    pooled.skip_recycle();
-                }
+            if let Some(mut pooled) = self.pooled.take()
+                && pooled.get().is_none_or(|t| t.conn.is_none())
+            {
+                pooled.skip_recycle();
             }
         }
     }

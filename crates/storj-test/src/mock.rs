@@ -1086,14 +1086,14 @@ fn list_objects(
         {
             continue;
         }
-        if let Some(d) = delim {
-            if let Some(idx) = remainder.windows(d.len()).position(|w| w == d) {
-                let mut prefix_key = remainder[..idx + d.len()].to_vec();
-                if prefixes.insert(prefix_key.clone()) {
-                    entries.push((std::mem::take(&mut prefix_key), None));
-                }
-                continue;
+        if let Some(d) = delim
+            && let Some(idx) = remainder.windows(d.len()).position(|w| w == d)
+        {
+            let mut prefix_key = remainder[..idx + d.len()].to_vec();
+            if prefixes.insert(prefix_key.clone()) {
+                entries.push((std::mem::take(&mut prefix_key), None));
             }
+            continue;
         }
         entries.push((
             remainder,
@@ -1334,10 +1334,8 @@ fn apply_relocated(
             seg.encrypted_key_nonce = k.encrypted_key_nonce.clone();
         }
     }
-    if !dest_exists {
-        if let Some(bucket) = st.buckets.get_mut(&dest_bucket) {
-            bucket.objects += 1;
-        }
+    if !dest_exists && let Some(bucket) = st.buckets.get_mut(&dest_bucket) {
+        bucket.objects += 1;
     }
     st.committed.insert(
         (dest_bucket, dest_enc),
@@ -1470,23 +1468,22 @@ fn retry_pieces(
     let mut addressed_limits = Vec::new();
     if let Some(sid) = stream_id {
         let mut st = state.lock().expect("mock state");
-        if let Some(pending) = st.pending.get_mut(&sid) {
-            if let Some(mut inflight) = pending.in_flight.remove(&req.segment_id) {
-                for (num, limit) in &replacements {
-                    inflight.piece_limits.insert(*num, limit.clone());
-                }
-                let n = inflight
-                    .piece_limits
-                    .keys()
-                    .copied()
-                    .max()
-                    .map_or(0, |m| m + 1);
-                for num in 0..n {
-                    addressed_limits
-                        .push(inflight.piece_limits.get(&num).cloned().unwrap_or_default());
-                }
-                pending.in_flight.insert(new_id.clone(), inflight);
+        if let Some(pending) = st.pending.get_mut(&sid)
+            && let Some(mut inflight) = pending.in_flight.remove(&req.segment_id)
+        {
+            for (num, limit) in &replacements {
+                inflight.piece_limits.insert(*num, limit.clone());
             }
+            let n = inflight
+                .piece_limits
+                .keys()
+                .copied()
+                .max()
+                .map_or(0, |m| m + 1);
+            for num in 0..n {
+                addressed_limits.push(inflight.piece_limits.get(&num).cloned().unwrap_or_default());
+            }
+            pending.in_flight.insert(new_id.clone(), inflight);
         }
     }
     if addressed_limits.is_empty() {
@@ -1554,38 +1551,38 @@ fn commit_segment(
         }
     }
     let stream_id = st.segment_to_stream.get(&req.segment_id).cloned();
-    if let Some(sid) = stream_id {
-        if let Some(pending) = st.pending.get_mut(&sid) {
-            let inflight = pending.in_flight.remove(&req.segment_id);
-            let mut pieces = Vec::new();
-            let position = inflight.as_ref().map(|f| f.position).unwrap_or_default();
-            if let Some(inflight) = inflight {
-                for result in &req.upload_result {
-                    if let Some(addr) = inflight.piece_limits.get(&result.piece_num) {
-                        let limit = addr.limit.as_ref();
-                        pieces.push(StoredPiece {
-                            piece_num: result.piece_num,
-                            piece_id: limit.map(|l| l.piece_id.clone()).unwrap_or_default(),
-                            node_id: limit
-                                .map(|l| l.storage_node_id.clone())
-                                .unwrap_or_else(|| result.node_id.clone()),
-                        });
-                    }
+    if let Some(sid) = stream_id
+        && let Some(pending) = st.pending.get_mut(&sid)
+    {
+        let inflight = pending.in_flight.remove(&req.segment_id);
+        let mut pieces = Vec::new();
+        let position = inflight.as_ref().map(|f| f.position).unwrap_or_default();
+        if let Some(inflight) = inflight {
+            for result in &req.upload_result {
+                if let Some(addr) = inflight.piece_limits.get(&result.piece_num) {
+                    let limit = addr.limit.as_ref();
+                    pieces.push(StoredPiece {
+                        piece_num: result.piece_num,
+                        piece_id: limit.map(|l| l.piece_id.clone()).unwrap_or_default(),
+                        node_id: limit
+                            .map(|l| l.storage_node_id.clone())
+                            .unwrap_or_else(|| result.node_id.clone()),
+                    });
                 }
             }
-            pending.segments.push(StoredSegment {
-                position,
-                encrypted_key: req.encrypted_key.clone(),
-                encrypted_key_nonce: req.encrypted_key_nonce.clone(),
-                plain_size: req.plain_size,
-                encrypted_size: req.size_encrypted_data,
-                inline_data: Vec::new(),
-                pieces,
-                scheme: test_scheme(),
-                encrypted_etag: req.encrypted_e_tag.clone(),
-                created: SystemTime::now(),
-            });
         }
+        pending.segments.push(StoredSegment {
+            position,
+            encrypted_key: req.encrypted_key.clone(),
+            encrypted_key_nonce: req.encrypted_key_nonce.clone(),
+            plain_size: req.plain_size,
+            encrypted_size: req.size_encrypted_data,
+            inline_data: Vec::new(),
+            pieces,
+            scheme: test_scheme(),
+            encrypted_etag: req.encrypted_e_tag.clone(),
+            created: SystemTime::now(),
+        });
     }
     Ok(CommitSegmentResponse {
         successful_pieces: req.upload_result.len() as i32,
@@ -1788,19 +1785,19 @@ fn list_uploading_objects(
     let mut seen_prefix = BTreeSet::new();
     for (remainder, pending) in items {
         let remainder = remainder.as_slice();
-        if let Some(del) = delimiter {
-            if let Some(idx) = remainder.iter().position(|b| *b == del) {
-                let prefix_key = remainder[..=idx].to_vec();
-                if seen_prefix.insert(prefix_key.clone()) {
-                    out.push(ObjectListItem {
-                        encrypted_object_key: prefix_key,
-                        status: ObjectStatus::Prefix as i32,
-                        created_at: Some(timestamp(pending.created)),
-                        ..Default::default()
-                    });
-                }
-                continue;
+        if let Some(del) = delimiter
+            && let Some(idx) = remainder.iter().position(|b| *b == del)
+        {
+            let prefix_key = remainder[..=idx].to_vec();
+            if seen_prefix.insert(prefix_key.clone()) {
+                out.push(ObjectListItem {
+                    encrypted_object_key: prefix_key,
+                    status: ObjectStatus::Prefix as i32,
+                    created_at: Some(timestamp(pending.created)),
+                    ..Default::default()
+                });
             }
+            continue;
         }
         let plain_size: i64 = pending.segments.iter().map(|s| s.plain_size).sum();
         out.push(ObjectListItem {
@@ -2138,15 +2135,15 @@ fn check_key(header: &Option<RequestHeader>, state: &MockState) -> Result<(), (u
         let Ok(c) = storj_access::Caveat::decode(raw) else {
             return Err((RPC_UNAUTHENTICATED, "invalid caveat".into()));
         };
-        if let Some(t) = c.not_after {
-            if now > t {
-                return Err((RPC_UNAUTHENTICATED, "api key expired".into()));
-            }
+        if let Some(t) = c.not_after
+            && now > t
+        {
+            return Err((RPC_UNAUTHENTICATED, "api key expired".into()));
         }
-        if let Some(t) = c.not_before {
-            if now < t {
-                return Err((RPC_UNAUTHENTICATED, "api key not yet valid".into()));
-            }
+        if let Some(t) = c.not_before
+            && now < t
+        {
+            return Err((RPC_UNAUTHENTICATED, "api key not yet valid".into()));
         }
     }
     Ok(())

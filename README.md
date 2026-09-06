@@ -84,7 +84,8 @@ cargo run -p storj --example walkthrough -- "$STORJ_ACCESS"
 
 ## MSRV
 
-Rust 1.85 (edition 2024).
+Rust 1.88 (edition 2024). This matches the existing let-chain syntax and the
+patched `time` dependency used by the certificate stack.
 
 ## Build notes
 

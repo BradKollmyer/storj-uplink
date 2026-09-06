@@ -250,7 +250,7 @@ Crate root (2025): `Bucket`, `Error`, `Object`, `Project`, `Config`, `Encryption
 | K7 | **rustls**, not native-tls | Consistent TLS, no OpenSSL. Custom verifier for Storj NodeID pinning. |
 | K8 | **prost + vendored `.proto`**, not a live git submodule of `storj/storj` | Pin proto snapshots; review proto diffs as PRs. Wire format is standard protobuf (picobuf is a Go subset encoder, compatible). |
 | K9 | **MIT OR Apache-2.0** | Uplink-go is MIT; Rust crates typically dual-license. Satellite AGPL does not apply to a client. |
-| K10 | **MSRV floor 1.85** (edition 2024) | CI on 1.85 and stable. Not “latest minus two” (that would be ~1.89 on 2026-09-01). |
+| K10 | **MSRV floor 1.88** (edition 2024) | CI on 1.88 and stable. This corrects the original 1.85 claim to match the implemented let chains and patched certificate-stack dependencies. |
 | K11 | **Blocking API is a thin `block_on` wrapper behind feature `blocking`** | Not the default. Exists for CLI tools that do not want to own a runtime. |
 | K12 | **Do not depend on or wrap `uplink`/`uplink-sys`** | Different product. Mention in README as the FFI alternative. |
 | K13 | **API familiarity with uplink-rust 0.11 / uplink-go, not source compatibility** | Keep Project/Bucket/Object/Upload/Download/share/permissions. Rename `Grant`→`Access`. Do not publish as `uplink`. Not a drop-in replacement (`!Send` vs `Send`, blocking vs async, `open` now `Result`). |
@@ -437,7 +437,7 @@ members = ["crates/*"]
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/<org>/storj-uplink"
 version = "0.1.0"
@@ -1665,7 +1665,7 @@ This is a library, not a service.
 | Item | Policy |
 |---|---|
 | Semver | 0.x can break; 1.x follows Cargo semver. Public API is `storj::*` only. |
-| MSRV | 1.85 at start; bump in CHANGELOG, not on patch if avoidable. |
+| MSRV | 1.88; changes documented in CHANGELOG, not on patch if avoidable. |
 | Edition | 2024 |
 | `no_std` | No |
 | WASM | No (needs TCP, rustls client identity, threads for Argon2) |

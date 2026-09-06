@@ -156,7 +156,7 @@ pub fn decode_encrypted(shares: &[(i32, Vec<u8>)], rs: &Redundancy) -> Result<Ve
     if !shares.iter().all(|(_, d)| d.len() == piece_len) {
         return Err(Error::protocol("piece lengths differ"));
     }
-    if piece_len % share_size != 0 {
+    if !piece_len.is_multiple_of(share_size) {
         return Err(Error::protocol(
             "piece length is not a multiple of share size",
         ));
@@ -413,10 +413,10 @@ async fn download_one_piece(
     }
     impl Drop for RecycleOnDrop {
         fn drop(&mut self) {
-            if let Some(mut pooled) = self.pooled.take() {
-                if pooled.get().is_none_or(|t| t.conn.is_none()) {
-                    pooled.skip_recycle();
-                }
+            if let Some(mut pooled) = self.pooled.take()
+                && pooled.get().is_none_or(|t| t.conn.is_none())
+            {
+                pooled.skip_recycle();
             }
         }
     }

@@ -63,7 +63,7 @@ Fuzz targets live in `fuzz/` (excluded from the workspace, needs nightly and `ca
 ## Contributing rules that CI or reviewers enforce
 
 - DCO: every commit needs `Signed-off-by:` — use `git commit -s`.
-- MSRV 1.85 / edition 2024; CI has an MSRV job, so no newer std APIs.
+- MSRV 1.88 / edition 2024; CI has an MSRV job, so no newer std APIs.
 - Workflows run with `--locked`; commit `Cargo.lock` changes.
 - `.cargo/config.toml` sets `--cfg aes_armv8 --cfg polyval_armv8` on aarch64;
   without it AES-GCM is ~10x slower. Downstream users must set the same.

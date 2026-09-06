@@ -28,7 +28,7 @@ right to submit it under the project license(s).
 
 ## Toolchain
 
-- **MSRV:** 1.85
+- **MSRV:** 1.88
 - **Edition:** 2024
 
 ```bash

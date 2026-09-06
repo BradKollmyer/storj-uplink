@@ -100,10 +100,10 @@ impl From<io::Error> for Error {
         // `AsyncRead`/`AsyncWrite` and `tokio::io::copy`) carries the original
         // as its inner error: unwrap it so the kind survives the round trip.
         if e.get_ref().is_some_and(|inner| inner.is::<Error>()) {
-            if let Some(inner) = e.into_inner() {
-                if let Ok(orig) = inner.downcast::<Error>() {
-                    return *orig;
-                }
+            if let Some(inner) = e.into_inner()
+                && let Ok(orig) = inner.downcast::<Error>()
+            {
+                return *orig;
             }
             return Self::new(ErrorKind::Io, "io error");
         }

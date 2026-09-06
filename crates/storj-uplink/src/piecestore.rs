@@ -558,11 +558,11 @@ mod tests {
                         algo = PieceHashAlgo::from_i32(req.hash_algorithm);
                         limit = Some(l);
                     }
-                    if let Some(order) = req.order.as_ref() {
-                        if let Some(l) = limit.as_ref() {
-                            let pk = PiecePublicKey::from_bytes(&l.uplink_public_key)?;
-                            verify_order(order, &pk)?;
-                        }
+                    if let Some(order) = req.order.as_ref()
+                        && let Some(l) = limit.as_ref()
+                    {
+                        let pk = PiecePublicKey::from_bytes(&l.uplink_public_key)?;
+                        verify_order(order, &pk)?;
                     }
                     if let Some(chunk) = req.chunk {
                         let off = usize::try_from(chunk.offset).unwrap_or(0);

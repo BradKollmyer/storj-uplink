@@ -1241,10 +1241,10 @@ fn server_name_from_address(address: &str) -> Result<ServerName<'static>> {
 }
 
 fn host_from_address(address: &str) -> &str {
-    if let Some(rest) = address.strip_prefix('[') {
-        if let Some((host, _)) = rest.split_once(']') {
-            return host;
-        }
+    if let Some(rest) = address.strip_prefix('[')
+        && let Some((host, _)) = rest.split_once(']')
+    {
+        return host;
     }
     match address.rsplit_once(':') {
         Some((host, port)) if port.chars().all(|c| c.is_ascii_digit()) => host,

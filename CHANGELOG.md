@@ -12,6 +12,13 @@ published so the facade can resolve on crates.io; they are not a stable API.
 
 ## [Unreleased]
 
+### Changed
+
+- Correct the minimum supported Rust version to 1.88 and explicitly test it
+  in CI. The implementation already uses let chains and certificate-stack
+  dependencies requiring 1.88; retaining 1.85 would require a `time` downgrade
+  affected by RUSTSEC-2026-0009.
+
 ## [1.0.0] - 2026-09-03
 
 Native Uplink API freeze. This crate is not a wrapper around `uplink-c` and is
@@ -125,4 +132,3 @@ runs and Dependabot bumps landed before `v1.0.0` was cut.
   tag `v1.0.0`
 - Edge / GatewayMT (`storj::edge`) is specified for 1.x and is not in this
   release
-

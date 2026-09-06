@@ -226,10 +226,10 @@ impl Project {
                 if meta.encryption_type != 0 {
                     cipher = storj_encryption::CipherSuite(meta.encryption_type);
                 }
-                if meta.encryption_block_size > 0 {
-                    if let Ok(b) = usize::try_from(meta.encryption_block_size) {
-                        block_size = b;
-                    }
+                if meta.encryption_block_size > 0
+                    && let Ok(b) = usize::try_from(meta.encryption_block_size)
+                {
+                    block_size = b;
                 }
                 (
                     info.segments_size,
@@ -789,26 +789,26 @@ async fn download_segments(
             .as_ref()
             .and_then(|o| o.encryption_parameters.as_ref()),
     );
-    if let Some(obj) = &resp.object {
-        if !obj.encrypted_metadata.is_empty() {
-            let (meta, custom) = decrypt_user_data(
-                &obj.encrypted_metadata,
-                &obj.encrypted_metadata_encrypted_key,
-                &obj.encrypted_metadata_nonce,
-                cipher,
-                &content_key,
-            )
-            .map_err(map_uplink)?;
-            if meta.encryption_type != 0 {
-                cipher = storj_encryption::CipherSuite(meta.encryption_type);
-            }
-            if meta.encryption_block_size > 0 {
-                if let Ok(b) = usize::try_from(meta.encryption_block_size) {
-                    block_size = b;
-                }
-            }
-            info.custom = custom.user_defined.into_iter().collect();
+    if let Some(obj) = &resp.object
+        && !obj.encrypted_metadata.is_empty()
+    {
+        let (meta, custom) = decrypt_user_data(
+            &obj.encrypted_metadata,
+            &obj.encrypted_metadata_encrypted_key,
+            &obj.encrypted_metadata_nonce,
+            cipher,
+            &content_key,
+        )
+        .map_err(map_uplink)?;
+        if meta.encryption_type != 0 {
+            cipher = storj_encryption::CipherSuite(meta.encryption_type);
         }
+        if meta.encryption_block_size > 0
+            && let Ok(b) = usize::try_from(meta.encryption_block_size)
+        {
+            block_size = b;
+        }
+        info.custom = custom.user_defined.into_iter().collect();
     }
 
     let mut list = resp.segment_list.unwrap_or_default();

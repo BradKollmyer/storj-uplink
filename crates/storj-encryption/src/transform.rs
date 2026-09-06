@@ -253,7 +253,7 @@ pub fn transform_blocks(
     starting_block: i64,
 ) -> Result<Vec<u8>> {
     let in_size = transformer.in_block_size();
-    if in_size == 0 || data.len() % in_size != 0 {
+    if in_size == 0 || !data.len().is_multiple_of(in_size) {
         return Err(Error::new(
             ErrorKind::InvalidConfig,
             "invalid transformer and range reader combination.the range reader size is not a multiple of the block size",

@@ -166,16 +166,16 @@ impl Store {
             base = walked.base;
         }
 
-        if base.is_none() {
-            if let Some(key) = &self.default_key {
-                let mut lookup = Lookup {
-                    revealed: None,
-                    remaining: PathIter::new(path),
-                    base: Some(self.default_base(key)),
-                };
-                self.apply_bypass(&mut lookup);
-                return lookup;
-            }
+        if base.is_none()
+            && let Some(key) = &self.default_key
+        {
+            let mut lookup = Lookup {
+                revealed: None,
+                remaining: PathIter::new(path),
+                base: Some(self.default_base(key)),
+            };
+            self.apply_bypass(&mut lookup);
+            return lookup;
         }
 
         let mut lookup = Lookup {
@@ -198,10 +198,10 @@ impl Store {
     }
 
     fn apply_bypass(&self, lookup: &mut Lookup) {
-        if self.encryption_bypass {
-            if let Some(base) = lookup.base.as_mut() {
-                base.path_cipher = CipherSuite::NULL_BASE64_URL;
-            }
+        if self.encryption_bypass
+            && let Some(base) = lookup.base.as_mut()
+        {
+            base.path_cipher = CipherSuite::NULL_BASE64_URL;
         }
     }
 
