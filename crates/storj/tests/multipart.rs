@@ -34,6 +34,71 @@ async fn open_project(mock: &MockSatellite) -> Project {
     Project::open(&mock.access()).await.expect("open")
 }
 
+#[tokio::test]
+async fn multipart_commit_requires_only_upload_permission() {
+    let mock = MockSatellite::start().await;
+    let access = mock.access();
+    let full = Project::open(&access).await.unwrap();
+    full.ensure_bucket("write-only").await.unwrap();
+    let restricted = access
+        .share(
+            storj::Permission {
+                allow_upload: true,
+                ..Default::default()
+            },
+            &[],
+        )
+        .unwrap();
+
+    for with_metadata in [false, true] {
+        let key = if with_metadata {
+            "custom"
+        } else {
+            "empty-meta"
+        };
+        let writer = Project::open(&restricted).await.unwrap();
+        let info = writer
+            .begin_upload("write-only", key, Default::default())
+            .await
+            .unwrap();
+        let mut part = writer
+            .upload_part("write-only", key, &info.upload_id, 1)
+            .await
+            .unwrap();
+        part.write_all(b"multipart body").await.unwrap();
+        part.commit().await.unwrap();
+        writer.close().await.unwrap();
+        // Commit must also work without local state from BeginUpload/UploadPart.
+        let writer = Project::open(&restricted).await.unwrap();
+        let custom = if with_metadata {
+            CustomMetadata::from([("name".into(), "value".into())])
+        } else {
+            CustomMetadata::new()
+        };
+        let object = writer
+            .commit_upload(
+                "write-only",
+                key,
+                &info.upload_id,
+                CommitUploadOptions {
+                    custom_metadata: custom.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(object.system.content_length, 14);
+        assert_eq!(object.custom, custom);
+        let mut download = full
+            .download_object("write-only", key, Default::default())
+            .await
+            .unwrap();
+        assert_eq!(download.info().custom, custom);
+        let mut body = Vec::new();
+        download.read_to_end(&mut body).await.unwrap();
+        assert_eq!(body, b"multipart body");
+    }
+}
+
 fn unique(prefix: &str) -> String {
     format!(
         "{prefix}-{}",

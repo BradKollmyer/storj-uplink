@@ -371,24 +371,19 @@ impl Project {
         let content_key =
             storj_encryption::derive_content_key(bucket, key.as_bytes(), &self.inner.store)
                 .map_err(map_enc)?;
-        let mut listed = self
-            .inner
-            .metainfo
-            .list_all_segments(bucket, key, stream_id.clone())
-            .await?;
-        listed.items.sort_by_key(segment_list_order);
-        let (cipher, block_size) = encryption_from_params(listed.encryption_parameters.as_ref());
-        let last_segment_plain = listed.items.last().map(|i| i.plain_size).unwrap_or(0);
-        let total_plain: i64 = listed.items.iter().map(|i| i.plain_size).sum();
+        // Multipart metadata does not need segment sizes/counts: the satellite
+        // computes them at commit. Like Go fillMetadata, omit those legacy
+        // hints so committing only requires upload permission, even after
+        // reopening a project with an existing upload ID.
         let custom_pairs: Vec<(String, String)> = opts.custom_metadata.into_iter().collect();
         let user = storj_uplink::pipeline::encrypt_user_data(
             &custom_pairs,
-            crate::constants::MAX_SEGMENT_SIZE as i64,
-            last_segment_plain,
-            i64::try_from(listed.items.len()).unwrap_or(i64::MAX),
-            cipher,
+            0,
+            0,
+            0,
+            storj_encryption::CipherSuite::AES_GCM,
             &content_key,
-            block_size,
+            crate::constants::ENCRYPTION_BLOCK_SIZE,
         )
         .map_err(map_uplink)?;
         let committed = self
@@ -397,9 +392,6 @@ impl Project {
             .commit_object(bucket, key, stream_id, user)
             .await?;
         let mut obj = object_from_proto(committed.object, key);
-        if obj.system.content_length <= 0 {
-            obj.system.content_length = total_plain;
-        }
         obj.custom = custom_pairs.into_iter().collect();
         Ok(obj)
     }
