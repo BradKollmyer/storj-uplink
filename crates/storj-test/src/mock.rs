@@ -133,6 +133,7 @@ struct MockState {
     next_id: u64,
     piece_key: Vec<u8>,
     fail_commit: bool,
+    malformed_connection: bool,
     last_retry_segment_id: Option<Vec<u8>>,
     last_commit_segment_id: Option<Vec<u8>>,
     stale_segment_ids: BTreeSet<Vec<u8>>,
@@ -190,6 +191,7 @@ impl MockSatellite {
             next_id: 1,
             piece_key,
             fail_commit: false,
+            malformed_connection: false,
             last_retry_segment_id: None,
             last_commit_segment_id: None,
             stale_segment_ids: BTreeSet::new(),
@@ -322,6 +324,11 @@ impl MockSatellite {
         self.state.lock().expect("mock state").fail_commit = true;
     }
 
+    /// Send an invalid frame header on the next satellite connection.
+    pub fn malform_next_connection(&self) {
+        self.state.lock().expect("mock state").malformed_connection = true;
+    }
+
     /// Next Download on storage node `idx` fails (k-1 reconstruction tests).
     pub async fn fail_sn_download(&self, idx: usize) {
         if let Some(sn) = self.sns.get(idx) {
@@ -418,7 +425,15 @@ async fn serve_conn(
     identity: Identity,
 ) -> Result<(), storj_rpc::Error> {
     read_tls_mux_prefix(&mut tcp).await?;
-    let tls = acceptor.accept(tcp).await.map_err(storj_rpc::Error::Io)?;
+    let mut tls = acceptor.accept(tcp).await.map_err(storj_rpc::Error::Io)?;
+    let malformed = std::mem::take(&mut state.lock().expect("mock state").malformed_connection);
+    if malformed {
+        use tokio::io::AsyncWriteExt;
+        // A MESSAGE frame declaring MAX_PACKET_SIZE + 1 bytes. Keep the
+        // connection open so reuse fails on buffered bytes, not on EOF.
+        tls.write_all(&[0x05, 1, 1, 0x81, 0x80, 0x80, 0x02]).await?;
+        tls.flush().await?;
+    }
     let mut conn = Conn::new(tls);
     loop {
         match serve_one(&mut conn, &state, &sns, &identity).await {

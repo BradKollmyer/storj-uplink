@@ -1299,13 +1299,10 @@ fn is_retryable(err: &storj_rpc::Error) -> bool {
 }
 
 fn is_conn_dead(err: &storj_rpc::Error) -> bool {
-    matches!(
-        err,
-        storj_rpc::Error::Io(_)
-            | storj_rpc::Error::Truncated
-            | storj_rpc::Error::Closed
-            | storj_rpc::Error::MuxPrefix { .. }
-    )
+    // Only a well-formed remote RPC error leaves framing reusable. In
+    // particular, a frame parse failure can leave the offending bytes in
+    // Conn's buffer and must never be returned to the idle pool.
+    !matches!(err, storj_rpc::Error::Remote { .. })
 }
 
 fn map_decode(e: prost::DecodeError) -> Error {

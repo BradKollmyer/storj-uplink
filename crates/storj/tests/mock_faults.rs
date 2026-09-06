@@ -72,6 +72,29 @@ async fn open_rejects_wrong_node_id_pin() {
 }
 
 #[tokio::test]
+async fn malformed_satellite_connection_is_discarded() {
+    let mock = storj_test::MockSatellite::start().await;
+    let access = mock.access();
+    let project = storj::Project::open(&access).await.unwrap();
+    project.create_bucket("framing").await.unwrap();
+    project.close().await.unwrap();
+
+    mock.malform_next_connection();
+    let project = storj::Project::open(&access).await.unwrap();
+    let err = project.stat_bucket("framing").await.unwrap_err();
+    assert_eq!(err.kind(), storj::ErrorKind::Protocol);
+    // A new call must redial instead of parsing the same invalid bytes again.
+    assert_eq!(
+        project.stat_bucket("framing").await.unwrap().name,
+        "framing"
+    );
+    assert_eq!(
+        project.stat_bucket("framing").await.unwrap().name,
+        "framing"
+    );
+}
+
+#[tokio::test]
 async fn long_tail_cancels_slow_pieces() {
     use tokio::io::AsyncWriteExt;
     let mock = storj_test::MockSatellite::start().await;
