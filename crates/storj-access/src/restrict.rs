@@ -170,22 +170,46 @@ fn limit_to(enc: &EncryptionAccess, api_key: &ApiKey) -> Result<EncryptionAccess
     let mut store = Store::new();
     store.set_default_path_cipher(src.default_path_cipher());
 
-    for prefix in prefixes {
+    for prefix in &prefixes {
         // A non-UTF-8 bucket cannot match any store entry: skip, don't rewrite.
         let Ok(bucket) = std::str::from_utf8(&prefix.bucket) else {
             continue;
         };
-        let enc_path = prefix.encrypted_path_prefix;
-        let Ok(unenc) = decrypt_path(bucket, &enc_path, &src) else {
+        let enc_path = &prefix.encrypted_path_prefix;
+        let Ok(unenc) = decrypt_path(bucket, enc_path, &src) else {
             continue;
         };
         let Ok(key) = derive_path_key(bucket, &unenc, &src) else {
             continue;
         };
-        let Some(base) = src.lookup_encrypted(bucket, &enc_path).base else {
+        let Some(base) = src.lookup_encrypted(bucket, enc_path).base else {
             continue;
         };
-        let _ = store.add_with_cipher(bucket, &unenc, &enc_path, key, base.path_cipher);
+        let _ = store.add_with_cipher(bucket, &unenc, enc_path, key, base.path_cipher);
+    }
+
+    // A permitted ancestor key cannot reconstruct independently overridden
+    // descendant keys. Keep those explicit bases too, but only when their
+    // encrypted paths satisfy every caveat (as collapsed above).
+    for entry in &enc.store_entries {
+        if prefixes.iter().any(|prefix| {
+            entry.bucket == prefix.bucket
+                && entry
+                    .encrypted_path
+                    .starts_with(&prefix.encrypted_path_prefix)
+        }) {
+            let bucket = std::str::from_utf8(&entry.bucket)
+                .map_err(|_| Error::new("encryption access entry bucket is not utf-8"))?;
+            store
+                .add_with_cipher(
+                    bucket,
+                    &entry.unencrypted_path,
+                    &entry.encrypted_path,
+                    Key::from_bytes(entry.key),
+                    EncCipher(entry.path_cipher.0),
+                )
+                .map_err(map_enc)?;
+        }
     }
 
     Ok(enc_from_store(&store))
@@ -383,6 +407,69 @@ mod tests {
         let limited = enc.limit_to(&api).unwrap();
         assert_eq!(limited.default_key, Some([0x33; 32]));
         assert!(limited.store_entries.is_empty());
+    }
+
+    #[test]
+    fn restricted_grant_preserves_descendant_overrides_on_share_and_reload() {
+        let mut original = sample_grant();
+        original
+            .override_encryption_key("app", "user1/child/", &[0x55; 32])
+            .unwrap();
+        original
+            .override_encryption_key("app", "other/", &[0x66; 32])
+            .unwrap();
+        let before = store_from_enc(original.enc_access()).unwrap();
+        let path = "user1/child/object";
+        let encrypted = encrypt_path("app", path, &before).unwrap();
+        let content_key =
+            storj_encryption::derive_content_key("app", path.as_bytes(), &before).unwrap();
+        let shared = original
+            .restrict(
+                &Permission::full(),
+                &[SharePrefix {
+                    bucket: "app".into(),
+                    prefix: "user1/".into(),
+                }],
+            )
+            .unwrap();
+        let reloaded = Grant::parse(&shared.serialize().unwrap()).unwrap();
+        for grant in [&shared, &reloaded] {
+            let store = store_from_enc(grant.enc_access()).unwrap();
+            assert_eq!(encrypt_path("app", path, &store).unwrap(), encrypted);
+            assert_eq!(
+                storj_encryption::derive_content_key("app", path.as_bytes(), &store)
+                    .unwrap()
+                    .to_bytes(),
+                content_key.to_bytes()
+            );
+            assert!(grant.enc_access().default_key.is_none());
+            assert!(encrypt_path("app", "other/object", &store).is_err());
+            assert!(encrypt_path("different", path, &store).is_err());
+        }
+        let mut shared = shared;
+        shared
+            .override_encryption_key("app", "user1/new/", &[0x77; 32])
+            .unwrap();
+        let reloaded = Grant::parse(&shared.serialize().unwrap()).unwrap();
+        assert_eq!(
+            shared.enc_access().store_entries.len(),
+            reloaded.enc_access().store_entries.len()
+        );
+        for entry in &shared.enc_access().store_entries {
+            assert!(reloaded.enc_access().store_entries.contains(entry));
+        }
+        let narrower = shared
+            .restrict(
+                &Permission::read_only(),
+                &[SharePrefix {
+                    bucket: "app".into(),
+                    prefix: "user1/child/".into(),
+                }],
+            )
+            .unwrap();
+        let store = store_from_enc(narrower.enc_access()).unwrap();
+        assert_eq!(encrypt_path("app", path, &store).unwrap(), encrypted);
+        assert!(encrypt_path("app", "user1/new/object", &store).is_err());
     }
 
     #[test]
