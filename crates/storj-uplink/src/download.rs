@@ -307,12 +307,6 @@ const LAUNCH_MARGIN: usize = 1;
 /// for its full byte range, so this bounds egress to roughly `k + 1` pieces
 /// instead of all `n`.
 pub async fn download_pieces_long_tail(job: LongTailDownload) -> Result<Vec<(i32, Vec<u8>)>> {
-    if job.size < 0 || job.offset < 0 {
-        return Err(Error::protocol("piece download offset/size must be >= 0"));
-    }
-    if job.size == 0 {
-        return Ok(Vec::new());
-    }
     let LongTailDownload {
         assignments,
         piece_key,
@@ -325,70 +319,170 @@ pub async fn download_pieces_long_tail(job: LongTailDownload) -> Result<Vec<(i32
         dial_timeout,
         message_timeout,
     } = job;
-    let mut queue: std::collections::VecDeque<PieceAssignment> = assignments.into();
-    let mut set = JoinSet::new();
-    let spawn = |set: &mut JoinSet<_>, asg: PieceAssignment| {
-        let key = piece_key.clone();
-        let sat_cert = satellite_cert.clone();
-        let ident = identity.clone();
-        let pool = pool.clone();
-        set.spawn(async move {
-            download_one_piece(
-                asg,
-                key,
-                sat_cert,
-                ident,
-                pool,
-                (offset, size),
-                (dial_timeout, message_timeout),
-            )
-            .await
-        });
-    };
-    let want = rs.k.saturating_add(LAUNCH_MARGIN);
-    while set.len() < want {
-        let Some(asg) = queue.pop_front() else { break };
-        spawn(&mut set, asg);
-    }
+    collect_piece_downloads(assignments, rs.k, offset, size, |asg| {
+        download_one_piece(
+            asg,
+            piece_key.clone(),
+            satellite_cert.clone(),
+            identity.clone(),
+            pool.clone(),
+            (offset, size),
+            (dial_timeout, message_timeout),
+        )
+    })
+    .await
+}
 
+/// Stage at which a piece failed.
+#[derive(Debug, Clone, Copy)]
+pub enum DownloadStage {
+    Connection,
+    Validation,
+    Transfer,
+}
+
+/// A failed piece attempt. Contains no grants, keys, or signed orders.
+#[derive(Debug)]
+pub struct PieceDownloadFailure {
+    pub piece_num: i32,
+    pub node_id: String,
+    pub stage: DownloadStage,
+    pub error: Error,
+}
+
+/// All failures from one unsuccessful long-tail download.
+#[derive(Debug)]
+pub struct PieceDownloadError {
+    pub required: usize,
+    pub obtained: usize,
+    pub attempted: usize,
+    pub offset: i64,
+    pub size: i64,
+    pub failures: Vec<PieceDownloadFailure>,
+}
+
+impl PieceDownloadError {
+    /// Retrying is useful only if transient failures could supply the deficit.
+    pub fn is_retryable(&self) -> bool {
+        self.obtained
+            + self
+                .failures
+                .iter()
+                .filter(|f| f.error.is_retryable())
+                .count()
+            >= self.required
+    }
+}
+
+impl std::fmt::Display for PieceDownloadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "insufficient pieces: obtained {} of {} required, attempted {}; range {}+{}",
+            self.obtained, self.required, self.attempted, self.offset, self.size
+        )?;
+        // Display is lossy; inspect `failures` for every node and its typed cause.
+        let mut groups = std::collections::BTreeMap::<&str, Vec<&PieceDownloadFailure>>::new();
+        for failure in &self.failures {
+            let kind = match &failure.error {
+                Error::DownloadLimit { .. } | Error::InvalidDownloadRange { .. } => {
+                    "range validation"
+                }
+                Error::DialTimeout => "dial timeout",
+                error if error.is_retryable() => "transient transport",
+                _ => "permanent failure",
+            };
+            groups.entry(kind).or_default().push(failure);
+        }
+        for (kind, mut group) in groups {
+            group.sort_by_key(|failure| failure.piece_num);
+            let first = group[0];
+            write!(
+                f,
+                "; {kind}: {} (piece {}, node {}, {:?}: {})",
+                group.len(),
+                first.piece_num,
+                first.node_id,
+                first.stage,
+                first.error
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for PieceDownloadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.failures
+            .iter()
+            .find(|f| !f.error.is_retryable())
+            .or_else(|| self.failures.first())
+            .map(|failure| &failure.error as _)
+    }
+}
+
+async fn collect_piece_downloads<A, F, Fut>(
+    assignments: Vec<A>,
+    required: usize,
+    offset: i64,
+    size: i64,
+    download: F,
+) -> Result<Vec<(i32, Vec<u8>)>>
+where
+    F: Fn(A) -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<(i32, Vec<u8>), PieceDownloadFailure>>
+        + Send
+        + 'static,
+{
+    if offset < 0 || size < 0 || offset.checked_add(size).is_none() {
+        return Err(Error::InvalidDownloadRange {
+            offset,
+            size,
+            reason: "negative or overflowing range",
+        });
+    }
+    if size == 0 {
+        return Ok(Vec::new());
+    }
+    let mut queue: std::collections::VecDeque<A> = assignments.into();
+    let mut set = JoinSet::new();
+    let mut attempted = 0;
+    while set.len() < required.saturating_add(LAUNCH_MARGIN) {
+        let Some(asg) = queue.pop_front() else { break };
+        set.spawn(download(asg));
+        attempted += 1;
+    }
     let mut successes = Vec::new();
-    let mut last_err: Option<Error> = None;
+    let mut failures = Vec::new();
     while let Some(joined) = set.join_next().await {
         match joined {
             Ok(Ok(piece)) => {
                 successes.push(piece);
-                if successes.len() >= rs.k {
+                if successes.len() >= required {
                     set.abort_all();
                     while set.join_next().await.is_some() {}
-                    break;
+                    return Ok(successes);
                 }
             }
-            Ok(Err((_piece_num, err))) => {
-                last_err = Some(err);
-                // Promote the next unused piece to replace the failed one.
+            Ok(Err(failure)) => {
+                failures.push(failure);
                 if let Some(asg) = queue.pop_front() {
-                    spawn(&mut set, asg);
+                    set.spawn(download(asg));
+                    attempted += 1;
                 }
             }
-            Err(e) if e.is_cancelled() => {}
             Err(e) => return Err(Error::protocol(format!("piece download join: {e}"))),
         }
     }
-    let job = LongTailDownloadTail { rs };
-    if successes.len() < job.rs.k {
-        return Err(last_err.unwrap_or_else(|| {
-            Error::protocol(format!(
-                "need {} pieces to decode, have {}",
-                job.rs.k,
-                successes.len()
-            ))
-        }));
-    }
-    Ok(successes)
-}
-
-struct LongTailDownloadTail {
-    rs: Redundancy,
+    failures.sort_by_key(|failure| failure.piece_num);
+    Err(Error::PieceDownload(Box::new(PieceDownloadError {
+        required,
+        obtained: successes.len(),
+        attempted,
+        offset,
+        size,
+        failures,
+    })))
 }
 
 async fn download_one_piece(
@@ -399,15 +493,21 @@ async fn download_one_piece(
     pool: SnPool,
     range: (i64, i64),
     (dial_timeout, message_timeout): (Duration, Duration),
-) -> std::result::Result<(i32, Vec<u8>), (i32, Error)> {
+) -> std::result::Result<(i32, Vec<u8>), PieceDownloadFailure> {
     let (offset, size) = range;
     let node = asg.node_id;
+    let failure = |error: Error, stage| PieceDownloadFailure {
+        piece_num: asg.piece_num,
+        node_id: node.to_string(),
+        stage,
+        error,
+    };
     let pooled: Pooled<SnTransport> = pool
         .checkout(node, || async {
             dial_sn(&identity, node, &asg.address, dial_timeout, message_timeout).await
         })
         .await
-        .map_err(|e| (asg.piece_num, e))?;
+        .map_err(|e| failure(e, DownloadStage::Connection))?;
     struct RecycleOnDrop {
         pooled: Option<Pooled<SnTransport>>,
     }
@@ -427,7 +527,12 @@ async fn download_one_piece(
         .pooled
         .as_mut()
         .and_then(Pooled::get_mut)
-        .ok_or_else(|| (asg.piece_num, Error::protocol("pooled SN conn missing")))?;
+        .ok_or_else(|| {
+            failure(
+                Error::protocol("pooled SN conn missing"),
+                DownloadStage::Connection,
+            )
+        })?;
     match get_piece(
         transport,
         &satellite_cert,
@@ -439,7 +544,15 @@ async fn download_one_piece(
     .await
     {
         Ok(data) => Ok((asg.piece_num, data)),
-        Err(e) => Err((asg.piece_num, e)),
+        Err(e) => {
+            let stage = match e {
+                Error::InvalidDownloadRange { .. }
+                | Error::DownloadLimit { .. }
+                | Error::OrderLimitSignature => DownloadStage::Validation,
+                _ => DownloadStage::Transfer,
+            };
+            Err(failure(e, stage))
+        }
     }
 }
 
@@ -470,6 +583,139 @@ async fn get_piece(
 
 #[cfg(test)]
 mod tests {
+
+    fn failure(piece_num: i32, error: Error) -> PieceDownloadFailure {
+        PieceDownloadFailure {
+            piece_num,
+            node_id: format!("node-{piece_num}"),
+            stage: DownloadStage::Transfer,
+            error,
+        }
+    }
+
+    async fn scheduled(
+        jobs: Vec<(i32, u64, Option<Error>)>,
+        required: usize,
+    ) -> Result<Vec<(i32, Vec<u8>)>> {
+        collect_piece_downloads(
+            jobs,
+            required,
+            496384,
+            256,
+            |(piece, delay, error)| async move {
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+                match error {
+                    Some(e) => Err(failure(piece, e)),
+                    None => Ok((piece, vec![42])),
+                }
+            },
+        )
+        .await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failures_survive_both_completion_orders() {
+        let mut displays = Vec::new();
+        for (first, second) in [(1, 2), (2, 1)] {
+            let err = scheduled(
+                vec![
+                    (
+                        0,
+                        first,
+                        Some(Error::DownloadLimit {
+                            offset: 496384,
+                            size: 256,
+                            limit: 128,
+                        }),
+                    ),
+                    (1, second, Some(Error::DialTimeout)),
+                ],
+                2,
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                !err.is_retryable(),
+                "one retryable piece cannot supply two missing pieces"
+            );
+            let Error::PieceDownload(ref aggregate) = err else {
+                panic!("missing aggregate")
+            };
+            assert_eq!(aggregate.failures.len(), 2);
+            assert_eq!(aggregate.attempted, 2);
+            assert!(aggregate.to_string().contains("range validation: 1"));
+            assert!(aggregate.to_string().contains("dial timeout: 1"));
+            displays.push(aggregate.to_string());
+        }
+        assert_eq!(displays[0], displays[1]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retries_only_when_transient_pieces_can_supply_deficit() {
+        assert!(
+            scheduled(
+                vec![
+                    (0, 1, Some(Error::DialTimeout)),
+                    (1, 2, Some(Error::DialTimeout))
+                ],
+                2
+            )
+            .await
+            .unwrap_err()
+            .is_retryable()
+        );
+        assert!(
+            scheduled(
+                vec![
+                    (0, 1, None),
+                    (1, 2, Some(Error::DialTimeout)),
+                    (2, 3, Some(Error::protocol("bad piece")))
+                ],
+                2
+            )
+            .await
+            .unwrap_err()
+            .is_retryable()
+        );
+        let err = scheduled(vec![(0, 1, None)], 2).await.unwrap_err();
+        assert!(!err.is_retryable());
+        assert!(
+            err.to_string()
+                .contains("obtained 1 of 2 required, attempted 1")
+        );
+        assert!(!scheduled(Vec::new(), 2).await.unwrap_err().is_retryable());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fallback_succeeds_and_cancels_surplus_downloads() {
+        let now = tokio::time::Instant::now();
+        let pieces = scheduled(
+            vec![
+                (0, 1, Some(Error::protocol("bad node"))),
+                (1, 2, None),
+                (2, 60_000, None),
+                (3, 1, None),
+            ],
+            2,
+        )
+        .await
+        .unwrap();
+        assert_eq!(pieces.len(), 2);
+        assert!(now.elapsed() < Duration::from_secs(1));
+        assert!(pieces.iter().any(|(num, _)| *num == 3));
+    }
+
+    #[tokio::test]
+    async fn invalid_ranges_fail_before_spawning_downloads() {
+        for (offset, size) in [(-1, 1), (1, -1), (i64::MAX, 1)] {
+            let err = collect_piece_downloads(vec![()], 1, offset, size, |_| async {
+                panic!("invalid request must not start a node connection");
+            })
+            .await
+            .unwrap_err();
+            assert!(matches!(err, Error::InvalidDownloadRange { .. }));
+        }
+    }
     use super::*;
     use crate::pipeline::{
         encode_pieces, encrypt_inline, encrypt_remote, random_key, random_nonce,

@@ -704,7 +704,9 @@ pub(crate) fn map_enc(e: storj_encryption::Error) -> Error {
         | storj_encryption::ErrorKind::MissingDecryptionBase => ErrorKind::InvalidGrant,
         _ => ErrorKind::Protocol,
     };
-    Error::new(kind, e.to_string()).with_source(e)
+    Error::new(kind, e.to_string())
+        .with_retryable(false)
+        .with_source(e)
 }
 
 fn map_cipher(c: storj_access::CipherSuite) -> storj_encryption::CipherSuite {
@@ -761,10 +763,12 @@ pub(crate) fn encryption_from_params(
 }
 
 pub(crate) fn map_uplink(e: storj_uplink::Error) -> Error {
+    let retryable = e.is_retryable();
     match e {
         storj_uplink::Error::Encryption(enc) => map_enc(enc),
         other => Error::new(ErrorKind::Protocol, other.to_string()).with_source(other),
     }
+    .with_retryable(retryable)
 }
 
 async fn download_segments(
@@ -1367,6 +1371,89 @@ async fn join_aborted_flush(handle: tokio::task::JoinHandle<Result<FlushedSegmen
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn encryption_errors_remain_permanent_through_public_and_io_mapping() {
+        use storj_encryption::{Error as EncryptionError, ErrorKind as EncryptionKind};
+        for (kind, public_kind) in [
+            (EncryptionKind::InvalidConfig, ErrorKind::Protocol),
+            (EncryptionKind::Conflict, ErrorKind::Protocol),
+            (EncryptionKind::Protocol, ErrorKind::Protocol),
+            (
+                EncryptionKind::DecryptionFailed,
+                ErrorKind::DecryptionFailed,
+            ),
+            (
+                EncryptionKind::MissingEncryptionBase,
+                ErrorKind::InvalidGrant,
+            ),
+            (
+                EncryptionKind::MissingDecryptionBase,
+                ErrorKind::InvalidGrant,
+            ),
+        ] {
+            for err in [
+                map_enc(EncryptionError::new(kind, "encryption failure")),
+                map_uplink(storj_uplink::Error::Encryption(EncryptionError::new(
+                    kind,
+                    "encryption failure",
+                ))),
+            ] {
+                assert_eq!(err.kind(), public_kind);
+                assert!(!err.is_retryable());
+                let io: std::io::Error = err.into();
+                let restored = Error::from(io);
+                assert_eq!(restored.kind(), public_kind);
+                assert!(!restored.is_retryable());
+                let cause = std::error::Error::source(&restored)
+                    .unwrap()
+                    .downcast_ref::<EncryptionError>()
+                    .unwrap();
+                assert_eq!(cause.kind(), kind);
+            }
+        }
+    }
+
+    #[test]
+    fn download_retry_decision_and_causes_survive_public_and_io_mapping() {
+        use storj_uplink::{
+            Error as UplinkError,
+            download::{DownloadStage, PieceDownloadError, PieceDownloadFailure},
+        };
+        for (cause, retryable) in [
+            (
+                UplinkError::DownloadLimit {
+                    offset: 496384,
+                    size: 257,
+                    limit: 256,
+                },
+                false,
+            ),
+            (UplinkError::DialTimeout, true),
+        ] {
+            let err = map_uplink(UplinkError::PieceDownload(Box::new(PieceDownloadError {
+                required: 1,
+                obtained: 0,
+                attempted: 1,
+                offset: 496384,
+                size: 257,
+                failures: vec![PieceDownloadFailure {
+                    piece_num: 0,
+                    node_id: "node-0".into(),
+                    stage: DownloadStage::Transfer,
+                    error: cause,
+                }],
+            })));
+            assert_eq!(err.kind(), ErrorKind::Protocol);
+            assert_eq!(err.is_retryable(), retryable);
+            let message = err.to_string();
+            let io: std::io::Error = err.into();
+            let restored = Error::from(io);
+            assert_eq!(restored.is_retryable(), retryable);
+            assert_eq!(restored.to_string(), message);
+            assert!(std::error::Error::source(&restored).is_some());
+        }
+    }
     use super::*;
     use crate::error::ErrorKind;
     use tokio::io::sink;

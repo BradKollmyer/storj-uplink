@@ -238,16 +238,27 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Client<T> {
             return Err(Error::protocol("order limit action is not GET"));
         }
         if offset < 0 || size < 0 {
-            return Err(Error::protocol("download offset/size must be >= 0"));
+            return Err(Error::InvalidDownloadRange {
+                offset,
+                size,
+                reason: "offset/size must be >= 0",
+            });
         }
-        let end = offset
+        offset
             .checked_add(size)
-            .ok_or_else(|| Error::protocol("download offset+size overflows"))?;
-        if end > limit.limit {
-            return Err(Error::protocol(format!(
-                "download range {offset}+{size} exceeds order limit {}",
-                limit.limit
-            )));
+            .ok_or(Error::InvalidDownloadRange {
+                offset,
+                size,
+                reason: "offset+size overflows",
+            })?;
+        // The signed limit authorizes a byte count, not an absolute endpoint.
+        // The storage node separately checks the range against its piece size.
+        if size > limit.limit {
+            return Err(Error::DownloadLimit {
+                offset,
+                size,
+                limit: limit.limit,
+            });
         }
         if size == 0 {
             return Ok(Vec::new());
@@ -648,9 +659,32 @@ mod tests {
         stream_id: u64,
         satellite_cert: &[u8],
         store: &PieceStore,
-    ) -> Result<()> {
-        let mut limit = None;
+    ) -> Result<(), Error> {
+        let mut limit: Option<OrderLimit> = None;
         let mut chunk = None;
+        // Bytes the uplink has signed orders for so far (cumulative, like a
+        // real node: it never sends beyond this and waits for a larger order).
+        let mut allocated: i64 = 0;
+        let take_order = |req_order: Option<storj_proto::orders::Order>,
+                          limit: &Option<OrderLimit>,
+                          allocated: &mut i64|
+         -> Result<(), Error> {
+            if let Some(order) = req_order {
+                let l = limit
+                    .as_ref()
+                    .ok_or_else(|| Error::protocol("order before limit"))?;
+                let pk = PiecePublicKey::from_bytes(&l.uplink_public_key)?;
+                verify_order(&order, &pk)?;
+                if order.serial_number != l.serial_number {
+                    return Err(Error::protocol("order serial mismatch"));
+                }
+                if order.amount > l.limit {
+                    return Err(Error::protocol("order exceeds limit"));
+                }
+                *allocated = (*allocated).max(order.amount);
+            }
+            Ok(())
+        };
         loop {
             let pkt = conn.read_packet().await?;
             if pkt.stream_id != stream_id {
@@ -663,6 +697,7 @@ mod tests {
                         verify_order_limit(&l, satellite_cert)?;
                         limit = Some(l);
                     }
+                    take_order(req.order, &limit, &mut allocated)?;
                     if let Some(c) = req.chunk {
                         chunk = Some(c);
                     }
@@ -682,6 +717,12 @@ mod tests {
             .get(&limit.piece_id)
             .cloned()
             .ok_or_else(|| Error::protocol("piece not found"))?;
+        assert!(chunk.offset >= 0 && chunk.chunk_size >= 0);
+        assert!(
+            chunk.chunk_size <= limit.limit,
+            "requested bytes exceed allowance"
+        );
+        assert!(chunk.offset.checked_add(chunk.chunk_size).unwrap() <= data.len() as i64);
         let start = usize::try_from(chunk.offset).unwrap_or(0);
         let want = usize::try_from(chunk.chunk_size).unwrap_or(0);
         let slice = data.get(start..).unwrap_or(&[][..]);
@@ -689,27 +730,55 @@ mod tests {
         const CHUNK: usize = 16 * 1024;
         let mut off = start as i64;
         let mut message_id = 0u64;
-        for part in slice.chunks(CHUNK) {
-            message_id += 1;
-            let resp = PieceDownloadResponse {
-                chunk: Some(piece_download_response::Chunk {
-                    offset: off,
-                    data: part.to_vec(),
-                }),
-                hash: None,
-                limit: None,
-                restored_from_trash: false,
-            };
-            conn.write_packet(&Packet {
-                stream_id,
-                message_id,
-                kind: Kind::MESSAGE,
-                control: false,
-                data: resp.encode_to_vec(),
-            })
-            .await?;
-            off += part.len() as i64;
+        let mut sent = 0usize;
+        let limit_for_orders = Some(limit.clone());
+        loop {
+            while sent < slice.len() && (sent as i64) < allocated {
+                let room = usize::try_from(allocated - sent as i64).unwrap_or(usize::MAX);
+                let n = CHUNK.min(slice.len() - sent).min(room);
+                let part = &slice[sent..sent + n];
+                message_id += 1;
+                let resp = PieceDownloadResponse {
+                    chunk: Some(piece_download_response::Chunk {
+                        offset: off,
+                        data: part.to_vec(),
+                    }),
+                    hash: None,
+                    limit: None,
+                    restored_from_trash: false,
+                };
+                conn.write_packet(&Packet {
+                    stream_id,
+                    message_id,
+                    kind: Kind::MESSAGE,
+                    control: false,
+                    data: resp.encode_to_vec(),
+                })
+                .await?;
+                off += part.len() as i64;
+                sent += n;
+            }
+            if sent >= slice.len() {
+                break;
+            }
+            let pkt = conn.read_packet().await?;
+            if pkt.stream_id != stream_id {
+                continue;
+            }
+            match pkt.kind {
+                Kind::MESSAGE => {
+                    let req = PieceDownloadRequest::decode(pkt.data.as_slice())?;
+                    take_order(req.order, &limit_for_orders, &mut allocated)?;
+                }
+                Kind::CLOSE_SEND | Kind::CLOSE => break,
+                _ => {}
+            }
         }
+        assert_eq!(
+            allocated,
+            slice.len() as i64,
+            "final order must equal transferred bytes"
+        );
         message_id += 1;
         conn.write_packet(&Packet {
             stream_id,
@@ -775,6 +844,114 @@ mod tests {
 
         drop(client);
         let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn ranged_download_uses_byte_allowance_not_endpoint() {
+        let satellite = Identity::generate().unwrap();
+        let sn = Identity::generate().unwrap();
+        let piece_key = PiecePrivateKey::generate();
+        let piece_id = vec![0x55; 32];
+        let payload: Vec<u8> = (0..600_000).map(|i| (i % 251) as u8).collect();
+        let store: PieceStore = Arc::new(Mutex::new(HashMap::from([(
+            piece_id.clone(),
+            payload.clone(),
+        )])));
+        let sat_cert = satellite.leaf_der().as_ref().to_vec();
+        let sn_cert = sn.leaf_der().as_ref().to_vec();
+        let (client_io, server_io) = tokio::io::duplex(256 * 1024);
+        let node = Identity::generate().unwrap();
+        let server = tokio::spawn(serve_mock(
+            Conn::new(server_io),
+            sn,
+            sat_cert.clone(),
+            store,
+        ));
+        let mut client = Client::new(Conn::new(client_io), sat_cert, sn_cert).with_config(Config {
+            initial_step: 64,
+            maximum_step: 1024,
+            maximum_chunk_size: 32,
+            ..Config::default()
+        });
+        for (offset, size, allowance) in [
+            (496384, 256, 256),
+            (516352, 256, 256),
+            (378880, 35584, 35584),
+            (12345, 4096, 8192),
+            (12345, 0, 0),
+        ] {
+            let get = signed_limit(
+                &satellite,
+                &node,
+                &piece_key,
+                &piece_id,
+                PieceAction::Get,
+                allowance,
+            );
+            let data = tokio::time::timeout(
+                Duration::from_secs(5),
+                client.download(&get, &piece_key, offset, size),
+            )
+            .await
+            .expect("ranged download must complete")
+            .unwrap();
+            assert_eq!(data, payload[offset as usize..(offset + size) as usize]);
+        }
+        drop(client);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalid_download_ranges_and_limits_send_no_rpc() {
+        use tokio::io::AsyncReadExt;
+        let satellite = Identity::generate().unwrap();
+        let node = Identity::generate().unwrap();
+        let key = PiecePrivateKey::generate();
+        for (offset, size, allowance) in [(10, 257, 256), (-1, 1, 1), (0, -1, 1), (i64::MAX, 1, 1)]
+        {
+            let (client_io, mut server_io) = tokio::io::duplex(1024);
+            let mut client = Client::new(
+                Conn::new(client_io),
+                satellite.leaf_der().as_ref().to_vec(),
+                node.leaf_der().as_ref().to_vec(),
+            );
+            let get = signed_limit(
+                &satellite,
+                &node,
+                &key,
+                &[0x55; 32],
+                PieceAction::Get,
+                allowance,
+            );
+            let err = client.download(&get, &key, offset, size).await.unwrap_err();
+            assert!(matches!(
+                err,
+                Error::InvalidDownloadRange { .. } | Error::DownloadLimit { .. }
+            ));
+            assert!(!err.is_retryable());
+            assert!(
+                tokio::time::timeout(Duration::from_millis(1), server_io.read(&mut [0u8; 1]))
+                    .await
+                    .is_err()
+            );
+        }
+        // Reject invalid action and tampering even for a zero-length read.
+        let (client_io, _server_io) = tokio::io::duplex(1024);
+        let mut client = Client::new(
+            Conn::new(client_io),
+            satellite.leaf_der().as_ref().to_vec(),
+            node.leaf_der().as_ref().to_vec(),
+        );
+        let mut limit = signed_limit(&satellite, &node, &key, &[0x55; 32], PieceAction::Put, 64);
+        assert!(matches!(
+            client.download(&limit, &key, 10, 0).await.unwrap_err(),
+            Error::Protocol(_)
+        ));
+        limit.limit += 1;
+        assert!(matches!(
+            client.download(&limit, &key, 10, 0).await.unwrap_err(),
+            Error::OrderLimitSignature
+        ));
     }
 
     #[tokio::test]

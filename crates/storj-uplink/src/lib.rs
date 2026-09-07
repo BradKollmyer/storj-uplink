@@ -58,6 +58,22 @@ pub enum Error {
     /// Protocol sequence or protobuf decode failure.
     #[error("protocol: {0}")]
     Protocol(String),
+    /// Invalid local range arithmetic; retrying cannot change the request.
+    #[error("invalid download range {offset}+{size}: {reason}")]
+    InvalidDownloadRange {
+        offset: i64,
+        size: i64,
+        reason: &'static str,
+    },
+    /// Requested byte count exceeds the signed transfer allowance.
+    #[error("download size {size} exceeds order byte limit {limit} (offset {offset})")]
+    DownloadLimit { offset: i64, size: i64, limit: i64 },
+    /// TCP/TLS connection establishment exceeded its deadline.
+    #[error("storage-node dial timed out")]
+    DialTimeout,
+    /// Too few pieces were downloaded; retains all node failures.
+    #[error(transparent)]
+    PieceDownload(#[from] Box<download::PieceDownloadError>),
     /// Underlying I/O.
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -69,7 +85,32 @@ pub enum Error {
     Encryption(#[from] storj_encryption::Error),
 }
 
+// gRPC / rpcstatus codes carried in DRPC error payloads.
+const RPC_UNKNOWN: u64 = 2;
+const RPC_DEADLINE_EXCEEDED: u64 = 4;
+const RPC_RESOURCE_EXHAUSTED: u64 = 8;
+const RPC_INTERNAL: u64 = 13;
+const RPC_UNAVAILABLE: u64 = 14;
+
 impl Error {
+    /// Whether repeating the operation can recover from this failure.
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            Self::DialTimeout | Self::Io(_) => true,
+            Self::Rpc(
+                storj_rpc::Error::Io(_) | storj_rpc::Error::Closed | storj_rpc::Error::Truncated,
+            ) => true,
+            Self::Rpc(storj_rpc::Error::Remote { code, message }) => {
+                matches!(
+                    *code,
+                    RPC_UNKNOWN | RPC_DEADLINE_EXCEEDED | RPC_INTERNAL | RPC_UNAVAILABLE
+                ) || (*code == RPC_RESOURCE_EXHAUSTED && message.contains("Too Many Requests"))
+            }
+            Self::PieceDownload(error) => error.is_retryable(),
+            _ => false,
+        }
+    }
+
     /// Protocol / sequence failure.
     pub fn protocol(msg: impl Into<String>) -> Self {
         Self::Protocol(msg.into())
@@ -84,3 +125,31 @@ impl From<prost::DecodeError> for Error {
 
 /// Result alias for this crate.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remote_retry_policy_distinguishes_throttling_from_exhausted_resources() {
+        for (code, message, retryable) in [
+            (RPC_UNKNOWN, "unknown", true),
+            (RPC_DEADLINE_EXCEEDED, "deadline", true),
+            (RPC_INTERNAL, "internal", true),
+            (RPC_UNAVAILABLE, "unavailable", true),
+            (RPC_RESOURCE_EXHAUSTED, "Too Many Requests", true),
+            (RPC_RESOURCE_EXHAUSTED, "bandwidth quota exceeded", false),
+            (RPC_RESOURCE_EXHAUSTED, "storage quota exceeded", false),
+            (RPC_RESOURCE_EXHAUSTED, "", false),
+            (3, "invalid argument", false),
+            (7, "permission denied", false),
+            (999, "unrecognized status", false),
+        ] {
+            let err = Error::Rpc(storj_rpc::Error::Remote {
+                code,
+                message: message.into(),
+            });
+            assert_eq!(err.is_retryable(), retryable, "{err}");
+        }
+    }
+}

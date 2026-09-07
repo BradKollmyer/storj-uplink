@@ -220,7 +220,7 @@ pub async fn dial_sn(
     };
     tokio::time::timeout(timeout, dial)
         .await
-        .map_err(|_| Error::protocol("storage-node dial timed out"))?
+        .map_err(|_| Error::DialTimeout)?
 }
 
 fn host_from_address(address: &str) -> &str {

@@ -15,6 +15,7 @@ pub struct Error {
 #[derive(Debug)]
 struct ErrorInner {
     kind: ErrorKind,
+    retryable: Option<bool>,
     message: String,
     bucket: Option<Bucket>,
     object: Option<Object>,
@@ -27,6 +28,7 @@ impl Error {
         Self {
             inner: Box::new(ErrorInner {
                 kind,
+                retryable: None,
                 message: message.into(),
                 bucket: None,
                 object: None,
@@ -59,6 +61,20 @@ impl Error {
     /// Stable kind for matching.
     pub fn kind(&self) -> ErrorKind {
         self.inner.kind
+    }
+
+    /// Whether retrying an idempotent operation may recover from this error.
+    /// Download failures account for how many pieces can still succeed.
+    pub fn is_retryable(&self) -> bool {
+        self.inner.retryable.unwrap_or(matches!(
+            self.kind(),
+            ErrorKind::TooManyRequests | ErrorKind::Protocol | ErrorKind::Io
+        ))
+    }
+
+    pub(crate) fn with_retryable(mut self, retryable: bool) -> Self {
+        self.inner.retryable = Some(retryable);
+        self
     }
 
     /// True when `kind` equals `kind`.
