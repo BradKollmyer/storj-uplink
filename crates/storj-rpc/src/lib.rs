@@ -10,7 +10,9 @@ pub mod conn;
 pub mod frame;
 pub mod identity;
 pub mod known_ids;
+pub mod telemetry;
 pub mod tls;
+pub mod transport;
 
 pub use conn::{Conn, Error, RpcStream, read_tls_mux_prefix, write_tls_mux_prefix};
 pub use frame::{

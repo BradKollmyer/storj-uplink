@@ -71,6 +71,45 @@ cargo run -p storj --example walkthrough -- "$STORJ_ACCESS"
 `commit()` is the only path that publishes an upload. Dropping `Upload` without
 `commit` aborts. `poll_shutdown` does not commit.
 
+## QUIC and telemetry
+
+Configure both satellite and storage-node connections with `Config::transport`:
+`Tcp` (the default), `Quic` (QUIC only), or `Auto`. Auto gives QUIC a 250 ms
+head start, then races TCP/TLS; a failed QUIC attempt starts TCP immediately.
+DNS, TLS authentication, and fallback share the configured dial deadline.
+Both transports pin the peer's Storj NodeID and present the client identity.
+QUIC carries DRPC directly with the `storj` ALPN, using Quinn and TLS 1.3.
+
+```rust
+use storj::{Config, Telemetry, TransportMode};
+
+let config = Config {
+    transport: TransportMode::Auto,
+    telemetry: Some(Telemetry::new(|event| {
+        // Forward to your metrics/logging channel without blocking.
+        println!("{event:?}");
+    })),
+    ..Default::default()
+};
+// Project::open_with_config(&access, config).await?;
+```
+
+Telemetry is disabled by default. The callback receives connection-attempt
+events (transport, elapsed time, outcome) and one terminal event per upload,
+download, or multipart part. Transfers report plaintext bytes accepted from
+the writer or delivered to the reader, elapsed time from operation start,
+time to the first such byte, outcome, and configured transport mode. Upload
+success means commit succeeded; download success is reported on close/drop
+after the requested range was consumed. The copy helpers also report source
+read and destination write/flush failures. Explicit aborts and unfinished drops are cancellations.
+Initialization and transfer failures report errors. No bucket names, object
+keys, credentials, payloads, or error strings are included.
+
+Callbacks run synchronously and may run concurrently; keep them fast and
+nonblocking. With panic unwinding, callback panics are caught. There is no
+automatic network exporter or background delivery queue. Existing `Config`
+struct literals should use `..Default::default()` for the new fields.
+
 ## Comparison with `uplink` 0.11.0 (FFI)
 
 | `uplink` 0.11.0 | `storj` 1.0.0 |
@@ -101,6 +140,7 @@ builds must set the same `rustflags` (x86_64 autodetects AES-NI).
 cargo test --workspace              # contract + mock satellite (no Go / live network)
 go run -C scripts .                 # Argon2 / path-HMAC / grant goldens
 STORJ_INTEROP=1 cargo test -p storj --test interop -- --ignored --skip writer_reader_size_matrix
+cargo test -p storj --test quic_go_interop -- --ignored # local Go QUIC listener; no grant needed
 ```
 
 Object-matrix interop and `storj-sim` need a live grant (`STORJ_INTEROP_ACCESS` /

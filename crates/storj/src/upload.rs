@@ -9,6 +9,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use crate::error::{Error, ErrorKind, Result};
 use crate::project::ProjectInner;
 use crate::types::{CustomMetadata, Object, Part};
+use crate::{Outcome, telemetry::Transfer};
 
 /// In-progress object upload. Implements `AsyncWrite`. Must `commit()` to publish.
 pub struct Upload {
@@ -17,6 +18,7 @@ pub struct Upload {
 }
 
 pub(crate) struct UploadInner {
+    pub(crate) telemetry: Option<Transfer>,
     pub(crate) project: Arc<ProjectInner>,
     pub(crate) bucket: String,
     pub(crate) key: String,
@@ -53,6 +55,9 @@ impl UploadInner {
     }
 
     fn poison(&mut self, e: Error) -> Error {
+        if let Some(t) = &mut self.telemetry {
+            t.finish(Outcome::Error);
+        }
         if self.failed.is_none() {
             self.failed = Some((e.kind(), e.to_string()));
         }
@@ -114,6 +119,9 @@ impl UploadInner {
             }
             let n = buf.len().min(room);
             self.plaintext.extend_from_slice(&buf[..n]);
+            if let Some(t) = &mut self.telemetry {
+                t.add_bytes(n);
+            }
             return Poll::Ready(Ok(n));
         }
     }
@@ -128,6 +136,17 @@ impl UploadInner {
 }
 
 impl Upload {
+    pub(crate) fn record_error(&self) {
+        if let Some(inner) = self.lock_inner().as_mut()
+            && let Some(t) = &mut inner.telemetry
+        {
+            t.finish(Outcome::Error);
+        }
+    }
+    pub(crate) fn with_telemetry(self, telemetry: Transfer) -> Self {
+        self.lock_inner().as_mut().expect("new upload").telemetry = Some(telemetry);
+        self
+    }
     pub(crate) fn new(info: Object, inner: UploadInner) -> Self {
         Self {
             info,
@@ -155,24 +174,42 @@ impl Upload {
     /// Flush remaining stripes, shut down piece RPCs, then `CommitObject`.
     /// `poll_shutdown` does **not** commit.
     pub async fn commit(self) -> Result<Object> {
-        let inner = self.lock_inner().take().ok_or_else(|| {
+        let mut inner = self.lock_inner().take().ok_or_else(|| {
             Error::new(
                 ErrorKind::UploadDone,
                 "upload done: already committed or aborted",
             )
         })?;
-        crate::project::commit_upload(inner).await
+        let mut telemetry = inner.telemetry.take();
+        let result = crate::project::commit_upload(inner).await;
+        if let Some(t) = &mut telemetry {
+            t.finish(if result.is_ok() {
+                Outcome::Success
+            } else {
+                Outcome::Error
+            });
+        }
+        result
     }
 
     /// Abort an uncommitted upload.
     pub async fn abort(self) -> Result<()> {
-        let inner = self.lock_inner().take().ok_or_else(|| {
+        let mut inner = self.lock_inner().take().ok_or_else(|| {
             Error::new(
                 ErrorKind::UploadDone,
                 "upload done: already committed or aborted",
             )
         })?;
-        crate::project::abort_upload(inner).await
+        let mut telemetry = inner.telemetry.take();
+        let result = crate::project::abort_upload(inner).await;
+        if let Some(t) = &mut telemetry {
+            t.finish(if result.is_ok() {
+                Outcome::Cancelled
+            } else {
+                Outcome::Error
+            });
+        }
+        result
     }
 
     /// Object info populated at `upload_object` return.
@@ -186,6 +223,7 @@ impl Drop for Upload {
         let Some(mut inner) = self.lock_inner().take() else {
             return;
         };
+        drop(inner.telemetry.take());
         if let Some(handle) = inner.pending_flush.take() {
             handle.abort();
         }
@@ -233,6 +271,8 @@ impl AsyncWrite for Upload {
 /// download cancels the background task and releases its storage-node
 /// connections.
 pub struct Download {
+    telemetry: Option<Transfer>,
+    complete: bool,
     info: Object,
     buf: Vec<u8>,
     pos: usize,
@@ -246,6 +286,8 @@ impl Download {
     /// An already-materialized (empty or inline) body.
     pub(crate) fn new(info: Object, buf: Vec<u8>) -> Self {
         Self {
+            telemetry: None,
+            complete: false,
             info,
             buf,
             pos: 0,
@@ -262,6 +304,8 @@ impl Download {
         total: i64,
     ) -> Self {
         Self {
+            telemetry: None,
+            complete: false,
             info,
             buf: Vec::new(),
             pos: 0,
@@ -274,6 +318,20 @@ impl Download {
     /// Object info available immediately.
     pub fn info(&self) -> &Object {
         &self.info
+    }
+
+    pub(crate) fn with_telemetry(mut self, telemetry: Transfer) -> Self {
+        if self.rx.is_none() && self.buf.is_empty() {
+            self.complete = true;
+        }
+        self.telemetry = Some(telemetry);
+        self
+    }
+
+    pub(crate) fn record_error(&mut self) {
+        if let Some(t) = &mut self.telemetry {
+            t.finish(Outcome::Error);
+        }
     }
 
     /// Stop fetching: cancels the background segment task and releases its
@@ -294,6 +352,13 @@ impl Download {
 impl Drop for Download {
     fn drop(&mut self) {
         self.cancel();
+        if let Some(t) = &mut self.telemetry {
+            t.finish(if self.complete {
+                Outcome::Success
+            } else {
+                Outcome::Cancelled
+            });
+        }
     }
 }
 
@@ -304,14 +369,24 @@ impl AsyncRead for Download {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
         loop {
             if this.pos < this.buf.len() {
                 let n = buf.remaining().min(this.buf.len() - this.pos);
                 buf.put_slice(&this.buf[this.pos..this.pos + n]);
                 this.pos += n;
+                if let Some(t) = &mut this.telemetry {
+                    t.add_bytes(n);
+                }
+                if this.pos == this.buf.len() && this.remaining == 0 {
+                    this.complete = true;
+                }
                 return Poll::Ready(Ok(()));
             }
             let Some(rx) = this.rx.as_mut() else {
+                this.complete = true;
                 return Poll::Ready(Ok(()));
             };
             match rx.poll_recv(cx) {
@@ -322,18 +397,25 @@ impl AsyncRead for Download {
                     this.pos = 0;
                 }
                 Poll::Ready(Some(Err(e))) => {
+                    if let Some(t) = &mut this.telemetry {
+                        t.finish(Outcome::Error);
+                    }
                     this.cancel();
                     return Poll::Ready(Err(e.into()));
                 }
                 Poll::Ready(None) => {
                     this.cancel();
                     if this.remaining != 0 {
+                        if let Some(t) = &mut this.telemetry {
+                            t.finish(Outcome::Error);
+                        }
                         return Poll::Ready(Err(Error::new(
                             ErrorKind::Protocol,
                             "download missing segment data",
                         )
                         .into()));
                     }
+                    this.complete = true;
                     return Poll::Ready(Ok(()));
                 }
             }
@@ -348,6 +430,13 @@ pub struct PartUpload {
 }
 
 impl PartUpload {
+    pub(crate) fn with_telemetry(self, telemetry: Transfer) -> Self {
+        self.lock_inner()
+            .as_mut()
+            .expect("new part upload")
+            .telemetry = Some(telemetry);
+        self
+    }
     pub(crate) fn new(info: Part, inner: UploadInner) -> Self {
         Self {
             info,
@@ -375,14 +464,32 @@ impl PartUpload {
 
     /// Commit this part. Does not publish the object; call `Project::commit_upload`.
     pub async fn commit(self) -> Result<()> {
-        let inner = self.lock_inner().take().ok_or_else(upload_done)?;
-        crate::project::commit_part(inner).await
+        let mut inner = self.lock_inner().take().ok_or_else(upload_done)?;
+        let mut telemetry = inner.telemetry.take();
+        let result = crate::project::commit_part(inner).await;
+        if let Some(t) = &mut telemetry {
+            t.finish(if result.is_ok() {
+                Outcome::Success
+            } else {
+                Outcome::Error
+            });
+        }
+        result
     }
 
     /// Abort this part. Already committed segments of the part are left in place.
     pub async fn abort(self) -> Result<()> {
-        let inner = self.lock_inner().take().ok_or_else(upload_done)?;
-        crate::project::abort_part(inner).await
+        let mut inner = self.lock_inner().take().ok_or_else(upload_done)?;
+        let mut telemetry = inner.telemetry.take();
+        let result = crate::project::abort_part(inner).await;
+        if let Some(t) = &mut telemetry {
+            t.finish(if result.is_ok() {
+                Outcome::Cancelled
+            } else {
+                Outcome::Error
+            });
+        }
+        result
     }
 
     /// Last information about the part.
@@ -396,6 +503,7 @@ impl Drop for PartUpload {
         let Some(mut inner) = self.lock_inner().take() else {
             return;
         };
+        drop(inner.telemetry.take());
         if let Some(handle) = inner.pending_flush.take() {
             handle.abort();
         }

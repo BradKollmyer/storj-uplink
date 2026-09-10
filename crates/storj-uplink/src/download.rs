@@ -16,7 +16,7 @@ use crate::orders::PiecePrivateKey;
 use crate::piecestore::{Client, Config as PieceConfig};
 use crate::pipeline::Redundancy;
 use crate::pool::Pooled;
-use crate::segment::{PieceAssignment, SnPool, SnTransport, dial_sn};
+use crate::segment::{PieceAssignment, SnPool, SnTransport};
 use crate::{Error, Result};
 
 /// Resolve Go `DownloadOptions` against `object_size` → `(plain_start, plain_len)`.
@@ -273,6 +273,8 @@ pub fn decrypt_remote(job: RemoteDecrypt<'_>) -> Result<Vec<u8>> {
 
 /// Inputs for [`download_pieces_long_tail`].
 pub struct LongTailDownload {
+    /// Transport selection and connection telemetry.
+    pub connection_options: storj_rpc::transport::ConnectionOptions,
     /// Addressed GET limits (index = piece number; empty slots omitted).
     pub assignments: Vec<PieceAssignment>,
     /// Piece private key from the download response.
@@ -308,6 +310,7 @@ const LAUNCH_MARGIN: usize = 1;
 /// instead of all `n`.
 pub async fn download_pieces_long_tail(job: LongTailDownload) -> Result<Vec<(i32, Vec<u8>)>> {
     let LongTailDownload {
+        connection_options,
         assignments,
         piece_key,
         satellite_cert,
@@ -328,6 +331,7 @@ pub async fn download_pieces_long_tail(job: LongTailDownload) -> Result<Vec<(i32
             pool.clone(),
             (offset, size),
             (dial_timeout, message_timeout),
+            connection_options.clone(),
         )
     })
     .await
@@ -485,6 +489,7 @@ where
     })))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn download_one_piece(
     asg: PieceAssignment,
     piece_key: PiecePrivateKey,
@@ -493,6 +498,7 @@ async fn download_one_piece(
     pool: SnPool,
     range: (i64, i64),
     (dial_timeout, message_timeout): (Duration, Duration),
+    connection_options: storj_rpc::transport::ConnectionOptions,
 ) -> std::result::Result<(i32, Vec<u8>), PieceDownloadFailure> {
     let (offset, size) = range;
     let node = asg.node_id;
@@ -504,7 +510,15 @@ async fn download_one_piece(
     };
     let pooled: Pooled<SnTransport> = pool
         .checkout(node, || async {
-            dial_sn(&identity, node, &asg.address, dial_timeout, message_timeout).await
+            crate::segment::dial_sn_with_options(
+                &identity,
+                node,
+                &asg.address,
+                dial_timeout,
+                message_timeout,
+                &connection_options,
+            )
+            .await
         })
         .await
         .map_err(|e| failure(e, DownloadStage::Connection))?;

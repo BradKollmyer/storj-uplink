@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 use storj::constants::{MAX_INLINE_SEGMENT_SIZE, MAX_SEGMENT_SIZE};
 
+mod listener;
 pub mod mock;
 pub mod mock_sn;
 pub use mock::MockSatellite;

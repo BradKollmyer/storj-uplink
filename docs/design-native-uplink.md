@@ -232,7 +232,7 @@ Crate root (2025): `Bucket`, `Error`, `Object`, `Project`, `Config`, `Encryption
 - FFI *out* (exposing a C ABI). This crate *consumes* the network; it does not replace `uplink-c`.
 - Source compatibility with crates.io `uplink` 0.11.0, and publishing under the `uplink` crate name.
 - Bucket-notification configuration RPCs. Object Lock **RPCs** and `Permission` lock bits **are** in v1.0 (K19).
-- QUIC transport (satellite/SN optionally speak QUIC; v1 is TCP + TLS, with Noise as a follow-on).
+- Noise transport (follow-on). TCP/TLS is the default; QUIC and automatic TCP fallback are available through `Config::transport`.
 - Partner User-Agent attribution beyond a config string.
 
 ---
@@ -1591,7 +1591,7 @@ Go uplink uses `storj/infectious` (Berlekamp-Welch over GF(2^8)). Options:
   - `storj_segment_long_tail_canceled`  
   - `storj_retries_total{op}`  
   - `storj_open_connections{peer_kind}`
-- **No built-in telemetry exporter** in v1 (Go uplink has optional eventkit). Apps subscribe via `tracing`.
+- **Opt-in telemetry callback** via `Config::telemetry`: connection attempts and upload/download/multipart-part totals, elapsed time, first byte, and success/error/cancellation. No identifiers or credentials. No built-in network exporter; applications forward events to their own metrics/logging systems.
 - **Alerting (for apps):** error rate on `CommitSegment`, `DecryptionFailed` (should be ~0; if not, grant mismatch).
 
 ---
@@ -1725,8 +1725,8 @@ None remaining as product decisions.
 
 **Watch (not product questions):**
 
-- **Noise timeline** — if a satellite drops TLS, v1 cannot connect. Monitor Storj release notes before 1.0. v1 is TCP+TLS; Noise is a follow-on.
-- **QUIC** — skip until the TLS path is solid.
+- **Noise timeline** — Noise remains a follow-on; current transports are TCP/TLS and QUIC/TLS 1.3.
+- **QUIC** — implemented with Quinn, Storj ALPN and NodeID pinning; `Auto` races TCP after a 250 ms head start within one dial deadline. TCP remains the default, matching Go's disabled-by-default QUIC rollout.
 
 **Resolved (not open):**
 
@@ -1971,7 +1971,7 @@ Incremental, each PR independently reviewable and mergeable. First PRs leave the
 - **Depends on:** PR 6 only (Access + HTTP). **Not** PR 21.
 - **Changes:** HTTPS Auth client; `register_gateway_access`; `share_url`. Feature `edge`. Can land anytime after grants work.
 
-Later: Noise, `object_store`, QUIC. Bucket notifications remain a non-goal.
+Later: Noise, `object_store`. QUIC and local telemetry callbacks are implemented. Bucket notifications remain a non-goal.
 
 ```
 PR1 → PR2 → PR3 → PR4 → PR6 ──────────────────────────────────────────┐

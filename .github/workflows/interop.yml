@@ -42,6 +42,8 @@ jobs:
         run: >
           cargo test -p storj --test interop -- --ignored
           --skip writer_reader_size_matrix
+      - name: Local Go QUIC listener interoperability
+        run: cargo test --locked -p storj --test quic_go_interop -- --ignored
 
   # Nightly / manual only. Does not fail default PR CI when sim is unavailable.
   # STORJ_SIM_ACCESS is a repository secret: it is available on schedule and

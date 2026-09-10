@@ -35,15 +35,13 @@ use storj_proto::orders::{OrderLimit, PieceAction};
 use storj_proto::pointerdb::RedundancyScheme;
 use storj_proto::rpc;
 use storj_proto::{decode_batch_request, encode_batch_response};
-use storj_rpc::tls::server_config;
-use storj_rpc::{Conn, Identity, Kind, Packet, marshal_error, read_tls_mux_prefix};
+use storj_rpc::{Conn, Identity, Kind, Packet, marshal_error};
 use storj_uplink::download::{resolve_range, segment_plain_range};
 use storj_uplink::orders::{PiecePrivateKey, sign_order_limit};
 
+use crate::listener::{Listener, Stream};
 use crate::mock_sn::MockStorageNode;
-use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
-use tokio_rustls::TlsAcceptor;
 
 const RPC_INVALID_ARGUMENT: u64 = 3;
 const RPC_NOT_FOUND: u64 = 5;
@@ -156,11 +154,14 @@ pub struct MockSatellite {
 impl MockSatellite {
     /// Bind `127.0.0.1:0`, serve DRPC over TLS with NodeID pinning.
     pub async fn start() -> Self {
+        Self::start_with_quic(false).await
+    }
+
+    /// Start satellite and storage nodes on QUIC-only listeners when enabled.
+    pub async fn start_with_quic(quic: bool) -> Self {
         // Signed identity: [leaf, CA, signer], as production satellites present.
         let identity = Identity::generate_signed().expect("mock satellite identity");
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind mock satellite");
+        let listener = Listener::bind(&identity, quic).await;
         let addr = listener.local_addr().expect("local addr");
         let node_url = format!("{}@{}", identity.node_id(), addr);
 
@@ -173,7 +174,9 @@ impl MockSatellite {
 
         let mut sns = Vec::new();
         for _ in 0..6 {
-            sns.push(Arc::new(MockStorageNode::start(sat_cert.clone()).await));
+            sns.push(Arc::new(
+                MockStorageNode::start_with_quic(sat_cert.clone(), quic).await,
+            ));
         }
 
         let state = Arc::new(Mutex::new(MockState {
@@ -200,23 +203,22 @@ impl MockSatellite {
             revoked: BTreeSet::new(),
         }));
 
-        let server_cfg = server_config(&identity).expect("mock server tls");
-        let acceptor = TlsAcceptor::from(Arc::new(server_cfg));
         let join_state = Arc::clone(&state);
         let join_sns = sns.clone();
         let join_ident = identity.clone();
         let join = tokio::spawn(async move {
             loop {
-                let (tcp, _) = match listener.accept().await {
+                let stream = match listener.accept().await {
                     Ok(c) => c,
                     Err(_) => break,
                 };
-                let acceptor = acceptor.clone();
                 let state = Arc::clone(&join_state);
                 let sns = join_sns.clone();
                 let ident = join_ident.clone();
                 tokio::spawn(async move {
-                    let _ = serve_conn(tcp, acceptor, state, sns, ident).await;
+                    if let Ok(stream) = stream.await {
+                        let _ = serve_conn(stream, state, sns, ident).await;
+                    }
                 });
             }
         });
@@ -418,14 +420,11 @@ impl Drop for MockSatellite {
 }
 
 async fn serve_conn(
-    mut tcp: TcpStream,
-    acceptor: TlsAcceptor,
+    mut tls: Stream,
     state: Arc<Mutex<MockState>>,
     sns: Vec<Arc<MockStorageNode>>,
     identity: Identity,
 ) -> Result<(), storj_rpc::Error> {
-    read_tls_mux_prefix(&mut tcp).await?;
-    let mut tls = acceptor.accept(tcp).await.map_err(storj_rpc::Error::Io)?;
     let malformed = std::mem::take(&mut state.lock().expect("mock state").malformed_connection);
     if malformed {
         use tokio::io::AsyncWriteExt;
@@ -445,7 +444,7 @@ async fn serve_conn(
 }
 
 async fn serve_one(
-    conn: &mut Conn<tokio_rustls::server::TlsStream<TcpStream>>,
+    conn: &mut Conn<Stream>,
     state: &Mutex<MockState>,
     sns: &[Arc<MockStorageNode>],
     identity: &Identity,

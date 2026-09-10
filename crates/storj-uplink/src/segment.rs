@@ -7,17 +7,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rustls::pki_types::ServerName;
 use storj_proto::metainfo::{
     AddressedOrderLimit, CohortRequirements, SegmentPieceUploadResult, cohort_requirements,
 };
 use storj_proto::orders::OrderLimit;
-use storj_rpc::tls::client_config;
-use storj_rpc::{Conn, Identity, NodeId, write_tls_mux_prefix};
-use tokio::net::TcpStream;
+use storj_rpc::transport::{ConnectionOptions, Transport, dial};
+use storj_rpc::{Conn, Identity, NodeId};
 use tokio::task::JoinSet;
-use tokio_rustls::TlsConnector;
-use tokio_rustls::client::TlsStream;
 
 use crate::orders::PiecePrivateKey;
 use crate::piecestore::{Client, Config as PieceConfig};
@@ -25,11 +21,11 @@ use crate::pipeline::Redundancy;
 use crate::pool::{ConnectionPool, Pooled};
 use crate::{Error, Result};
 
-/// TLS piecestore connection plus the peer CA (piece-hash verify).
+/// Authenticated piecestore connection plus the peer leaf (piece-hash verify).
 pub struct SnTransport {
     /// Established DRPC connection. `None` while a piece RPC owns it.
-    pub conn: Option<Conn<TlsStream<TcpStream>>>,
-    /// Storage-node CA DER from the handshake.
+    pub conn: Option<Conn<Transport>>,
+    /// Storage-node leaf certificate DER from the handshake.
     pub peer_cert: Vec<u8>,
 }
 
@@ -193,46 +189,47 @@ pub async fn dial_sn(
     timeout: Duration,
     message_timeout: Duration,
 ) -> Result<SnTransport> {
-    let dial = async {
-        let mut tcp = TcpStream::connect(address).await?;
-        let _ = tcp.set_nodelay(true);
-        write_tls_mux_prefix(&mut tcp).await?;
-        let tls_cfg = client_config(identity, node_id)?;
-        let connector = TlsConnector::from(Arc::new(tls_cfg));
-        let host = host_from_address(address);
-        let server_name = ServerName::try_from(host.to_string())
-            .map_err(|e| Error::protocol(format!("invalid storage-node host {host:?}: {e}")))?;
-        let tls = connector.connect(server_name, tcp).await?;
-        // The node signs piece hashes with its leaf key (Go
-        // `SigneeFromPeerIdentity` uses `Leaf.PublicKey`), so keep the leaf
-        // (chain[0]), not the CA.
-        let peer_cert = tls
-            .get_ref()
-            .1
-            .peer_certificates()
-            .and_then(|c| c.first())
-            .map(|c| c.as_ref().to_vec())
-            .unwrap_or_default();
-        Ok::<_, Error>(SnTransport {
-            conn: Some(Conn::new(tls).with_timeout(message_timeout)),
-            peer_cert,
-        })
-    };
-    tokio::time::timeout(timeout, dial)
-        .await
-        .map_err(|_| Error::DialTimeout)?
+    dial_sn_with_options(
+        identity,
+        node_id,
+        address,
+        timeout,
+        message_timeout,
+        &ConnectionOptions::default(),
+    )
+    .await
 }
 
-fn host_from_address(address: &str) -> &str {
-    if let Some(rest) = address.strip_prefix('[')
-        && let Some((host, _)) = rest.split_once(']')
-    {
-        return host;
-    }
-    match address.rsplit_once(':') {
-        Some((host, port)) if port.chars().all(|c| c.is_ascii_digit()) => host,
-        _ => address,
-    }
+/// Dial an authenticated storage-node stream using the configured transport.
+pub async fn dial_sn_with_options(
+    identity: &Identity,
+    node_id: NodeId,
+    address: &str,
+    timeout: Duration,
+    message_timeout: Duration,
+    options: &ConnectionOptions,
+) -> Result<SnTransport> {
+    let transport = dial(
+        identity,
+        node_id,
+        address,
+        options.mode,
+        timeout,
+        options.telemetry.as_ref(),
+    )
+    .await
+    .map_err(|e| {
+        if e.kind() == std::io::ErrorKind::TimedOut {
+            Error::DialTimeout
+        } else {
+            Error::Io(e)
+        }
+    })?;
+    let peer_cert = transport.peer_cert.clone();
+    Ok(SnTransport {
+        conn: Some(Conn::new(transport).with_timeout(message_timeout)),
+        peer_cert,
+    })
 }
 
 /// Successful piece upload used in `CommitSegment`.
@@ -240,6 +237,8 @@ pub type PieceResult = SegmentPieceUploadResult;
 
 /// Inputs for [`upload_pieces_long_tail`].
 pub struct LongTailUpload {
+    /// Transport selection and connection telemetry.
+    pub connection_options: ConnectionOptions,
     /// Addressed limits from BeginSegment (index = piece number).
     pub assignments: Vec<PieceAssignment>,
     /// Segment id (updated if RetryBeginSegmentPieces returns a new one).
@@ -391,6 +390,7 @@ async fn upload_round(
         let pool = job.pool.clone();
         let dial_timeout = job.dial_timeout;
         let message_timeout = job.message_timeout;
+        let connection_options = job.connection_options.clone();
         set.spawn(async move {
             upload_one_piece(
                 asg,
@@ -401,6 +401,7 @@ async fn upload_round(
                 ident,
                 pool,
                 (dial_timeout, message_timeout),
+                connection_options,
             )
             .await
         });
@@ -455,11 +456,20 @@ async fn upload_one_piece(
     identity: Identity,
     pool: SnPool,
     (dial_timeout, message_timeout): (Duration, Duration),
+    connection_options: ConnectionOptions,
 ) -> std::result::Result<PieceResult, (i32, Error)> {
     let node = asg.node_id;
     let pooled: Pooled<SnTransport> = pool
         .checkout(node, || async {
-            dial_sn(&identity, node, &asg.address, dial_timeout, message_timeout).await
+            dial_sn_with_options(
+                &identity,
+                node,
+                &asg.address,
+                dial_timeout,
+                message_timeout,
+                &connection_options,
+            )
+            .await
         })
         .await
         .map_err(|e| (asg.piece_num, e))?;

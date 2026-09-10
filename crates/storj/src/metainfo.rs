@@ -5,11 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use prost::Message;
-use rustls::pki_types::ServerName;
-use tokio::net::TcpStream;
 use tokio::sync::Mutex;
-use tokio_rustls::TlsConnector;
-use tokio_rustls::client::TlsStream;
 
 use storj_proto::metainfo::{
     self, BatchRequest, BatchRequestItem, BeginCopyObjectRequest, BeginDeleteObjectRequest,
@@ -25,8 +21,8 @@ use storj_proto::metainfo::{
     batch_request_item, batch_response_item,
 };
 use storj_proto::rpc;
-use storj_rpc::tls::client_config;
-use storj_rpc::{Conn, Identity, NodeUrl, parse_node_url, write_tls_mux_prefix};
+use storj_rpc::transport::{ConnectionOptions, Transport, dial};
+use storj_rpc::{Conn, Identity, NodeUrl, parse_node_url};
 
 use crate::bucket::{bucket_from_list_item, bucket_from_proto, proto_timestamp};
 use crate::error::{Error, ErrorKind, Result};
@@ -90,7 +86,7 @@ pub(crate) struct ListObjectsParams {
     pub arbitrary_prefix: bool,
 }
 
-type SatelliteStream = TlsStream<TcpStream>;
+type SatelliteStream = Transport;
 
 /// Upper bound on concurrent satellite connections per `Project`.
 const MAX_SATELLITE_CONNS: usize = 8;
@@ -108,6 +104,7 @@ pub(crate) struct MetainfoClient {
     identity: Identity,
     dial_timeout: Duration,
     message_timeout: Duration,
+    connection_options: ConnectionOptions,
     satellite_cert: Mutex<Vec<u8>>,
     /// Idle connections. `std` mutex: never held across an await.
     idle: std::sync::Mutex<Vec<Conn<SatelliteStream>>>,
@@ -131,6 +128,10 @@ impl MetainfoClient {
             identity,
             dial_timeout: config.dial_timeout_or_default(),
             message_timeout: config.message_timeout_or_default(),
+            connection_options: ConnectionOptions {
+                mode: config.transport,
+                telemetry: config.telemetry.clone(),
+            },
             satellite_cert: Mutex::new(Vec::new()),
             idle: std::sync::Mutex::new(Vec::new()),
             slots: Arc::new(tokio::sync::Semaphore::new(MAX_SATELLITE_CONNS)),
@@ -159,6 +160,7 @@ impl MetainfoClient {
             identity: Identity::generate().expect("ephemeral identity"),
             dial_timeout: Duration::from_secs(1),
             message_timeout: Duration::from_secs(1),
+            connection_options: ConnectionOptions::default(),
             satellite_cert: Mutex::new(Vec::new()),
             idle: std::sync::Mutex::new(Vec::new()),
             slots: Arc::new(tokio::sync::Semaphore::new(MAX_SATELLITE_CONNS)),
@@ -191,32 +193,17 @@ impl MetainfoClient {
     }
 
     async fn dial(&self) -> Result<Conn<SatelliteStream>> {
-        let dial = async {
-            let mut tcp = TcpStream::connect(&self.node.address).await?;
-            let _ = tcp.set_nodelay(true);
-            write_tls_mux_prefix(&mut tcp).await?;
-
-            let tls_cfg = client_config(&self.identity, self.node.id).map_err(map_identity_err)?;
-            let connector = TlsConnector::from(Arc::new(tls_cfg));
-            let server_name = server_name_from_address(&self.node.address)?;
-            let tls = connector.connect(server_name, tcp).await?;
-            // The satellite signs order limits with its leaf key (Go
-            // `SignerFromFullIdentity` uses `FullIdentity.Key`), so keep the
-            // leaf (chain[0]), not the CA.
-            if let Some(leaf) = tls
-                .get_ref()
-                .1
-                .peer_certificates()
-                .and_then(|c| c.first())
-                .map(|c| c.as_ref().to_vec())
-            {
-                *self.satellite_cert.lock().await = leaf;
-            }
-            Ok::<_, Error>(Conn::new(tls).with_timeout(self.message_timeout))
-        };
-        tokio::time::timeout(self.dial_timeout, dial)
-            .await
-            .map_err(|_| Error::new(ErrorKind::Protocol, "satellite dial timed out"))?
+        let transport = dial(
+            &self.identity,
+            self.node.id,
+            &self.node.address,
+            self.connection_options.mode,
+            self.dial_timeout,
+            self.connection_options.telemetry.as_ref(),
+        )
+        .await?;
+        *self.satellite_cert.lock().await = transport.peer_cert.clone();
+        Ok(Conn::new(transport).with_timeout(self.message_timeout))
     }
 
     /// Invoke `rpc`, retrying transport failures only when `idempotent`
@@ -1230,28 +1217,6 @@ pub(crate) fn object_from_proto(pb: Option<metainfo::Object>, plaintext_key: &st
     }
 }
 
-fn server_name_from_address(address: &str) -> Result<ServerName<'static>> {
-    let host = host_from_address(address);
-    ServerName::try_from(host.to_string()).map_err(|e| {
-        Error::new(
-            ErrorKind::Protocol,
-            format!("invalid satellite host {host:?}: {e}"),
-        )
-    })
-}
-
-fn host_from_address(address: &str) -> &str {
-    if let Some(rest) = address.strip_prefix('[')
-        && let Some((host, _)) = rest.split_once(']')
-    {
-        return host;
-    }
-    match address.rsplit_once(':') {
-        Some((host, port)) if port.chars().all(|c| c.is_ascii_digit()) => host,
-        _ => address,
-    }
-}
-
 /// Unary RPCs that are safe to re-send after a lost response.
 fn is_idempotent_rpc(rpc: &str) -> bool {
     matches!(
@@ -1483,13 +1448,6 @@ fn bucket_from_not_found(message: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn host_from_ipv4_and_name() {
-        assert_eq!(host_from_address("127.0.0.1:7777"), "127.0.0.1");
-        assert_eq!(host_from_address("us1.storj.io:7777"), "us1.storj.io");
-        assert_eq!(host_from_address("[::1]:7777"), "::1");
-    }
 
     #[test]
     fn remote_not_found_is_bucket() {

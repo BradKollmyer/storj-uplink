@@ -236,6 +236,10 @@ pub struct Part {
 /// Client configuration.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Config {
+    /// Transport for satellite and storage-node connections. Defaults to TCP/TLS.
+    pub transport: storj_rpc::transport::TransportMode,
+    /// Optional local observer for connection and transfer events.
+    pub telemetry: Option<storj_rpc::telemetry::Telemetry>,
     /// Partner User-Agent (RFC 7231 §5.5.3). Sent as `RequestHeader.user_agent`.
     pub user_agent: Option<String>,
     /// Dial timeout. `None` or zero → 20s (Go default). Rust `Duration` cannot

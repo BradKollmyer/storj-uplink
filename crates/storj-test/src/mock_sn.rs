@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::listener::{Listener, Stream};
 use prost::Message;
 use storj_proto::orders::OrderLimit;
 use storj_proto::piecestore::{
@@ -11,16 +12,13 @@ use storj_proto::piecestore::{
     piece_download_response,
 };
 use storj_proto::rpc::{PIECESTORE_DOWNLOAD, PIECESTORE_UPLOAD};
-use storj_rpc::tls::server_config;
-use storj_rpc::{Conn, Identity, Kind, Packet, read_tls_mux_prefix};
+use storj_rpc::{Conn, Identity, Kind, Packet};
 use storj_uplink::orders::{
     PieceHashAlgo, PieceHasher, PiecePublicKey, sign_piece_hash_node, verify_order,
     verify_order_limit, verify_piece_hash_uplink,
 };
-use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
-use tokio_rustls::TlsAcceptor;
 
 /// Loopback TLS storage node speaking piecestore Upload.
 pub struct MockStorageNode {
@@ -37,18 +35,19 @@ pub struct MockStorageNode {
 impl MockStorageNode {
     /// Bind `127.0.0.1:0` and serve piecestore over TLS.
     pub async fn start(satellite_cert: Vec<u8>) -> Self {
+        Self::start_with_quic(satellite_cert, false).await
+    }
+
+    /// Start a storage node on a QUIC-only listener when enabled.
+    pub async fn start_with_quic(satellite_cert: Vec<u8>, quic: bool) -> Self {
         let identity = Identity::generate_signed().expect("mock SN identity");
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind mock SN");
+        let listener = Listener::bind(&identity, quic).await;
         let addr = listener.local_addr().expect("sn local addr");
         let address = addr.to_string();
         let delay = Arc::new(Mutex::new(Duration::ZERO));
         let fail_next = Arc::new(Mutex::new(false));
         let fail_next_download = Arc::new(Mutex::new(false));
         let store = Arc::new(Mutex::new(HashMap::new()));
-        let server_cfg = server_config(&identity).expect("mock SN tls");
-        let acceptor = TlsAcceptor::from(Arc::new(server_cfg));
         let sn = identity.clone();
         let delay_c = Arc::clone(&delay);
         let fail_c = Arc::clone(&fail_next);
@@ -56,11 +55,10 @@ impl MockStorageNode {
         let store_c = Arc::clone(&store);
         let join = tokio::spawn(async move {
             loop {
-                let (tcp, _) = match listener.accept().await {
+                let stream = match listener.accept().await {
                     Ok(c) => c,
                     Err(_) => break,
                 };
-                let acceptor = acceptor.clone();
                 let sn = sn.clone();
                 let sat_cert = satellite_cert.clone();
                 let delay = Arc::clone(&delay_c);
@@ -68,9 +66,11 @@ impl MockStorageNode {
                 let fail_next_download = Arc::clone(&fail_dl_c);
                 let store = Arc::clone(&store_c);
                 tokio::spawn(async move {
+                    let Ok(stream) = stream.await else {
+                        return;
+                    };
                     let _ = serve_conn(
-                        tcp,
-                        acceptor,
+                        stream,
                         sn,
                         sat_cert,
                         delay,
@@ -127,8 +127,7 @@ impl Drop for MockStorageNode {
 
 #[allow(clippy::too_many_arguments)]
 async fn serve_conn(
-    mut tcp: TcpStream,
-    acceptor: TlsAcceptor,
+    tls: Stream,
     sn: Identity,
     satellite_cert: Vec<u8>,
     delay: Arc<Mutex<Duration>>,
@@ -136,8 +135,6 @@ async fn serve_conn(
     fail_next_download: Arc<Mutex<bool>>,
     store: Arc<Mutex<HashMap<Vec<u8>, Vec<u8>>>>,
 ) -> Result<(), storj_rpc::Error> {
-    read_tls_mux_prefix(&mut tcp).await?;
-    let tls = acceptor.accept(tcp).await.map_err(storj_rpc::Error::Io)?;
     let mut conn = Conn::new(tls);
     loop {
         let invoke = loop {
@@ -181,7 +178,7 @@ async fn serve_conn(
 }
 
 async fn serve_upload(
-    conn: &mut Conn<tokio_rustls::server::TlsStream<TcpStream>>,
+    conn: &mut Conn<Stream>,
     stream_id: u64,
     sn: &Identity,
     satellite_cert: &[u8],
@@ -309,7 +306,7 @@ async fn serve_upload(
 }
 
 async fn serve_download(
-    conn: &mut Conn<tokio_rustls::server::TlsStream<TcpStream>>,
+    conn: &mut Conn<Stream>,
     stream_id: u64,
     satellite_cert: &[u8],
     fail_next: &Mutex<bool>,

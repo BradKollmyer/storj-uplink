@@ -30,6 +30,7 @@ pub type UploadStream = Pin<Box<dyn Stream<Item = Result<UploadInfo>> + Send>>;
 pub type PartStream = Pin<Box<dyn Stream<Item = Result<crate::types::Part>> + Send>>;
 
 pub(crate) struct ProjectInner {
+    pub(crate) connection_options: storj_rpc::transport::ConnectionOptions,
     pub(crate) metainfo: MetainfoClient,
     pub(crate) store: storj_encryption::Store,
     pub(crate) identity: storj_rpc::Identity,
@@ -63,6 +64,10 @@ impl Project {
         let message_timeout = config.message_timeout_or_default();
         Ok(Self {
             inner: Arc::new(ProjectInner {
+                connection_options: storj_rpc::transport::ConnectionOptions {
+                    mode: config.transport,
+                    telemetry: config.telemetry.clone(),
+                },
                 metainfo,
                 store,
                 identity,
@@ -86,6 +91,25 @@ impl Project {
 
     /// Start an object upload.
     pub async fn upload_object(
+        &self,
+        bucket: &str,
+        key: &str,
+        opts: UploadOptions,
+    ) -> Result<Upload> {
+        let mut telemetry = crate::telemetry::Transfer::new(
+            crate::Operation::Upload,
+            &self.inner.connection_options,
+        );
+        match self.start_upload_object(bucket, key, opts).await {
+            Ok(upload) => Ok(upload.with_telemetry(telemetry)),
+            Err(e) => {
+                telemetry.finish(crate::Outcome::Error);
+                Err(e)
+            }
+        }
+    }
+
+    async fn start_upload_object(
         &self,
         bucket: &str,
         key: &str,
@@ -131,6 +155,7 @@ impl Project {
         Ok(Upload::new(
             info,
             UploadInner {
+                telemetry: None,
                 failed: None,
                 project: Arc::clone(&self.inner),
                 bucket: bucket.to_owned(),
@@ -154,6 +179,25 @@ impl Project {
 
     /// Start an object download.
     pub async fn download_object(
+        &self,
+        bucket: &str,
+        key: &str,
+        opts: DownloadOptions,
+    ) -> Result<Download> {
+        let mut telemetry = crate::telemetry::Transfer::new(
+            crate::Operation::Download,
+            &self.inner.connection_options,
+        );
+        match self.start_download_object(bucket, key, opts).await {
+            Ok(download) => Ok(download.with_telemetry(telemetry)),
+            Err(e) => {
+                telemetry.finish(crate::Outcome::Error);
+                Err(e)
+            }
+        }
+    }
+
+    async fn start_download_object(
         &self,
         bucket: &str,
         key: &str,
@@ -314,6 +358,29 @@ impl Project {
         upload_id: &str,
         part_number: u32,
     ) -> Result<PartUpload> {
+        let mut telemetry = crate::telemetry::Transfer::new(
+            crate::Operation::UploadPart,
+            &self.inner.connection_options,
+        );
+        match self
+            .start_upload_part(bucket, key, upload_id, part_number)
+            .await
+        {
+            Ok(upload) => Ok(upload.with_telemetry(telemetry)),
+            Err(e) => {
+                telemetry.finish(crate::Outcome::Error);
+                Err(e)
+            }
+        }
+    }
+
+    async fn start_upload_part(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        part_number: u32,
+    ) -> Result<PartUpload> {
         require_bucket_name(bucket)?;
         require_object_key(key)?;
         let stream_id = decode_upload_id(upload_id)?;
@@ -336,6 +403,7 @@ impl Project {
                 etag: Vec::new(),
             },
             UploadInner {
+                telemetry: None,
                 failed: None,
                 project: Arc::clone(&self.inner),
                 bucket: bucket.to_owned(),
@@ -565,6 +633,7 @@ impl Project {
         match tokio::io::copy(&mut reader, &mut upload).await {
             Ok(_) => upload.commit().await,
             Err(e) => {
+                upload.record_error();
                 let io_err = Error::from(e);
                 match upload.abort().await {
                     Ok(()) => Err(io_err),
@@ -587,6 +656,9 @@ impl Project {
         let mut writer = std::pin::pin!(writer);
         let copy = tokio::io::copy(&mut download, &mut writer).await;
         let flush = writer.flush().await;
+        if copy.is_err() || flush.is_err() {
+            download.record_error();
+        }
         let close = download.close().await;
         copy?;
         flush?;
@@ -958,6 +1030,7 @@ async fn decrypt_one_segment(
     }
     let piece_key = PiecePrivateKey::from_bytes(&seg.private_key).map_err(map_uplink)?;
     let shares = download_pieces_long_tail(LongTailDownload {
+        connection_options: project.connection_options.clone(),
         assignments,
         piece_key,
         satellite_cert: project.satellite_cert.clone(),
@@ -1201,6 +1274,7 @@ async fn commit_one_segment(job: SegmentCommit) -> Result<i64> {
     let key_c = key.clone();
     let (segment_id, results) = upload_pieces_long_tail(
         LongTailUpload {
+            connection_options: project.connection_options.clone(),
             assignments,
             segment_id: begin.segment_id.clone(),
             piece_key,
@@ -1463,6 +1537,7 @@ mod tests {
         Project {
             inner: Arc::new(ProjectInner {
                 metainfo: placeholder_metainfo(),
+                connection_options: storj_rpc::transport::ConnectionOptions::default(),
                 store: storj_encryption::Store::new(),
                 identity: storj_rpc::Identity::generate().expect("ephemeral identity"),
                 pool: storj_uplink::pool::ConnectionPool::new(

@@ -18,6 +18,8 @@ p256.workspace = true
 rcgen.workspace = true
 rustls.workspace = true
 tokio-rustls.workspace = true
+quinn.workspace = true
+futures-util.workspace = true
 x509-parser.workspace = true
 
 [dev-dependencies]
