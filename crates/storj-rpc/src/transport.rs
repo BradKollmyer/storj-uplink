@@ -53,7 +53,9 @@ pub struct ConnectionOptions {
 /// TCP performance controls. Unsupported platform/kernel options are ignored.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NetworkOptions {
-    /// Put the first replay-safe piece RPC bytes in the Noise IK handshake.
+    /// Put the first transport write in the Noise IK handshake. The current
+    /// piece RPC path flushes after DRPC INVOKE, so the order limit and first
+    /// piece request are sent after the handshake, not as early data.
     pub noise_early_data: bool,
     /// Race Fast Open against ordinary TCP only for nodes advertising support
     /// and capacity to suppress at least two identical handshakes.
@@ -452,6 +454,8 @@ type NoiseStart = Box<dyn FnOnce(Vec<u8>) -> NoiseFuture + Send + Sync>;
 
 // The first write becomes IK payload. Subsequent I/O completes authentication;
 // only replay-safe Upload/Download connections are wrapped this way.
+// Conn::open_stream flushes INVOKE before sending the first piece request, so
+// this does not cork INVOKE and the request together as Go's piece path does.
 struct DeferredNoise {
     start: Option<NoiseStart>,
     pending: Option<NoiseFuture>,
