@@ -8,7 +8,7 @@ use p256::ecdsa::{Signature, SigningKey, VerifyingKey};
 use p256::pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey};
 use rcgen::{
     BasicConstraints, CertificateParams, CustomExtension, DistinguishedName, DnType,
-    ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose, PKCS_ECDSA_P256_SHA256,
+    ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose, PKCS_ECDSA_P256_SHA256,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use sha2::{Digest, Sha256};
@@ -176,8 +176,9 @@ impl Identity {
             let signer_cert = signer_params
                 .self_signed(&signer_key)
                 .map_err(|e| IdentityError::Certificate(e.to_string()))?;
+            let signer = Issuer::new(signer_params, signer_key);
             let ca_cert = ca_params
-                .signed_by(&ca_key, &signer_cert, &signer_key)
+                .signed_by(&ca_key, &signer)
                 .map_err(|e| IdentityError::Certificate(e.to_string()))?;
             parents.push(signer_cert.der().clone());
             ca_cert
@@ -201,8 +202,9 @@ impl Identity {
             ExtendedKeyUsagePurpose::ClientAuth,
         ];
         leaf_params.distinguished_name = storj_dn();
+        let ca_issuer = Issuer::new(ca_params, ca_key);
         let leaf_cert = leaf_params
-            .signed_by(&leaf_key, &ca_cert, &ca_key)
+            .signed_by(&leaf_key, &ca_issuer)
             .map_err(|e| IdentityError::Certificate(e.to_string()))?;
 
         let ca_der: CertificateDer<'static> = ca_cert.der().clone();
