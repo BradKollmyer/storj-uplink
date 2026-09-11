@@ -20,7 +20,7 @@ env.
 | `project_objects.rs` | List/stat/delete/copy/move/revoke (mock) | yes |
 | `upload_download.rs` | Pipeline including 64MiB+1, versioned download, expiry (mock) | yes |
 | `multipart.rs` | Begin/Part/Commit, pending-stream listing (mock) | yes |
-| `object_lock.rs` | Retention / legal hold / copy-move lock (mock) | yes |
+| `object_lock.rs` | Retention / legal hold, copy defaults, protected-move rejection (mock) | yes |
 | `checksums.rs` | Object checksums, metadata update, copy/move (mock) | yes |
 | `metadata_validation.rs` | Custom metadata UTF-8 / NUL (mock) | yes |
 | `mock_faults.rs` | Stalled nodes, RetryBeginSegmentPieces (mock) | yes |

@@ -412,7 +412,7 @@ async fn bucket_object_lock_configuration() {
 }
 
 #[tokio::test]
-async fn copy_and_move_preserve_object_lock() {
+async fn copy_does_not_inherit_object_lock() {
     let mock = MockSatellite::start().await;
     let project = open_test_project(&mock).await;
     let bucket = unique_bucket();
@@ -456,10 +456,10 @@ async fn copy_and_move_preserve_object_lock() {
             .get_object_retention(&bucket, "copied", None)
             .await
             .expect("copied retention"),
-        Some(retention.clone())
+        None
     );
     assert!(
-        project
+        !project
             .get_object_legal_hold(&bucket, "copied", None)
             .await
             .expect("copied legal hold")
@@ -474,14 +474,183 @@ async fn copy_and_move_preserve_object_lock() {
             .get_object_retention(&bucket, "moved", None)
             .await
             .expect("moved retention"),
-        Some(retention)
+        None
     );
     assert!(
-        project
+        !project
             .get_object_legal_hold(&bucket, "moved", None)
             .await
             .expect("moved legal hold")
     );
+}
+
+#[tokio::test]
+async fn move_rejects_protected_source_without_removing_it() {
+    let mock = MockSatellite::start().await;
+    let project = open_test_project(&mock).await;
+    let bucket = unique_bucket();
+    project
+        .create_bucket_with(
+            &bucket,
+            CreateBucketOptions {
+                object_lock_enabled: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    for (key, retention, legal_hold) in [
+        (
+            "retention",
+            Some(Retention {
+                mode: RetentionMode::Compliance,
+                retain_until: SystemTime::now() + Duration::from_secs(86400),
+            }),
+            false,
+        ),
+        ("hold", None, true),
+    ] {
+        let mut upload = project
+            .upload_object(
+                &bucket,
+                key,
+                UploadOptions {
+                    retention: retention.clone(),
+                    legal_hold,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        upload.write_all(b"protected").await.unwrap();
+        upload.commit().await.unwrap();
+        let err = project
+            .move_object(&bucket, key, &bucket, "moved")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("object is protected"), "{err}");
+        project
+            .stat_object(&bucket, key)
+            .await
+            .expect("source remains");
+        assert_eq!(
+            project
+                .stat_object(&bucket, "moved")
+                .await
+                .unwrap_err()
+                .kind(),
+            ErrorKind::ObjectNotFound
+        );
+        assert_eq!(
+            project
+                .get_object_retention(&bucket, key, None)
+                .await
+                .unwrap(),
+            retention
+        );
+        assert_eq!(
+            project
+                .get_object_legal_hold(&bucket, key, None)
+                .await
+                .unwrap(),
+            legal_hold
+        );
+    }
+    // An expired retention does not prevent moving and is not inherited.
+    let mut upload = project
+        .upload_object(
+            &bucket,
+            "expired",
+            UploadOptions {
+                retention: Some(Retention {
+                    mode: RetentionMode::Compliance,
+                    retain_until: SystemTime::UNIX_EPOCH + Duration::from_secs(1),
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    upload.write_all(b"expired").await.unwrap();
+    upload.commit().await.unwrap();
+    project
+        .move_object(&bucket, "expired", &bucket, "moved")
+        .await
+        .unwrap();
+    assert_eq!(
+        project
+            .get_object_retention(&bucket, "moved", None)
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        project
+            .stat_object(&bucket, "expired")
+            .await
+            .unwrap_err()
+            .kind(),
+        ErrorKind::ObjectNotFound
+    );
+}
+
+#[tokio::test]
+async fn copy_and_move_use_destination_default_retention() {
+    let mock = MockSatellite::start().await;
+    let project = open_test_project(&mock).await;
+    let src = unique_bucket();
+    let dest = format!("{src}-destination");
+    project.create_bucket(&src).await.unwrap();
+    project
+        .create_bucket_with(
+            &dest,
+            CreateBucketOptions {
+                object_lock_enabled: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    project
+        .set_bucket_object_lock_configuration(
+            &dest,
+            BucketObjectLockConfiguration {
+                enabled: true,
+                default_retention: Some(DefaultRetention {
+                    mode: RetentionMode::Governance,
+                    days: 7,
+                    years: 0,
+                }),
+            },
+        )
+        .await
+        .unwrap();
+    put_object(&project, &src, "src").await;
+    let earliest = SystemTime::now() + Duration::from_secs(7 * 86400);
+    project
+        .copy_object(&src, "src", &dest, "copied")
+        .await
+        .unwrap();
+    project
+        .move_object(&src, "src", &dest, "moved")
+        .await
+        .unwrap();
+    let latest = SystemTime::now() + Duration::from_secs(7 * 86400);
+    for key in ["copied", "moved"] {
+        let retention = project
+            .get_object_retention(&dest, key, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(retention.mode, RetentionMode::Governance);
+        assert!(retention.retain_until >= earliest && retention.retain_until <= latest);
+        assert!(
+            !project
+                .get_object_legal_hold(&dest, key, None)
+                .await
+                .unwrap()
+        );
+    }
 }
 
 #[tokio::test]

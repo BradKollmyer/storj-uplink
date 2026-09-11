@@ -55,6 +55,7 @@ const RPC_UNIMPLEMENTED: u64 = 12;
 const RPC_UNAUTHENTICATED: u64 = 16;
 const RPC_OBJECT_LOCK_BUCKET_CONFIG_MISSING: u64 = 10003;
 const RPC_OBJECT_LOCK_OBJECT_RETENTION_MISSING: u64 = 10004;
+const RPC_OBJECT_LOCK_OBJECT_PROTECTED: u64 = 10005;
 const RPC_OBJECT_LOCK_INVALID_BUCKET_CONFIG: u64 = 10007;
 
 const PROJECT_SALT: &[u8] = b"0123456789abcdef";
@@ -73,6 +74,77 @@ struct BucketRec {
 struct ObjectLockRec {
     retention: Option<Retention>,
     legal_hold: bool,
+}
+
+/// Copy/move lock settings come from the request or destination bucket defaults,
+/// never from the source object (satellite FinishCopyObject/FinishMoveObject).
+fn relocated_lock(
+    bucket: &BucketRec,
+    retention: Option<Retention>,
+    legal_hold: bool,
+) -> Result<ObjectLockRec, (u64, String)> {
+    let mut retention = retention.filter(|r| r.mode != 0);
+    let config = bucket.lock_config.filter(|c| c.enabled);
+    if (retention.is_some() || legal_hold) && config.is_none() {
+        return Err((
+            RPC_OBJECT_LOCK_BUCKET_CONFIG_MISSING,
+            "object lock is not enabled for this bucket".into(),
+        ));
+    }
+    if retention.is_none()
+        && let Some(default) = config
+            .and_then(|c| c.default_retention)
+            .filter(|r| r.mode != 0)
+    {
+        retention = Some(default_lock_retention(default, SystemTime::now())?);
+    }
+    Ok(ObjectLockRec {
+        retention,
+        legal_hold,
+    })
+}
+
+fn default_lock_retention(
+    default: storj_proto::metainfo::DefaultRetention,
+    now: SystemTime,
+) -> Result<Retention, (u64, String)> {
+    use storj_proto::metainfo::default_retention::Duration;
+    let invalid = || {
+        (
+            RPC_OBJECT_LOCK_INVALID_BUCKET_CONFIG,
+            "invalid default retention duration".into(),
+        )
+    };
+    let now = time::OffsetDateTime::from(now);
+    let until = match default.duration {
+        Some(Duration::Days(days)) if days > 0 => {
+            now.checked_add(time::Duration::days(i64::from(days)))
+        }
+        Some(Duration::Years(years)) if years > 0 => {
+            // Go AddDate normalizes Feb 29 to March 1 in a non-leap year.
+            now.year()
+                .checked_add(years)
+                .and_then(|year| time::Date::from_calendar_date(year, now.month(), 1).ok())
+                .and_then(|date| date.checked_add(time::Duration::days(i64::from(now.day() - 1))))
+                .map(|date| now.replace_date(date))
+        }
+        _ => None,
+    }
+    .ok_or_else(invalid)?;
+    Ok(Retention {
+        mode: default.mode,
+        retain_until: Some(timestamp(until.into())),
+    })
+}
+
+fn lock_is_active(lock: &ObjectLockRec, now: SystemTime) -> bool {
+    lock.legal_hold
+        || lock.retention.as_ref().is_some_and(|r| {
+            r.mode != 0
+                && r.retain_until
+                    .and_then(|t| SystemTime::try_from(t).ok())
+                    .is_some_and(|until| until > now)
+        })
 }
 
 struct PendingObject {
@@ -1373,6 +1445,7 @@ fn finish_copy(
     if !st.buckets.contains_key(&dest) {
         return Err((RPC_NOT_FOUND, format!("bucket not found: {dest}")));
     }
+    let lock = relocated_lock(&st.buckets[&dest], req.retention, req.legal_hold)?;
     let src = st
         .committed
         .iter()
@@ -1387,6 +1460,7 @@ fn finish_copy(
         &req.new_encrypted_metadata_key_nonce,
         &req.new_segment_keys,
         true,
+        lock,
         &mut st,
     )?;
     Ok(FinishCopyObjectResponse {
@@ -1431,18 +1505,31 @@ fn finish_move(
     if !st.buckets.contains_key(&dest) {
         return Err((RPC_NOT_FOUND, format!("bucket not found: {dest}")));
     }
+    let lock = relocated_lock(&st.buckets[&dest], req.retention, req.legal_hold)?;
     let src_key = st
         .committed
         .iter()
         .find(|(_, rec)| rec.object.stream_id == req.stream_id)
         .map(|(k, _)| k.clone())
         .ok_or_else(|| (RPC_NOT_FOUND, "object not found".into()))?;
+    let now = SystemTime::now();
+    if st.buckets[&src_key.0]
+        .object_locks
+        .iter()
+        .any(|((key, _), lock)| key == &src_key.1 && lock_is_active(lock, now))
+    {
+        return Err((
+            RPC_OBJECT_LOCK_OBJECT_PROTECTED,
+            "object is protected by retention or legal hold".into(),
+        ));
+    }
     let src = st
         .committed
         .remove(&src_key)
         .ok_or_else(|| (RPC_NOT_FOUND, "object not found".into()))?;
     if let Some(bucket) = st.buckets.get_mut(&src_key.0) {
         bucket.objects = bucket.objects.saturating_sub(1);
+        bucket.object_locks.retain(|(key, _), _| key != &src_key.1);
     }
     apply_relocated(
         &src,
@@ -1452,6 +1539,7 @@ fn finish_move(
         &req.new_encrypted_metadata_key_nonce,
         &req.new_segment_keys,
         false,
+        lock,
         &mut st,
     )?;
     Ok(FinishMoveObjectResponse {})
@@ -1466,6 +1554,7 @@ fn apply_relocated(
     new_meta_nonce: &[u8],
     new_segment_keys: &[EncryptedKeyAndNonce],
     new_stream: bool,
+    lock: ObjectLockRec,
     st: &mut MockState,
 ) -> Result<ProtoObject, (u64, String)> {
     let dest_exists = st
@@ -1476,6 +1565,8 @@ fn apply_relocated(
         st.next_id += 1;
         object.stream_id = st.next_id.to_be_bytes().to_vec();
     }
+    object.retention = lock.retention;
+    object.legal_hold = Some(lock.legal_hold);
     object.bucket = dest_bucket.as_bytes().to_vec();
     object.encrypted_object_key = dest_enc.clone();
     if !new_meta_key.is_empty() {
@@ -1496,18 +1587,13 @@ fn apply_relocated(
     if !dest_exists && let Some(bucket) = st.buckets.get_mut(&dest_bucket) {
         bucket.objects += 1;
     }
-    // Satellite copy/move carries Object Lock from the source object.
-    let src_bucket = String::from_utf8_lossy(&src.object.bucket).into_owned();
-    let src_lock = st.buckets.get(&src_bucket).and_then(|b| {
-        b.object_locks
-            .get(&(src.object.encrypted_object_key.clone(), Vec::new()))
-            .cloned()
-    });
-    if let Some(lock) = src_lock
-        && let Some(dest) = st.buckets.get_mut(&dest_bucket)
-    {
-        dest.object_locks
-            .insert((dest_enc.clone(), Vec::new()), lock);
+    if let Some(dest) = st.buckets.get_mut(&dest_bucket) {
+        // Overwriting an unlocked destination must not leave stale lock records.
+        dest.object_locks.retain(|(key, _), _| key != &dest_enc);
+        if lock.retention.is_some() || lock.legal_hold {
+            dest.object_locks
+                .insert((dest_enc.clone(), Vec::new()), lock);
+        }
     }
     st.committed.insert(
         (dest_bucket, dest_enc),
@@ -2610,6 +2696,39 @@ mod tests {
     use super::*;
     use storj::{ObjectChecksum, ObjectChecksumAlgorithm, Project, UploadOptions};
     use tokio::io::AsyncWriteExt;
+
+    #[test]
+    fn destination_lock_prefers_request_and_uses_calendar_years() {
+        use storj_proto::metainfo::{DefaultRetention, default_retention::Duration};
+        let now = prost_types::Timestamp::date_time(2024, 2, 29, 12, 30, 0).unwrap();
+        let default = DefaultRetention {
+            mode: 1,
+            duration: Some(Duration::Years(1)),
+        };
+        let retention =
+            default_lock_retention(default, SystemTime::try_from(now).unwrap()).unwrap();
+        assert_eq!(
+            retention.retain_until,
+            Some(prost_types::Timestamp::date_time(2025, 3, 1, 12, 30, 0).unwrap())
+        );
+        let bucket = BucketRec {
+            created: SystemTime::now(),
+            objects: 0,
+            lock_config: Some(ObjectLockConfiguration {
+                enabled: true,
+                default_retention: Some(default),
+            }),
+            object_locks: BTreeMap::new(),
+            placement: Vec::new(),
+        };
+        let explicit = Retention {
+            mode: 2,
+            retain_until: Some(now),
+        };
+        let lock = relocated_lock(&bucket, Some(explicit), true).unwrap();
+        assert_eq!(lock.retention, Some(explicit));
+        assert!(lock.legal_hold);
+    }
 
     async fn checksummed_object() -> (MockSatellite, Project, ProtoObject) {
         let mock = MockSatellite::start().await;

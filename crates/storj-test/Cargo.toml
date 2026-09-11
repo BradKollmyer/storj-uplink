@@ -20,6 +20,7 @@ storj-encryption.workspace = true
 storj-proto.workspace = true
 storj-rpc.workspace = true
 storj-uplink.workspace = true
+time = "0.3"
 tokio.workspace = true
 tokio-rustls.workspace = true
 
