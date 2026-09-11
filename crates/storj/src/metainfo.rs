@@ -14,11 +14,11 @@ use storj_proto::metainfo::{
     DownloadObjectRequest, DownloadSegmentRequest, FinishCopyObjectRequest,
     FinishMoveObjectRequest, GetBucketObjectLockConfigurationRequest, GetBucketRequest,
     GetObjectLegalHoldRequest, GetObjectRequest, GetObjectRetentionRequest, ListBucketsRequest,
-    ListObjectsRequest, ListSegmentsRequest, MakeInlineSegmentRequest, ObjectListItemIncludes,
-    ProjectInfoRequest, ProjectInfoResponse, Range, RequestHeader, RetryBeginSegmentPiecesRequest,
-    RevokeApiKeyRequest, SegmentPosition, SetBucketObjectLockConfigurationRequest,
-    SetObjectLegalHoldRequest, SetObjectRetentionRequest, UpdateObjectMetadataRequest,
-    batch_request_item, batch_response_item,
+    ListObjectsRequest, ListPendingObjectStreamsRequest, ListSegmentsRequest,
+    MakeInlineSegmentRequest, ObjectListItemIncludes, ProjectInfoRequest, ProjectInfoResponse,
+    Range, RequestHeader, RetryBeginSegmentPiecesRequest, RevokeApiKeyRequest, SegmentPosition,
+    SetBucketObjectLockConfigurationRequest, SetObjectLegalHoldRequest, SetObjectRetentionRequest,
+    UpdateObjectMetadataRequest, batch_request_item, batch_response_item,
 };
 use storj_proto::rpc;
 use storj_rpc::transport::{ConnectionOptions, Transport, dial_with_options};
@@ -771,6 +771,37 @@ impl MetainfoClient {
         }
     }
 
+    pub(crate) async fn list_pending_object_streams(
+        &self,
+        bucket: &str,
+        encrypted_object_key: Vec<u8>,
+        stream_id_cursor: Vec<u8>,
+    ) -> Result<metainfo::ListPendingObjectStreamsResponse> {
+        let req = ListPendingObjectStreamsRequest {
+            header: Some(self.header()),
+            bucket: bucket.as_bytes().to_vec(),
+            encrypted_object_key,
+            stream_id_cursor,
+            limit: 0,
+        };
+        let items = self
+            .compressed_batch(
+                vec![BatchRequestItem {
+                    request: Some(batch_request_item::Request::ObjectListPendingStreams(req)),
+                }],
+                bucket,
+                "",
+            )
+            .await?;
+        match Self::expect_one(items, "ListPendingObjectStreams")? {
+            batch_response_item::Response::ObjectListPendingStreams(r) => Ok(r),
+            _ => Err(Error::new(
+                ErrorKind::Protocol,
+                "unexpected ListPendingObjectStreams response",
+            )),
+        }
+    }
+
     pub(crate) async fn begin_delete_object(
         &self,
         bucket: &str,
@@ -1248,6 +1279,7 @@ fn is_idempotent_batch_item(item: &BatchRequestItem) -> bool {
                 | R::BucketList(_)
                 | R::ObjectGet(_)
                 | R::ObjectList(_)
+                | R::ObjectListPendingStreams(_)
                 | R::ObjectDownload(_)
                 | R::SegmentDownload(_)
                 | R::SegmentList(_)

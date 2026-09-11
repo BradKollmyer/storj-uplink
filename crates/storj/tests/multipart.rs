@@ -274,15 +274,17 @@ async fn abort_multipart() {
 
 #[tokio::test]
 async fn list_uploads_prefix_slash_rule() {
-    let bad = ListUploadsOptions {
+    let exact = ListUploadsOptions {
         prefix: "p".into(),
         ..Default::default()
     };
-    assert_eq!(
-        bad.validate().unwrap_err().kind(),
-        ErrorKind::ObjectKeyInvalid
-    );
-    let _ = (UploadOptions::default(), CommitUploadOptions::default());
+    assert!(exact.validate().is_ok());
+    let slash = ListUploadsOptions {
+        prefix: "p/".into(),
+        ..Default::default()
+    };
+    assert!(slash.validate().is_ok());
+    assert!(ListUploadsOptions::default().validate().is_ok());
 
     let mock = MockSatellite::start().await;
     let project = open_project(&mock).await;
@@ -352,6 +354,86 @@ async fn list_uploads_prefix_slash_rule() {
         "empty stream_id must not be encoded as an upload id"
     );
     let _ = nested;
+}
+
+#[tokio::test]
+async fn list_uploads_exact_key_pending_streams() {
+    let mock = MockSatellite::start().await;
+    let project = open_project(&mock).await;
+    let bucket = unique("streams");
+    project.ensure_bucket(&bucket).await.unwrap();
+    let key = "same-key";
+
+    let first = project
+        .begin_upload(&bucket, key, Default::default())
+        .await
+        .unwrap();
+    let second = project
+        .begin_upload(&bucket, key, Default::default())
+        .await
+        .unwrap();
+    for info in [&first, &second] {
+        let mut part = project
+            .upload_part(&bucket, key, &info.upload_id, 1)
+            .await
+            .unwrap();
+        part.write_all(b"listed-part").await.unwrap();
+        part.commit().await.unwrap();
+    }
+
+    let listed: Vec<_> = project
+        .list_uploads(
+            &bucket,
+            ListUploadsOptions {
+                prefix: key.into(),
+                system: true,
+                ..Default::default()
+            },
+        )
+        .collect()
+        .await;
+    let listed: Vec<_> = listed.into_iter().collect::<Result<Vec<_>, _>>().unwrap();
+    assert_eq!(listed.len(), 2);
+    assert!(listed.iter().all(|u| u.key == key));
+    assert!(listed.iter().any(|u| u.upload_id == first.upload_id));
+    assert!(listed.iter().any(|u| u.upload_id == second.upload_id));
+
+    let under_slash: Vec<_> = project
+        .list_uploads(
+            &bucket,
+            ListUploadsOptions {
+                prefix: "same-key/".into(),
+                recursive: true,
+                system: true,
+                ..Default::default()
+            },
+        )
+        .collect()
+        .await;
+    let under_slash: Vec<_> = under_slash
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(
+        under_slash
+            .iter()
+            .all(|u| u.upload_id != first.upload_id && u.upload_id != second.upload_id)
+    );
+
+    let all: Vec<_> = project
+        .list_uploads(
+            &bucket,
+            ListUploadsOptions {
+                recursive: true,
+                system: true,
+                ..Default::default()
+            },
+        )
+        .collect()
+        .await;
+    let all: Vec<_> = all.into_iter().collect::<Result<Vec<_>, _>>().unwrap();
+    assert!(all.iter().any(|u| u.upload_id == first.upload_id));
+    assert!(all.iter().any(|u| u.upload_id == second.upload_id));
 }
 
 #[tokio::test]

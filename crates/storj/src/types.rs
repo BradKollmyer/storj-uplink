@@ -214,9 +214,12 @@ pub struct CommitUploadOptions {
 /// Options for listing uncommitted uploads.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ListUploadsOptions {
-    /// If non-empty, must end with `/`.
+    /// Empty lists the bucket. A nonempty value ending with `/` is a listing
+    /// prefix. A nonempty value without `/` lists pending streams for that
+    /// exact object key via `ListPendingObjectStreams`.
     pub prefix: String,
-    /// Relative to `prefix`.
+    /// Relative to `prefix`. For an exact-key listing, a valid multipart
+    /// upload id is used as the exclusive `stream_id` cursor.
     pub cursor: String,
     /// Do not collapse prefixes.
     pub recursive: bool,
@@ -227,9 +230,10 @@ pub struct ListUploadsOptions {
 }
 
 impl ListUploadsOptions {
-    /// Validate prefix slash rule.
+    /// Empty prefix, trailing-slash listing prefix, and exact object key are valid.
     pub fn validate(&self) -> Result<()> {
-        require_trailing_slash_if_nonempty("prefix", &self.prefix)
+        let _ = &self.prefix;
+        Ok(())
     }
 }
 

@@ -504,6 +504,10 @@ impl Project {
         }
         let project = self.clone();
         let bucket = bucket.to_owned();
+        // Go `ListUploads`: nonempty prefix without `/` is an exact object key.
+        if !opts.prefix.is_empty() && !opts.prefix.ends_with('/') {
+            return list_uploads_by_key(project, bucket, opts);
+        }
         // Same prefix-relative key handling as `list_objects` (Go `ListUploads`
         // reuses `listObjects` with `Status: UPLOADING`).
         let codec = match crate::objects::ListKeyCodec::new(&project, &bucket, &opts.prefix) {
@@ -698,6 +702,76 @@ struct ListUploadsState {
     cursor: Vec<u8>,
     pending: VecDeque<UploadInfo>,
     done: bool,
+}
+
+struct ListPendingStreamsState {
+    project: Project,
+    bucket: String,
+    key: String,
+    enc_key: Vec<u8>,
+    cursor: Vec<u8>,
+    pending: VecDeque<UploadInfo>,
+    done: bool,
+}
+
+fn list_uploads_by_key(project: Project, bucket: String, opts: ListUploadsOptions) -> UploadStream {
+    let enc_key = match storj_encryption::encrypt_path(&bucket, &opts.prefix, &project.inner.store)
+    {
+        Ok(k) => k,
+        Err(e) => return Box::pin(stream::once(async move { Err(map_enc(e)) })),
+    };
+    let cursor = decode_upload_id(&opts.cursor).unwrap_or_default();
+    Box::pin(stream::try_unfold(
+        ListPendingStreamsState {
+            project,
+            bucket,
+            key: opts.prefix,
+            enc_key,
+            cursor,
+            pending: VecDeque::new(),
+            done: false,
+        },
+        |mut st| async move {
+            loop {
+                if let Some(info) = st.pending.pop_front() {
+                    return Ok(Some((info, st)));
+                }
+                if st.done {
+                    return Ok(None);
+                }
+                let page = st
+                    .project
+                    .inner
+                    .metainfo
+                    .list_pending_object_streams(&st.bucket, st.enc_key.clone(), st.cursor.clone())
+                    .await?;
+                if page.items.is_empty() {
+                    st.done = true;
+                    continue;
+                }
+                st.cursor = page
+                    .items
+                    .last()
+                    .map(|i| i.stream_id.clone())
+                    .unwrap_or_default();
+                st.done = !page.more;
+                for item in page.items {
+                    if item.stream_id.is_empty() {
+                        continue;
+                    }
+                    st.pending.push_back(UploadInfo {
+                        key: st.key.clone(),
+                        upload_id: storj_uplink::multipart::encode_upload_id(&item.stream_id),
+                        system: SystemMetadata {
+                            created: item.created_at.map(|t| proto_timestamp(Some(t))),
+                            expires: item.expires_at.map(|t| proto_timestamp(Some(t))),
+                            content_length: item.plain_size,
+                        },
+                    });
+                }
+            }
+        },
+    ))
 }
 
 struct ListPartsState {

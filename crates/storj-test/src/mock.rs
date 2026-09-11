@@ -19,16 +19,16 @@ use storj_proto::metainfo::{
     GetBucketRequest, GetBucketResponse, GetObjectLegalHoldRequest, GetObjectLegalHoldResponse,
     GetObjectRequest, GetObjectResponse, GetObjectRetentionRequest, GetObjectRetentionResponse,
     ListBucketsRequest, ListBucketsResponse, ListDirection, ListObjectsRequest,
-    ListObjectsResponse, ListSegmentsRequest, ListSegmentsResponse, MakeInlineSegmentRequest,
-    MakeInlineSegmentResponse, Object as ProtoObject, ObjectListItem, ObjectLockConfiguration,
-    ProjectInfoRequest, ProjectInfoResponse, Range, RequestHeader, Retention,
-    RetryBeginSegmentPiecesRequest, RetryBeginSegmentPiecesResponse, RevokeApiKeyRequest,
-    RevokeApiKeyResponse, SegmentListItem, SegmentPosition,
-    SetBucketObjectLockConfigurationRequest, SetBucketObjectLockConfigurationResponse,
-    SetObjectLegalHoldRequest, SetObjectLegalHoldResponse, SetObjectRetentionRequest,
-    SetObjectRetentionResponse, UpdateObjectMetadataRequest, UpdateObjectMetadataResponse,
-    batch_request_item, batch_response_item, cohort_requirements, object::Status as ObjectStatus,
-    range,
+    ListObjectsResponse, ListPendingObjectStreamsRequest, ListPendingObjectStreamsResponse,
+    ListSegmentsRequest, ListSegmentsResponse, MakeInlineSegmentRequest, MakeInlineSegmentResponse,
+    Object as ProtoObject, ObjectListItem, ObjectLockConfiguration, ProjectInfoRequest,
+    ProjectInfoResponse, Range, RequestHeader, Retention, RetryBeginSegmentPiecesRequest,
+    RetryBeginSegmentPiecesResponse, RevokeApiKeyRequest, RevokeApiKeyResponse, SegmentListItem,
+    SegmentPosition, SetBucketObjectLockConfigurationRequest,
+    SetBucketObjectLockConfigurationResponse, SetObjectLegalHoldRequest,
+    SetObjectLegalHoldResponse, SetObjectRetentionRequest, SetObjectRetentionResponse,
+    UpdateObjectMetadataRequest, UpdateObjectMetadataResponse, batch_request_item,
+    batch_response_item, cohort_requirements, object::Status as ObjectStatus, range,
 };
 use storj_proto::node::NodeAddress;
 use storj_proto::orders::{OrderLimit, PieceAction};
@@ -809,6 +809,11 @@ fn handle_batch_item(
         }
         Some(Request::ObjectList(req)) => {
             batch_response_item::Response::ObjectList(list_objects(req, state)?)
+        }
+        Some(Request::ObjectListPendingStreams(req)) => {
+            batch_response_item::Response::ObjectListPendingStreams(list_pending_object_streams(
+                req, state,
+            )?)
         }
         Some(Request::ObjectBeginCopy(req)) => {
             batch_response_item::Response::ObjectBeginCopy(begin_copy(req, state)?)
@@ -1830,6 +1835,52 @@ fn list_uploading_objects(
         items: out,
         more: false,
     })
+}
+
+fn list_pending_object_streams(
+    req: ListPendingObjectStreamsRequest,
+    state: &Mutex<MockState>,
+) -> Result<ListPendingObjectStreamsResponse, (u64, String)> {
+    let st = state.lock().expect("mock state");
+    check_key(&req.header, &st)?;
+    check_action(&req.header, Action::List)?;
+    let name = utf8_name(&req.bucket)?;
+    if !st.buckets.contains_key(&name) {
+        return Err((RPC_NOT_FOUND, format!("bucket not found: {name}")));
+    }
+    let mut items: Vec<&PendingObject> = st
+        .pending
+        .values()
+        .filter(|p| p.bucket == name && p.enc_key == req.encrypted_object_key)
+        .filter(|p| {
+            req.stream_id_cursor.is_empty()
+                || p.stream_id.as_slice() > req.stream_id_cursor.as_slice()
+        })
+        .collect();
+    items.sort_by(|a, b| a.stream_id.cmp(&b.stream_id));
+    let limit = if req.limit <= 0 {
+        1000
+    } else {
+        req.limit as usize
+    };
+    let more = items.len() > limit;
+    let items = items
+        .into_iter()
+        .take(limit)
+        .map(|pending| {
+            let plain_size: i64 = pending.segments.iter().map(|s| s.plain_size).sum();
+            ObjectListItem {
+                encrypted_object_key: pending.enc_key.clone(),
+                status: ObjectStatus::Uploading as i32,
+                created_at: Some(timestamp(pending.created)),
+                expires_at: pending.expires.map(timestamp),
+                plain_size,
+                stream_id: pending.stream_id.clone(),
+                ..Default::default()
+            }
+        })
+        .collect();
+    Ok(ListPendingObjectStreamsResponse { items, more })
 }
 
 fn check_multipart_limits(segments: &[StoredSegment]) -> Result<(), (u64, String)> {
