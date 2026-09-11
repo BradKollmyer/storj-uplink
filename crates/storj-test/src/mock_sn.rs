@@ -27,9 +27,9 @@ pub struct MockStorageNode {
     address: String,
     noise_info: Option<storj_proto::noise::NoiseInfo>,
     delay: Arc<Mutex<Duration>>,
+    download_delay: Arc<Mutex<Duration>>,
     fail_next: Arc<Mutex<bool>>,
     fail_next_download: Arc<Mutex<bool>>,
-    #[allow(dead_code)]
     store: Arc<Mutex<HashMap<Vec<u8>, Vec<u8>>>>,
     join: JoinHandle<()>,
 }
@@ -61,11 +61,13 @@ impl MockStorageNode {
         let peer_log = listener.peer_log();
         let address = addr.to_string();
         let delay = Arc::new(Mutex::new(Duration::ZERO));
+        let download_delay = Arc::new(Mutex::new(Duration::ZERO));
         let fail_next = Arc::new(Mutex::new(false));
         let fail_next_download = Arc::new(Mutex::new(false));
         let store = Arc::new(Mutex::new(HashMap::new()));
         let sn = identity.clone();
         let delay_c = Arc::clone(&delay);
+        let download_delay_c = Arc::clone(&download_delay);
         let fail_c = Arc::clone(&fail_next);
         let fail_dl_c = Arc::clone(&fail_next_download);
         let store_c = Arc::clone(&store);
@@ -78,6 +80,7 @@ impl MockStorageNode {
                 let sn = sn.clone();
                 let sat_cert = satellite_cert.clone();
                 let delay = Arc::clone(&delay_c);
+                let download_delay = Arc::clone(&download_delay_c);
                 let fail_next = Arc::clone(&fail_c);
                 let fail_next_download = Arc::clone(&fail_dl_c);
                 let store = Arc::clone(&store_c);
@@ -90,6 +93,7 @@ impl MockStorageNode {
                         sn,
                         sat_cert,
                         delay,
+                        download_delay,
                         fail_next,
                         fail_next_download,
                         store,
@@ -104,6 +108,7 @@ impl MockStorageNode {
             address,
             noise_info,
             delay,
+            download_delay,
             fail_next,
             fail_next_download,
             store,
@@ -135,6 +140,11 @@ impl MockStorageNode {
         *self.delay.lock().await = d;
     }
 
+    /// Sleep this long before serving Download (malformed-piece tests).
+    pub async fn set_download_delay(&self, d: Duration) {
+        *self.download_delay.lock().await = d;
+    }
+
     /// Next Upload closes without a piece-hash response.
     pub async fn fail_next_upload(&self) {
         *self.fail_next.lock().await = true;
@@ -143,6 +153,16 @@ impl MockStorageNode {
     /// Next Download closes without piece data.
     pub async fn fail_next_download(&self) {
         *self.fail_next_download.lock().await = true;
+    }
+
+    /// Flip every stored piece so RS+AEAD of this node's share fails.
+    pub async fn xor_stored_pieces(&self, mask: u8) {
+        let mut store = self.store.lock().await;
+        for data in store.values_mut() {
+            for b in data.iter_mut() {
+                *b ^= mask;
+            }
+        }
     }
 }
 
@@ -158,6 +178,7 @@ async fn serve_conn(
     sn: Identity,
     satellite_cert: Vec<u8>,
     delay: Arc<Mutex<Duration>>,
+    download_delay: Arc<Mutex<Duration>>,
     fail_next: Arc<Mutex<bool>>,
     fail_next_download: Arc<Mutex<bool>>,
     store: Arc<Mutex<HashMap<Vec<u8>, Vec<u8>>>>,
@@ -192,6 +213,7 @@ async fn serve_conn(
                     invoke.stream_id,
                     &satellite_cert,
                     &fail_next_download,
+                    &download_delay,
                     &store,
                 )
                 .await
@@ -341,6 +363,7 @@ async fn serve_download(
     stream_id: u64,
     satellite_cert: &[u8],
     fail_next: &Mutex<bool>,
+    download_delay: &Mutex<Duration>,
     store: &Mutex<HashMap<Vec<u8>, Vec<u8>>>,
 ) -> Result<(), storj_uplink::Error> {
     {
@@ -351,6 +374,10 @@ async fn serve_download(
                 "injected piece download failure",
             ));
         }
+    }
+    let pause = *download_delay.lock().await;
+    if !pause.is_zero() {
+        tokio::time::sleep(pause).await;
     }
     let mut limit: Option<OrderLimit> = None;
     let mut chunk = None;

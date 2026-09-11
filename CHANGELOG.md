@@ -54,6 +54,9 @@ published so the facade can resolve on crates.io; they are not a stable API.
 
 ### Fixed
 
+- Download a remote segment successfully when one of the initially fetched
+  pieces is malformed: extra pieces are requested and `k`-subsets retried
+  until AEAD decrypt succeeds (`storj/uplink#176`).
 - Preserve object checksums when replacing custom metadata by re-encrypting
   them under the new metadata key and including them in the update request.
 - Reject invalid nonempty exact-key pending-upload cursors instead of silently

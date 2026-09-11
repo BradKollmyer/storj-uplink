@@ -1,5 +1,6 @@
 //! Segment download: CompressedBatch limits, RS from k pieces, decrypt, ranges.
 
+use std::collections::{HashSet, VecDeque};
 use std::time::Duration;
 
 use storj_ec::ReedSolomon;
@@ -141,6 +142,16 @@ pub fn piece_byte_range(
 
 /// Reconstruct encrypted bytes from any `k` indexed piece buffers (same length).
 pub fn decode_encrypted(shares: &[(i32, Vec<u8>)], rs: &Redundancy) -> Result<Vec<u8>> {
+    let refs: Vec<(i32, &[u8])> = shares.iter().map(|(n, d)| (*n, d.as_slice())).collect();
+    decode_encrypted_slices(&refs, rs, 0, None)
+}
+
+fn decode_encrypted_slices(
+    shares: &[(i32, &[u8])],
+    rs: &Redundancy,
+    stripe0: usize,
+    n_stripes: Option<usize>,
+) -> Result<Vec<u8>> {
     if shares.len() < rs.k {
         return Err(Error::protocol(format!(
             "need {} pieces to decode, have {}",
@@ -161,21 +172,27 @@ pub fn decode_encrypted(shares: &[(i32, Vec<u8>)], rs: &Redundancy) -> Result<Ve
             "piece length is not a multiple of share size",
         ));
     }
-    let n_stripes = piece_len / share_size;
+    let total_stripes = piece_len / share_size;
+    if stripe0 > total_stripes {
+        return Err(Error::protocol("stripe offset past piece length"));
+    }
+    let n_stripes = n_stripes
+        .unwrap_or(total_stripes.saturating_sub(stripe0))
+        .min(total_stripes.saturating_sub(stripe0));
     let codec = ReedSolomon::new(rs.k, rs.n, share_size)?;
     // Invert the decode matrix once for this piece set (Go `NewRebuilder`),
     // then decode every stripe straight into the output buffer.
-    let mut by_index: Vec<Option<&Vec<u8>>> = vec![None; rs.n];
+    let mut by_index: Vec<Option<&[u8]>> = vec![None; rs.n];
     let mut available = Vec::with_capacity(shares.len());
     for (num, data) in shares {
         let idx = usize::try_from(*num).unwrap_or(usize::MAX);
         if idx < rs.n && by_index[idx].is_none() {
-            by_index[idx] = Some(data);
+            by_index[idx] = Some(*data);
             available.push(idx);
         }
     }
     let plan = codec.decode_plan(&available)?;
-    let inputs: Vec<&Vec<u8>> = plan
+    let inputs: Vec<&[u8]> = plan
         .indexes()
         .iter()
         .map(|&idx| by_index[idx].ok_or_else(|| Error::protocol("decode plan index missing")))
@@ -184,7 +201,7 @@ pub fn decode_encrypted(shares: &[(i32, Vec<u8>)], rs: &Redundancy) -> Result<Ve
     let mut out = vec![0u8; n_stripes.saturating_mul(stripe)];
     let mut slots: Vec<&[u8]> = Vec::with_capacity(rs.k);
     for s in 0..n_stripes {
-        let off = s * share_size;
+        let off = (stripe0 + s) * share_size;
         slots.clear();
         slots.extend(inputs.iter().map(|d| &d[off..off + share_size]));
         plan.decode_into(&slots, &mut out[s * stripe..(s + 1) * stripe])?;
@@ -271,6 +288,208 @@ pub fn decrypt_remote(job: RemoteDecrypt<'_>) -> Result<Vec<u8>> {
     Ok(decrypted[skip..skip + take].to_vec())
 }
 
+/// Ciphertext-independent inputs for [`decrypt_remote`] / [`reconstruct_remote`].
+pub struct DecryptParams<'a> {
+    /// Encrypted-stream offset of reconstructed `decoded[0]`.
+    pub decoded_offset: usize,
+    /// Encrypted size before stripe padding (`segment_size`).
+    pub encrypted_size: usize,
+    /// Content cipher.
+    pub cipher: CipherSuite,
+    /// Segment content key.
+    pub key: &'a Key,
+    /// Starting content nonce.
+    pub nonce: &'a [u8; NONCE_SIZE],
+    /// Encrypted block size (includes AEAD tag).
+    pub encrypted_block_size: usize,
+    /// Requested plaintext start.
+    pub plain_start: i64,
+    /// Requested plaintext length.
+    pub plain_len: i64,
+    /// Segment plaintext size (padding is not returned).
+    pub plain_size: i64,
+}
+
+impl<'a> DecryptParams<'a> {
+    fn as_remote(&'a self, decoded: &'a [u8]) -> RemoteDecrypt<'a> {
+        RemoteDecrypt {
+            decoded,
+            decoded_offset: self.decoded_offset,
+            encrypted_size: self.encrypted_size,
+            cipher: self.cipher,
+            key: self.key,
+            nonce: self.nonce,
+            encrypted_block_size: self.encrypted_block_size,
+            plain_start: self.plain_start,
+            plain_len: self.plain_len,
+            plain_size: self.plain_size,
+        }
+    }
+}
+
+/// Rebuild and decrypt a remote segment from `k` or more shares.
+///
+/// Reed-Solomon erasure decode of any `k` shares always "succeeds", even when
+/// one transferred piece is garbage; AES-GCM / secretbox then fails. Extra
+/// shares are tried as alternate `k`-subsets until a set authenticates
+/// (storj/uplink#176).
+pub fn reconstruct_remote(
+    shares: &[(i32, Vec<u8>)],
+    rs: &Redundancy,
+    params: &DecryptParams<'_>,
+) -> Result<Vec<u8>> {
+    if shares.len() < rs.k {
+        return Err(Error::protocol(format!(
+            "need {} pieces to decode, have {}",
+            rs.k,
+            shares.len()
+        )));
+    }
+    let probe_first = shares.len() > rs.k;
+    let mut last_err: Option<Error> = None;
+    for combo in k_subsets(shares.len(), rs.k) {
+        let subset: Vec<(i32, &[u8])> = combo
+            .iter()
+            .map(|&i| (shares[i].0, shares[i].1.as_slice()))
+            .collect();
+        if probe_first && !probe_share_set(&subset, rs, params) {
+            last_err = Some(content_auth_error());
+            continue;
+        }
+        match decode_encrypted_slices(&subset, rs, 0, None) {
+            Ok(decoded) => match decrypt_remote(params.as_remote(&decoded)) {
+                Ok(plain) => return Ok(plain),
+                Err(e) => last_err = Some(e),
+            },
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(content_auth_error))
+}
+
+fn content_auth_error() -> Error {
+    Error::Encryption(storj_encryption::Error::new(
+        storj_encryption::ErrorKind::DecryptionFailed,
+        "piece set failed content authentication",
+    ))
+}
+
+/// Whether `err` is an AEAD/content-authentication failure (retry with more pieces).
+#[must_use]
+pub fn is_content_auth_failure(err: &Error) -> bool {
+    matches!(
+        err,
+        Error::Encryption(e) if e.kind() == storj_encryption::ErrorKind::DecryptionFailed
+    )
+}
+
+/// Authenticate the first encryption block of `subset` without decoding the
+/// whole segment. A matching AEAD tag means this `k`-set is the right one.
+fn probe_share_set(subset: &[(i32, &[u8])], rs: &Redundancy, params: &DecryptParams<'_>) -> bool {
+    if params.plain_len <= 0 || params.plain_size <= 0 {
+        return true;
+    }
+    let Ok(decrypter) = new_decrypter(
+        params.cipher,
+        params.key,
+        params.nonce,
+        params.encrypted_block_size,
+    ) else {
+        return false;
+    };
+    let enc_block = decrypter.in_block_size();
+    let plain_block = decrypter.out_block_size();
+    if enc_block == 0 || plain_block == 0 {
+        return false;
+    }
+    let (first_block, nblocks) =
+        calc_encompassing_blocks(params.plain_start, params.plain_len, plain_block);
+    if nblocks <= 0 {
+        return true;
+    }
+    let want_start = usize::try_from(first_block)
+        .unwrap_or(0)
+        .saturating_mul(enc_block);
+    if want_start < params.decoded_offset {
+        return false;
+    }
+    let local = want_start - params.decoded_offset;
+    let stripe = rs.stripe_size();
+    if stripe == 0 {
+        return false;
+    }
+    let stripe0 = local / stripe;
+    let within = local % stripe;
+    let n_stripes = within.saturating_add(enc_block).div_ceil(stripe).max(1);
+    let Ok(decoded) = decode_encrypted_slices(subset, rs, stripe0, Some(n_stripes)) else {
+        return false;
+    };
+    if decoded.len() < within.saturating_add(enc_block) {
+        return false;
+    }
+    transform_blocks(
+        decrypter.as_ref(),
+        &decoded[within..within + enc_block],
+        first_block,
+    )
+    .is_ok()
+}
+
+/// Combinations of `k` indexes from `0..n`, lexicographic.
+fn k_subsets(n: usize, k: usize) -> KSubsets {
+    KSubsets::new(n, k)
+}
+
+struct KSubsets {
+    n: usize,
+    k: usize,
+    cur: Vec<usize>,
+    done: bool,
+}
+
+impl KSubsets {
+    fn new(n: usize, k: usize) -> Self {
+        if k == 0 || k > n {
+            return Self {
+                n,
+                k,
+                cur: Vec::new(),
+                done: true,
+            };
+        }
+        Self {
+            n,
+            k,
+            cur: (0..k).collect(),
+            done: false,
+        }
+    }
+}
+
+impl Iterator for KSubsets {
+    type Item = Vec<usize>;
+
+    fn next(&mut self) -> Option<Vec<usize>> {
+        if self.done {
+            return None;
+        }
+        let item = self.cur.clone();
+        let mut i = self.k;
+        while i > 0 {
+            i -= 1;
+            if self.cur[i] < i + self.n - self.k {
+                self.cur[i] += 1;
+                for j in i + 1..self.k {
+                    self.cur[j] = self.cur[j - 1] + 1;
+                }
+                return Some(item);
+            }
+        }
+        self.done = true;
+        Some(item)
+    }
+}
+
 /// Inputs for [`download_pieces_long_tail`].
 pub struct LongTailDownload {
     /// Transport selection and connection telemetry.
@@ -302,13 +521,74 @@ pub struct LongTailDownload {
 /// promotes the rest lazily rather than ordering every piece).
 const LAUNCH_MARGIN: usize = 1;
 
+/// Extra pieces fetched after AEAD failure so one malformed transferred
+/// piece can be replaced (storj/uplink#176). Two extras cover one corrupt
+/// share in the original `k` plus one more bad extra.
+pub const MAX_DECODE_EXTRAS: usize = 2;
+
+/// Successful piece buffers plus unused assignments for a reconstruct retry.
+pub struct DownloadedPieces {
+    /// Piece number + erasure share bytes.
+    pub shares: Vec<(i32, Vec<u8>)>,
+    unused: VecDeque<PieceAssignment>,
+    connection_options: storj_rpc::transport::ConnectionOptions,
+    piece_key: PiecePrivateKey,
+    satellite_cert: Vec<u8>,
+    identity: Identity,
+    pool: SnPool,
+    offset: i64,
+    size: i64,
+    dial_timeout: Duration,
+    message_timeout: Duration,
+}
+
+impl DownloadedPieces {
+    /// Download one more unused assignment, skipping transfer failures.
+    pub async fn fetch_one_more(&mut self) -> Result<Option<(i32, Vec<u8>)>> {
+        if self.unused.is_empty() {
+            return Ok(None);
+        }
+        let assignments: Vec<PieceAssignment> = self.unused.drain(..).collect();
+        let piece_key = self.piece_key.clone();
+        let satellite_cert = self.satellite_cert.clone();
+        let identity = self.identity.clone();
+        let pool = self.pool.clone();
+        let range = (self.offset, self.size);
+        let timeouts = (self.dial_timeout, self.message_timeout);
+        let connection_options = self.connection_options.clone();
+        match collect_piece_downloads(assignments, 1, 0, self.offset, self.size, move |asg| {
+            download_one_piece(
+                asg,
+                piece_key.clone(),
+                satellite_cert.clone(),
+                identity.clone(),
+                pool.clone(),
+                range,
+                timeouts,
+                connection_options.clone(),
+            )
+        })
+        .await
+        {
+            Ok(collected) => {
+                self.unused = collected.unused;
+                Ok(collected.shares.into_iter().next())
+            }
+            Err(Error::PieceDownload(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+}
+
 /// Download pieces until `k` succeed, then cancel the rest (long-tail).
 ///
 /// Only `k + LAUNCH_MARGIN` pieces are requested initially; each failure
 /// promotes the next unused assignment. Every launched piece signs an order
 /// for its full byte range, so this bounds egress to roughly `k + 1` pieces
-/// instead of all `n`.
-pub async fn download_pieces_long_tail(job: LongTailDownload) -> Result<Vec<(i32, Vec<u8>)>> {
+/// instead of all `n`. Unused assignments (including ones cancelled by the
+/// long tail) stay on [`DownloadedPieces`] so a later reconstruct failure
+/// can fetch replacements.
+pub async fn download_pieces_long_tail(job: LongTailDownload) -> Result<DownloadedPieces> {
     let LongTailDownload {
         connection_options,
         assignments,
@@ -322,19 +602,45 @@ pub async fn download_pieces_long_tail(job: LongTailDownload) -> Result<Vec<(i32
         dial_timeout,
         message_timeout,
     } = job;
-    collect_piece_downloads(assignments, rs.k, offset, size, |asg| {
-        download_one_piece(
-            asg,
-            piece_key.clone(),
-            satellite_cert.clone(),
-            identity.clone(),
-            pool.clone(),
-            (offset, size),
-            (dial_timeout, message_timeout),
-            connection_options.clone(),
-        )
+    let collected =
+        collect_piece_downloads(assignments.clone(), rs.k, LAUNCH_MARGIN, offset, size, {
+            let piece_key = piece_key.clone();
+            let satellite_cert = satellite_cert.clone();
+            let identity = identity.clone();
+            let pool = pool.clone();
+            let connection_options = connection_options.clone();
+            move |asg| {
+                download_one_piece(
+                    asg,
+                    piece_key.clone(),
+                    satellite_cert.clone(),
+                    identity.clone(),
+                    pool.clone(),
+                    (offset, size),
+                    (dial_timeout, message_timeout),
+                    connection_options.clone(),
+                )
+            }
+        })
+        .await?;
+    let have: HashSet<i32> = collected.shares.iter().map(|(n, _)| *n).collect();
+    let unused = assignments
+        .into_iter()
+        .filter(|a| !have.contains(&a.piece_num))
+        .collect();
+    Ok(DownloadedPieces {
+        shares: collected.shares,
+        unused,
+        connection_options,
+        piece_key,
+        satellite_cert,
+        identity,
+        pool,
+        offset,
+        size,
+        dial_timeout,
+        message_timeout,
     })
-    .await
 }
 
 /// Stage at which a piece failed.
@@ -425,13 +731,20 @@ impl std::error::Error for PieceDownloadError {
     }
 }
 
+#[derive(Debug)]
+struct Collected<A> {
+    shares: Vec<(i32, Vec<u8>)>,
+    unused: VecDeque<A>,
+}
+
 async fn collect_piece_downloads<A, F, Fut>(
     assignments: Vec<A>,
     required: usize,
+    margin: usize,
     offset: i64,
     size: i64,
     download: F,
-) -> Result<Vec<(i32, Vec<u8>)>>
+) -> Result<Collected<A>>
 where
     F: Fn(A) -> Fut,
     Fut: std::future::Future<Output = std::result::Result<(i32, Vec<u8>), PieceDownloadFailure>>
@@ -446,12 +759,15 @@ where
         });
     }
     if size == 0 {
-        return Ok(Vec::new());
+        return Ok(Collected {
+            shares: Vec::new(),
+            unused: assignments.into(),
+        });
     }
-    let mut queue: std::collections::VecDeque<A> = assignments.into();
+    let mut queue: VecDeque<A> = assignments.into();
     let mut set = JoinSet::new();
     let mut attempted = 0;
-    while set.len() < required.saturating_add(LAUNCH_MARGIN) {
+    while set.len() < required.saturating_add(margin) {
         let Some(asg) = queue.pop_front() else { break };
         set.spawn(download(asg));
         attempted += 1;
@@ -465,7 +781,10 @@ where
                 if successes.len() >= required {
                     set.abort_all();
                     while set.join_next().await.is_some() {}
-                    return Ok(successes);
+                    return Ok(Collected {
+                        shares: successes,
+                        unused: queue,
+                    });
                 }
             }
             Ok(Err(failure)) => {
@@ -616,6 +935,7 @@ mod tests {
         collect_piece_downloads(
             jobs,
             required,
+            LAUNCH_MARGIN,
             496384,
             256,
             |(piece, delay, error)| async move {
@@ -627,6 +947,7 @@ mod tests {
             },
         )
         .await
+        .map(|c| c.shares)
     }
 
     #[tokio::test(start_paused = true)]
@@ -721,10 +1042,31 @@ mod tests {
         assert!(pieces.iter().any(|(num, _)| *num == 3));
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn leftover_assignments_are_returned() {
+        let collected =
+            collect_piece_downloads(
+                vec![0, 1, 2, 3],
+                2,
+                1,
+                0,
+                1,
+                |n| async move { Ok((n, vec![1])) },
+            )
+            .await
+            .unwrap();
+        assert_eq!(collected.shares.len(), 2);
+        assert_eq!(
+            collected.unused.len(),
+            1,
+            "k+margin launched, the rest stay unused"
+        );
+    }
+
     #[tokio::test]
     async fn invalid_ranges_fail_before_spawning_downloads() {
         for (offset, size) in [(-1, 1), (1, -1), (i64::MAX, 1)] {
-            let err = collect_piece_downloads(vec![()], 1, offset, size, |_| async {
+            let err = collect_piece_downloads(vec![()], 1, 0, offset, size, |_| async {
                 panic!("invalid request must not start a node connection");
             })
             .await
@@ -813,6 +1155,24 @@ mod tests {
     }
 
     #[test]
+    fn k_subsets_are_lexicographic_combinations() {
+        let got: Vec<Vec<usize>> = k_subsets(4, 2).collect();
+        assert_eq!(
+            got,
+            vec![
+                vec![0, 1],
+                vec![0, 2],
+                vec![0, 3],
+                vec![1, 2],
+                vec![1, 3],
+                vec![2, 3]
+            ]
+        );
+        assert_eq!(k_subsets(2, 2).collect::<Vec<_>>(), vec![vec![0, 1]]);
+        assert!(k_subsets(2, 3).next().is_none());
+    }
+
+    #[test]
     fn inline_and_remote_round_trip() {
         let key = random_key();
         let nonce = random_nonce();
@@ -867,6 +1227,46 @@ mod tests {
         })
         .unwrap();
         assert_eq!(ranged, &remote[10..30]);
+    }
+
+    #[test]
+    fn reconstruct_skips_one_malformed_piece() {
+        let key = random_key();
+        let nonce = random_nonce();
+        let rs = test_rs();
+        let remote = vec![7u8; 200];
+        let encrypted = encrypt_remote(
+            &remote,
+            CipherSuite::AES_GCM,
+            &key,
+            &nonce,
+            DEFAULT_ENCRYPTED_BLOCK_SIZE,
+        )
+        .unwrap();
+        let mut pieces = encode_pieces(&encrypted, &rs).unwrap();
+        pieces[0][0] ^= 0xFF;
+        let params = DecryptParams {
+            decoded_offset: 0,
+            encrypted_size: encrypted.len(),
+            cipher: CipherSuite::AES_GCM,
+            key: &key,
+            nonce: &nonce,
+            encrypted_block_size: DEFAULT_ENCRYPTED_BLOCK_SIZE,
+            plain_start: 0,
+            plain_len: remote.len() as i64,
+            plain_size: remote.len() as i64,
+        };
+        let bad_k: Vec<(i32, Vec<u8>)> = vec![(0, pieces[0].clone()), (1, pieces[1].clone())];
+        let err = reconstruct_remote(&bad_k, &rs, &params).unwrap_err();
+        assert!(is_content_auth_failure(&err), "{err}");
+
+        let with_extra: Vec<(i32, Vec<u8>)> = vec![
+            (0, pieces[0].clone()),
+            (1, pieces[1].clone()),
+            (3, pieces[3].clone()),
+        ];
+        let got = reconstruct_remote(&with_extra, &rs, &params).unwrap();
+        assert_eq!(got, remote);
     }
 
     #[test]

@@ -198,6 +198,41 @@ async fn k_minus_one_pieces_fails_download() {
     assert_eq!(err.kind(), storj::ErrorKind::Protocol);
 }
 
+#[tokio::test]
+async fn malformed_piece_retries_with_extra_shares() {
+    use tokio::io::AsyncWriteExt;
+
+    let mock = storj_test::MockSatellite::start().await;
+    let project = storj::Project::open(&mock.access()).await.expect("open");
+    let name = unique("malformed");
+    project.ensure_bucket(&name).await.unwrap();
+    let payload = vec![9u8; 5000];
+    let mut upload = project
+        .upload_object(&name, "r", Default::default())
+        .await
+        .unwrap();
+    upload.write_all(&payload).await.unwrap();
+    upload.commit().await.expect("commit");
+
+    // Piece 0 is always launched first. Delay the others so the corrupt share
+    // is in the initial k, forcing the extra-piece reconstruct path.
+    mock.corrupt_sn_pieces(0).await;
+    for i in 1..4 {
+        mock.set_sn_download_delay(i, std::time::Duration::from_millis(50))
+            .await;
+    }
+
+    let mut download = project
+        .download_object(&name, "r", Default::default())
+        .await
+        .expect("open is lazy");
+    let mut got = Vec::new();
+    tokio::io::copy(&mut download, &mut got)
+        .await
+        .expect("malformed piece must be replaced by an extra share");
+    assert_eq!(got, payload);
+}
+
 fn unique(prefix: &str) -> String {
     format!(
         "{prefix}-{}",

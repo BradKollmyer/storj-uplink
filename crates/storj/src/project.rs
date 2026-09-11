@@ -1131,8 +1131,9 @@ async fn decrypt_one_segment(
     seg: storj_proto::metainfo::DownloadSegmentResponse,
 ) -> Result<Vec<u8>> {
     use storj_uplink::download::{
-        LongTailDownload, RemoteDecrypt, decode_encrypted, decrypt_inline, decrypt_remote,
-        download_pieces_long_tail, piece_byte_range, segment_plain_range,
+        DecryptParams, LongTailDownload, MAX_DECODE_EXTRAS, decrypt_inline,
+        download_pieces_long_tail, is_content_auth_failure, piece_byte_range, reconstruct_remote,
+        segment_plain_range,
     };
     use storj_uplink::orders::PiecePrivateKey;
     use storj_uplink::pipeline::{Redundancy, content_nonce, decrypt_key, nonce_from_slice};
@@ -1176,7 +1177,7 @@ async fn decrypt_one_segment(
         assignments.push(PieceAssignment::from_addressed(i, addressed).map_err(map_uplink)?);
     }
     let piece_key = PiecePrivateKey::from_bytes(&seg.private_key).map_err(map_uplink)?;
-    let shares = download_pieces_long_tail(LongTailDownload {
+    let mut downloaded = download_pieces_long_tail(LongTailDownload {
         connection_options: project.connection_options.clone(),
         assignments,
         piece_key,
@@ -1194,25 +1195,47 @@ async fn decrypt_one_segment(
     let decoded_offset = usize::try_from(piece_off.saturating_mul(rs.k as i64)).unwrap_or(0);
     let encrypted_size = usize::try_from(seg.segment_size.max(0)).unwrap_or(0);
     let plain_size = seg.plain_size;
-    // RS decode + AEAD decrypt of a 64 MiB segment is CPU-bound: keep it off
-    // the async executor threads (the upload side already does this).
-    tokio::task::spawn_blocking(move || {
-        let decoded = decode_encrypted(&shares, &rs).map_err(map_uplink)?;
-        decrypt_remote(RemoteDecrypt {
-            decoded: &decoded,
-            decoded_offset,
-            encrypted_size,
-            cipher,
-            key: &segment_key,
-            nonce: &nonce,
-            encrypted_block_size: block_size,
-            plain_start: local_start,
-            plain_len: local_len,
-            plain_size,
+    let mut extras = 0usize;
+    loop {
+        let shares = std::mem::take(&mut downloaded.shares);
+        let key = segment_key.clone();
+        // RS decode + AEAD decrypt of a 64 MiB segment is CPU-bound: keep it off
+        // the async executor threads (the upload side already does this).
+        let outcome = tokio::task::spawn_blocking(move || {
+            let params = DecryptParams {
+                decoded_offset,
+                encrypted_size,
+                cipher,
+                key: &key,
+                nonce: &nonce,
+                encrypted_block_size: block_size,
+                plain_start: local_start,
+                plain_len: local_len,
+                plain_size,
+            };
+            match reconstruct_remote(&shares, &rs, &params) {
+                Ok(plain) => Ok(plain),
+                Err(e) => Err((e, shares)),
+            }
         })
-        .map_err(map_uplink)
-    })
-    .await?
+        .await?;
+        match outcome {
+            Ok(plain) => return Ok(plain),
+            Err((e, shares)) => {
+                downloaded.shares = shares;
+                if extras >= MAX_DECODE_EXTRAS || !is_content_auth_failure(&e) {
+                    return Err(map_uplink(e));
+                }
+                match downloaded.fetch_one_more().await.map_err(map_uplink)? {
+                    Some(piece) => {
+                        downloaded.shares.push(piece);
+                        extras += 1;
+                    }
+                    None => return Err(map_uplink(e)),
+                }
+            }
+        }
+    }
 }
 
 fn slice_plain(full: &[u8], start: i64, len: i64) -> Vec<u8> {

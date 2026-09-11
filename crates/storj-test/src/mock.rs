@@ -408,6 +408,20 @@ impl MockSatellite {
         }
     }
 
+    /// Corrupt every piece stored on storage node `idx` (malformed-share tests).
+    pub async fn corrupt_sn_pieces(&self, idx: usize) {
+        if let Some(sn) = self.sns.get(idx) {
+            sn.xor_stored_pieces(0xFF).await;
+        }
+    }
+
+    /// Delay Download on storage node `idx`.
+    pub async fn set_sn_download_delay(&self, idx: usize, d: std::time::Duration) {
+        if let Some(sn) = self.sns.get(idx) {
+            sn.set_download_delay(d).await;
+        }
+    }
+
     /// Replace the metadata key ciphertext so user-data decrypt fails.
     pub fn corrupt_encrypted_metadata(&self) {
         let mut st = self.state.lock().expect("mock state");
