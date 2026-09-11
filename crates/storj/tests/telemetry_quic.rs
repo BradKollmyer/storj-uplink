@@ -112,11 +112,15 @@ async fn transports_remote_upload_download_and_multipart() {
                     first_byte,
                     outcome,
                     transport_mode,
+                    diagnostics,
                 } => {
                     assert_eq!(*bytes, body.len() as u64);
                     assert_eq!(*outcome, Outcome::Success);
                     assert_eq!(*transport_mode, mode);
                     assert!(first_byte.is_some_and(|d| d <= *elapsed));
+                    assert!(diagnostics.working_time <= *elapsed);
+                    assert_eq!(diagnostics.object_size, Some(body.len() as u64));
+                    assert_eq!(diagnostics.error_kind, None);
                     operations.push(*operation);
                 }
                 _ => {}

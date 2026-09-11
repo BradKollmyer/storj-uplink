@@ -100,11 +100,13 @@ impl Project {
         let mut telemetry = crate::telemetry::Transfer::new(
             crate::Operation::Upload,
             &self.inner.connection_options,
+            self.inner.metainfo.satellite_label(),
         );
+        telemetry.diagnostics.expires = Some(opts.expires.is_some());
         match self.start_upload_object(bucket, key, opts).await {
             Ok(upload) => Ok(upload.with_telemetry(telemetry)),
             Err(e) => {
-                telemetry.finish(crate::Outcome::Error);
+                telemetry.fail(&e);
                 Err(e)
             }
         }
@@ -188,11 +190,13 @@ impl Project {
         let mut telemetry = crate::telemetry::Transfer::new(
             crate::Operation::Download,
             &self.inner.connection_options,
+            self.inner.metainfo.satellite_label(),
         );
+        telemetry.download_request(opts.offset, opts.length);
         match self.start_download_object(bucket, key, opts).await {
             Ok(download) => Ok(download.with_telemetry(telemetry)),
             Err(e) => {
-                telemetry.finish(crate::Outcome::Error);
+                telemetry.fail(&e);
                 Err(e)
             }
         }
@@ -363,6 +367,7 @@ impl Project {
         let mut telemetry = crate::telemetry::Transfer::new(
             crate::Operation::UploadPart,
             &self.inner.connection_options,
+            self.inner.metainfo.satellite_label(),
         );
         match self
             .start_upload_part(bucket, key, upload_id, part_number)
@@ -370,7 +375,7 @@ impl Project {
         {
             Ok(upload) => Ok(upload.with_telemetry(telemetry)),
             Err(e) => {
-                telemetry.finish(crate::Outcome::Error);
+                telemetry.fail(&e);
                 Err(e)
             }
         }
@@ -636,7 +641,7 @@ impl Project {
         match tokio::io::copy(&mut reader, &mut upload).await {
             Ok(_) => upload.commit().await,
             Err(e) => {
-                upload.record_error();
+                upload.record_error(&e);
                 let io_err = Error::from(e);
                 match upload.abort().await {
                     Ok(()) => Err(io_err),
@@ -659,8 +664,8 @@ impl Project {
         let mut writer = std::pin::pin!(writer);
         let copy = tokio::io::copy(&mut download, &mut writer).await;
         let flush = writer.flush().await;
-        if copy.is_err() || flush.is_err() {
-            download.record_error();
+        if let Some(error) = copy.as_ref().err().or_else(|| flush.as_ref().err()) {
+            download.record_error(error);
         }
         let close = download.close().await;
         copy?;

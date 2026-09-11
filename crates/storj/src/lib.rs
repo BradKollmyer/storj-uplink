@@ -46,7 +46,9 @@
 
 #![deny(clippy::undocumented_unsafe_blocks)]
 
-pub use storj_rpc::telemetry::{Operation, Outcome, Telemetry, TelemetryEvent};
+pub use storj_rpc::telemetry::{
+    DiagnosticRange, Operation, Outcome, Telemetry, TelemetryEvent, TransferDiagnostics,
+};
 pub use storj_rpc::transport::{NetworkOptions, TransportKind, TransportMode};
 mod telemetry;
 

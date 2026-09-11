@@ -130,6 +130,19 @@ read and destination write/flush failures. Explicit aborts and unfinished drops 
 Initialization and transfer failures report errors. No bucket names, object
 keys, credentials, payloads, or error strings are included.
 
+Transfer events also contain `diagnostics`: working time, canonical satellite
+NodeID/address, OS/architecture/CPU count, expiration status, and a sanitized
+error kind plus retryability. Downloads include the requested range, normalized
+range, and full object size. Object size becomes available after initialization
+for downloads and successful commit for uploads/parts. Unknown values remain
+`None`, including size/range when download initialization fails.
+
+Working time excludes idle gaps between completed API operations and includes
+initialization, commit/abort, and pending read/write waits. An I/O operation stays
+active from its first poll until it returns Ready or the transfer terminates;
+the underlying `AsyncRead`/`AsyncWrite` traits cannot observe cancellation of an
+individual caller-owned I/O future. It measures wall time, not CPU usage.
+
 Callbacks run synchronously and may run concurrently; keep them fast and
 nonblocking. With panic unwinding, callback panics are caught. There is no
 automatic network exporter or background delivery queue. Existing `Config`

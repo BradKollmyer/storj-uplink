@@ -56,7 +56,7 @@ impl UploadInner {
 
     fn poison(&mut self, e: Error) -> Error {
         if let Some(t) = &mut self.telemetry {
-            t.finish(Outcome::Error);
+            t.fail(&e);
         }
         if self.failed.is_none() {
             self.failed = Some((e.kind(), e.to_string()));
@@ -98,6 +98,23 @@ impl UploadInner {
     }
 
     fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+        if let Some(t) = &mut self.telemetry {
+            t.begin_work();
+        }
+        let result = self.poll_write_inner(cx, buf);
+        if result.is_ready()
+            && let Some(t) = &mut self.telemetry
+        {
+            t.end_work();
+        }
+        result
+    }
+
+    fn poll_write_inner(
+        &mut self,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
@@ -127,23 +144,33 @@ impl UploadInner {
     }
 
     fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        match self.poll_pending_flush(cx) {
+        if let Some(t) = &mut self.telemetry {
+            t.begin_work();
+        }
+        let result = match self.poll_pending_flush(cx) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Err(e)) => Poll::Ready(Err(e.into())),
             Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
+        };
+        if result.is_ready()
+            && let Some(t) = &mut self.telemetry
+        {
+            t.end_work();
         }
+        result
     }
 }
 
 impl Upload {
-    pub(crate) fn record_error(&self) {
+    pub(crate) fn record_error(&self, error: &std::io::Error) {
         if let Some(inner) = self.lock_inner().as_mut()
             && let Some(t) = &mut inner.telemetry
         {
-            t.finish(Outcome::Error);
+            t.fail_io(error);
         }
     }
-    pub(crate) fn with_telemetry(self, telemetry: Transfer) -> Self {
+    pub(crate) fn with_telemetry(self, mut telemetry: Transfer) -> Self {
+        telemetry.end_work();
         self.lock_inner().as_mut().expect("new upload").telemetry = Some(telemetry);
         self
     }
@@ -182,13 +209,15 @@ impl Upload {
             )
         })?;
         let mut telemetry = inner.telemetry.take();
+        if let Some(t) = &mut telemetry {
+            t.begin_work();
+        }
         let result = crate::project::commit_upload(inner).await;
         if let Some(t) = &mut telemetry {
-            t.finish(if result.is_ok() {
-                Outcome::Success
-            } else {
-                Outcome::Error
-            });
+            match &result {
+                Ok(_) => t.finish(Outcome::Success),
+                Err(e) => t.fail(e),
+            }
         }
         result
     }
@@ -202,13 +231,15 @@ impl Upload {
             )
         })?;
         let mut telemetry = inner.telemetry.take();
+        if let Some(t) = &mut telemetry {
+            t.begin_work();
+        }
         let result = crate::project::abort_upload(inner).await;
         if let Some(t) = &mut telemetry {
-            t.finish(if result.is_ok() {
-                Outcome::Cancelled
-            } else {
-                Outcome::Error
-            });
+            match &result {
+                Ok(_) => t.finish(Outcome::Cancelled),
+                Err(e) => t.fail(e),
+            }
         }
         result
     }
@@ -321,7 +352,9 @@ impl Download {
         &self.info
     }
 
-    pub(crate) fn with_telemetry(mut self, telemetry: Transfer) -> Self {
+    pub(crate) fn with_telemetry(mut self, mut telemetry: Transfer) -> Self {
+        telemetry.download_info(&self.info);
+        telemetry.end_work();
         if self.rx.is_none() && self.buf.is_empty() {
             self.complete = true;
         }
@@ -329,15 +362,18 @@ impl Download {
         self
     }
 
-    pub(crate) fn record_error(&mut self) {
+    pub(crate) fn record_error(&mut self, error: &std::io::Error) {
         if let Some(t) = &mut self.telemetry {
-            t.finish(Outcome::Error);
+            t.fail_io(error);
         }
     }
 
     /// Stop fetching: cancels the background segment task and releases its
     /// storage-node connections. Drop does the same (best-effort).
     pub async fn close(mut self) -> Result<()> {
+        if let Some(t) = &mut self.telemetry {
+            t.begin_work();
+        }
         self.cancel();
         Ok(())
     }
@@ -370,6 +406,25 @@ impl AsyncRead for Download {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
+        if let Some(t) = &mut this.telemetry {
+            t.begin_work();
+        }
+        let result = this.poll_read_inner(cx, buf);
+        if result.is_ready()
+            && let Some(t) = &mut this.telemetry
+        {
+            t.end_work();
+        }
+        result
+    }
+}
+impl Download {
+    fn poll_read_inner(
+        &mut self,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self;
         if buf.remaining() == 0 {
             return Poll::Ready(Ok(()));
         }
@@ -399,7 +454,7 @@ impl AsyncRead for Download {
                 }
                 Poll::Ready(Some(Err(e))) => {
                     if let Some(t) = &mut this.telemetry {
-                        t.finish(Outcome::Error);
+                        t.fail(&e);
                     }
                     this.cancel();
                     return Poll::Ready(Err(e.into()));
@@ -408,7 +463,10 @@ impl AsyncRead for Download {
                     this.cancel();
                     if this.remaining != 0 {
                         if let Some(t) = &mut this.telemetry {
-                            t.finish(Outcome::Error);
+                            t.fail(&Error::new(
+                                ErrorKind::Protocol,
+                                "download missing segment data",
+                            ));
                         }
                         return Poll::Ready(Err(Error::new(
                             ErrorKind::Protocol,
@@ -431,7 +489,8 @@ pub struct PartUpload {
 }
 
 impl PartUpload {
-    pub(crate) fn with_telemetry(self, telemetry: Transfer) -> Self {
+    pub(crate) fn with_telemetry(self, mut telemetry: Transfer) -> Self {
+        telemetry.end_work();
         self.lock_inner()
             .as_mut()
             .expect("new part upload")
@@ -467,13 +526,15 @@ impl PartUpload {
     pub async fn commit(self) -> Result<()> {
         let mut inner = self.lock_inner().take().ok_or_else(upload_done)?;
         let mut telemetry = inner.telemetry.take();
+        if let Some(t) = &mut telemetry {
+            t.begin_work();
+        }
         let result = crate::project::commit_part(inner).await;
         if let Some(t) = &mut telemetry {
-            t.finish(if result.is_ok() {
-                Outcome::Success
-            } else {
-                Outcome::Error
-            });
+            match &result {
+                Ok(_) => t.finish(Outcome::Success),
+                Err(e) => t.fail(e),
+            }
         }
         result
     }
@@ -482,13 +543,15 @@ impl PartUpload {
     pub async fn abort(self) -> Result<()> {
         let mut inner = self.lock_inner().take().ok_or_else(upload_done)?;
         let mut telemetry = inner.telemetry.take();
+        if let Some(t) = &mut telemetry {
+            t.begin_work();
+        }
         let result = crate::project::abort_part(inner).await;
         if let Some(t) = &mut telemetry {
-            t.finish(if result.is_ok() {
-                Outcome::Cancelled
-            } else {
-                Outcome::Error
-            });
+            match &result {
+                Ok(_) => t.finish(Outcome::Cancelled),
+                Err(e) => t.fail(e),
+            }
         }
         result
     }
