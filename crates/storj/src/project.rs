@@ -138,6 +138,7 @@ impl Project {
                     .as_ref()
                     .map(crate::object_lock::retention_to_proto),
                 opts.legal_hold,
+                opts.checksum.clone(),
             )
             .await?;
         let content_key =
@@ -176,6 +177,7 @@ impl Project {
                 pending_flush: None,
                 part_number: 0,
                 etag: None,
+                checksum: opts.checksum,
             },
         ))
     }
@@ -343,6 +345,7 @@ impl Project {
                     .as_ref()
                     .map(crate::object_lock::retention_to_proto),
                 opts.legal_hold,
+                opts.checksum,
             )
             .await?;
         Ok(UploadInfo {
@@ -428,6 +431,7 @@ impl Project {
                 pending_flush: None,
                 part_number,
                 etag: None,
+                checksum: None,
             },
         ))
     }
@@ -465,7 +469,7 @@ impl Project {
         let committed = self
             .inner
             .metainfo
-            .commit_object(bucket, key, stream_id, user)
+            .commit_object(bucket, key, stream_id, user, opts.checksum)
             .await?;
         let mut obj = object_from_proto(committed.object, key);
         obj.custom = custom_pairs.into_iter().collect();
@@ -1261,7 +1265,13 @@ pub(crate) async fn commit_upload(mut inner: UploadInner) -> Result<Object> {
     let committed = inner
         .project
         .metainfo
-        .commit_object(&inner.bucket, &inner.key, inner.stream_id, user)
+        .commit_object(
+            &inner.bucket,
+            &inner.key,
+            inner.stream_id,
+            user,
+            inner.checksum,
+        )
         .await?;
     abort_on_drop.disarm();
     let mut obj = object_from_proto(committed.object, &inner.key);

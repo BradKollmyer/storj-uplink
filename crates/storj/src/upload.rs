@@ -8,7 +8,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::error::{Error, ErrorKind, Result};
 use crate::project::ProjectInner;
-use crate::types::{CustomMetadata, Object, Part};
+use crate::types::{CustomMetadata, Object, ObjectChecksum, Part};
 use crate::{Outcome, telemetry::Transfer};
 
 /// In-progress object upload. Implements `AsyncWrite`. Must `commit()` to publish.
@@ -35,6 +35,7 @@ pub(crate) struct UploadInner {
     pub(crate) pending_flush: Option<tokio::task::JoinHandle<Result<FlushedSegment>>>,
     pub(crate) part_number: i32,
     pub(crate) etag: Option<Vec<u8>>,
+    pub(crate) checksum: Option<ObjectChecksum>,
     /// Set once a background segment flush fails. Every later write, flush,
     /// shutdown and commit returns this error so a caller that ignores one
     /// write error cannot publish an object with a missing segment.

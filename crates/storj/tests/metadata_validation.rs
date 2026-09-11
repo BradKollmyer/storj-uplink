@@ -97,8 +97,9 @@ async fn multipart_validation_leaves_upload_available_for_valid_commit() {
                     "multipart",
                     &pending.upload_id,
                     CommitUploadOptions {
-                        custom_metadata: meta
-                    }
+                        custom_metadata: meta,
+                        ..Default::default()
+                    },
                 )
                 .await
                 .unwrap_err()

@@ -82,6 +82,7 @@ async fn multipart_commit_requires_only_upload_permission() {
                 &info.upload_id,
                 CommitUploadOptions {
                     custom_metadata: custom.clone(),
+                    ..Default::default()
                 },
             )
             .await
@@ -202,6 +203,7 @@ async fn begin_part_commit() {
             &info.upload_id,
             CommitUploadOptions {
                 custom_metadata: custom.clone(),
+                ..Default::default()
             },
         )
         .await

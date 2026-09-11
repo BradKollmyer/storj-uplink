@@ -110,6 +110,9 @@ pub struct UploadOptions {
     pub retention: Option<Retention>,
     /// Place a legal hold at creation (Go `UploadOptions.LegalHold`).
     pub legal_hold: bool,
+    /// Object checksum sent on `BeginObject` / `CommitObject`. `None` leaves
+    /// the proto fields at their defaults (`NONE`).
+    pub checksum: Option<ObjectChecksum>,
 }
 
 /// Options for `Project::download_object`.
@@ -208,11 +211,75 @@ pub struct UploadInfo {
     pub system: SystemMetadata,
 }
 
+/// Checksum algorithm on `BeginObject` / `CommitObject`.
+///
+/// Values match `storj_proto::metainfo::ObjectChecksumAlgorithm`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ObjectChecksumAlgorithm {
+    /// No checksum (`NONE` = 0).
+    #[default]
+    None,
+    /// CRC-32 (`CRC32` = 1).
+    Crc32,
+    /// CRC-32C (`CRC32C` = 2).
+    Crc32c,
+    /// CRC-64/NVME (`CRC64NVME` = 3).
+    Crc64Nvme,
+    /// SHA-1 (`SHA1` = 4).
+    Sha1,
+    /// SHA-256 (`SHA256` = 5).
+    Sha256,
+}
+
+impl ObjectChecksumAlgorithm {
+    pub(crate) fn to_proto(self) -> i32 {
+        use storj_proto::metainfo::ObjectChecksumAlgorithm as Proto;
+        match self {
+            Self::None => Proto::None as i32,
+            Self::Crc32 => Proto::Crc32 as i32,
+            Self::Crc32c => Proto::Crc32c as i32,
+            Self::Crc64Nvme => Proto::Crc64nvme as i32,
+            Self::Sha1 => Proto::Sha1 as i32,
+            Self::Sha256 => Proto::Sha256 as i32,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn from_proto(value: i32) -> Self {
+        use storj_proto::metainfo::ObjectChecksumAlgorithm as Proto;
+        match Proto::try_from(value) {
+            Ok(Proto::None) => Self::None,
+            Ok(Proto::Crc32) => Self::Crc32,
+            Ok(Proto::Crc32c) => Self::Crc32c,
+            Ok(Proto::Crc64nvme) => Self::Crc64Nvme,
+            Ok(Proto::Sha1) => Self::Sha1,
+            Ok(Proto::Sha256) => Self::Sha256,
+            Err(_) => Self::None,
+        }
+    }
+}
+
+/// Checksum fields sent on `BeginObject` / `CommitObject`.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ObjectChecksum {
+    /// Algorithm; `None` is proto `NONE`.
+    pub algorithm: ObjectChecksumAlgorithm,
+    /// Whether the checksum is a composite of part checksums.
+    pub composite: bool,
+    /// Encrypted checksum bytes. Commit requires this when `algorithm` is not
+    /// [`ObjectChecksumAlgorithm::None`].
+    pub encrypted_value: Vec<u8>,
+}
+
 /// Options for `commit_upload`.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CommitUploadOptions {
     /// Custom metadata applied at commit.
     pub custom_metadata: CustomMetadata,
+    /// Object checksum sent on `CommitObject`. `None` leaves the proto fields
+    /// at their defaults (`NONE`).
+    pub checksum: Option<ObjectChecksum>,
 }
 
 /// Options for listing uncommitted uploads.
@@ -406,5 +473,29 @@ mod tests {
             Config::default().dial_timeout_or_default(),
             Duration::from_secs(20)
         );
+    }
+
+    #[test]
+    fn checksum_algorithm_proto_round_trip() {
+        for algo in [
+            ObjectChecksumAlgorithm::None,
+            ObjectChecksumAlgorithm::Crc32,
+            ObjectChecksumAlgorithm::Crc32c,
+            ObjectChecksumAlgorithm::Crc64Nvme,
+            ObjectChecksumAlgorithm::Sha1,
+            ObjectChecksumAlgorithm::Sha256,
+        ] {
+            assert_eq!(ObjectChecksumAlgorithm::from_proto(algo.to_proto()), algo);
+        }
+        assert_eq!(
+            ObjectChecksumAlgorithm::default(),
+            ObjectChecksumAlgorithm::None
+        );
+        assert_eq!(
+            ObjectChecksumAlgorithm::from_proto(99),
+            ObjectChecksumAlgorithm::None
+        );
+        assert_eq!(UploadOptions::default().checksum, None);
+        assert_eq!(CommitUploadOptions::default().checksum, None);
     }
 }

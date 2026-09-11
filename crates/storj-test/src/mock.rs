@@ -931,6 +931,14 @@ fn commit_object(
         st.fail_commit = false;
         return Err((RPC_INTERNAL, "commit object failed".into()));
     }
+    if req.checksum_algorithm != storj_proto::metainfo::ObjectChecksumAlgorithm::None as i32
+        && req.encrypted_checksum.is_empty()
+    {
+        return Err((
+            RPC_INVALID_ARGUMENT,
+            "encrypted checksum is required when checksum algorithm is set".into(),
+        ));
+    }
     {
         let pending = st
             .pending
@@ -966,6 +974,9 @@ fn commit_object(
             block_size: 7424,
         }),
         redundancy_scheme: Some(scheme),
+        checksum_algorithm: req.checksum_algorithm,
+        is_checksum_composite: req.is_checksum_composite,
+        encrypted_checksum: req.encrypted_checksum,
         ..Default::default()
     };
     if obj.object_version.is_empty() {

@@ -30,8 +30,8 @@ use crate::object_lock::{
     lock_config_from_proto, lock_config_to_proto, retention_from_proto, retention_to_proto,
 };
 use crate::types::{
-    Bucket, BucketObjectLockConfiguration, Config, CustomMetadata, Object, Retention,
-    SystemMetadata,
+    Bucket, BucketObjectLockConfiguration, Config, CustomMetadata, Object, ObjectChecksum,
+    Retention, SystemMetadata,
 };
 
 use storj_proto::{decode_batch_response, encode_batch_request};
@@ -413,6 +413,7 @@ impl MetainfoClient {
         Ok(items.remove(0))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn begin_object(
         &self,
         bucket: &str,
@@ -421,7 +422,10 @@ impl MetainfoClient {
         encryption_parameters: Option<storj_proto::encryption::EncryptionParameters>,
         retention: Option<metainfo::Retention>,
         legal_hold: bool,
+        checksum: Option<ObjectChecksum>,
     ) -> Result<metainfo::BeginObjectResponse> {
+        let (checksum_algorithm, is_checksum_composite, encrypted_checksum) =
+            checksum_fields(checksum);
         let req = BeginObjectRequest {
             header: Some(self.header()),
             bucket: bucket.as_bytes().to_vec(),
@@ -430,6 +434,9 @@ impl MetainfoClient {
             encryption_parameters,
             retention,
             legal_hold,
+            checksum_algorithm,
+            is_checksum_composite,
+            encrypted_checksum,
             ..Default::default()
         };
         let items = self
@@ -456,7 +463,10 @@ impl MetainfoClient {
         key: &str,
         stream_id: Vec<u8>,
         user: storj_uplink::upload::EncryptedUserData,
+        checksum: Option<ObjectChecksum>,
     ) -> Result<metainfo::CommitObjectResponse> {
+        let (checksum_algorithm, is_checksum_composite, encrypted_checksum) =
+            checksum_fields(checksum);
         let req = CommitObjectRequest {
             header: Some(self.header()),
             stream_id,
@@ -465,6 +475,9 @@ impl MetainfoClient {
             encrypted_metadata_encrypted_key: user.encrypted_metadata_encrypted_key,
             encrypted_etag: user.encrypted_etag,
             skip_override_encrypted_metadata: false,
+            checksum_algorithm,
+            is_checksum_composite,
+            encrypted_checksum,
             ..Default::default()
         };
         let items = self
@@ -1223,6 +1236,12 @@ impl MetainfoClient {
         .await?;
         Ok(())
     }
+}
+
+fn checksum_fields(checksum: Option<ObjectChecksum>) -> (i32, bool, Vec<u8>) {
+    checksum
+        .map(|cs| (cs.algorithm.to_proto(), cs.composite, cs.encrypted_value))
+        .unwrap_or_default()
 }
 
 fn system_time_to_proto(t: std::time::SystemTime) -> prost_types::Timestamp {
