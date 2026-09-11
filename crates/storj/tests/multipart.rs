@@ -5,7 +5,8 @@ use storj::constants::{
     MAX_MULTIPART_PARTS, MAX_SEGMENT_SIZE, MIN_MULTIPART_PART_SIZE, STREAM_ID_BASE58_VERSION,
 };
 use storj::{
-    CommitUploadOptions, CustomMetadata, ErrorKind, ListUploadsOptions, Project, UploadOptions,
+    CommitUploadOptions, CustomMetadata, ErrorKind, ListUploadsOptions, Project, SystemMetadata,
+    UploadOptions,
 };
 use storj_test::MockSatellite;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -399,6 +400,35 @@ async fn list_uploads_exact_key_pending_streams() {
     assert!(listed.iter().all(|u| u.key == key));
     assert!(listed.iter().any(|u| u.upload_id == first.upload_id));
     assert!(listed.iter().any(|u| u.upload_id == second.upload_id));
+    assert!(
+        listed
+            .iter()
+            .any(|u| u.system.created.is_some() || u.system.content_length > 0),
+        "system: true should fill system metadata"
+    );
+
+    let without_system: Vec<_> = project
+        .list_uploads(
+            &bucket,
+            ListUploadsOptions {
+                prefix: key.into(),
+                system: false,
+                ..Default::default()
+            },
+        )
+        .collect()
+        .await;
+    let without_system: Vec<_> = without_system
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(without_system.len(), 2);
+    assert!(
+        without_system
+            .iter()
+            .all(|u| u.system == SystemMetadata::default()),
+        "system: false should omit system metadata"
+    );
 
     let under_slash: Vec<_> = project
         .list_uploads(

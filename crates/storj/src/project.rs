@@ -714,6 +714,7 @@ struct ListPendingStreamsState {
     cursor: Vec<u8>,
     pending: VecDeque<UploadInfo>,
     done: bool,
+    system: bool,
 }
 
 fn list_uploads_by_key(project: Project, bucket: String, opts: ListUploadsOptions) -> UploadStream {
@@ -732,6 +733,7 @@ fn list_uploads_by_key(project: Project, bucket: String, opts: ListUploadsOption
             cursor,
             pending: VecDeque::new(),
             done: false,
+            system: opts.system,
         },
         |mut st| async move {
             loop {
@@ -764,10 +766,14 @@ fn list_uploads_by_key(project: Project, bucket: String, opts: ListUploadsOption
                     st.pending.push_back(UploadInfo {
                         key: st.key.clone(),
                         upload_id: storj_uplink::multipart::encode_upload_id(&item.stream_id),
-                        system: SystemMetadata {
-                            created: item.created_at.map(|t| proto_timestamp(Some(t))),
-                            expires: item.expires_at.map(|t| proto_timestamp(Some(t))),
-                            content_length: item.plain_size,
+                        system: if st.system {
+                            SystemMetadata {
+                                created: item.created_at.map(|t| proto_timestamp(Some(t))),
+                                expires: item.expires_at.map(|t| proto_timestamp(Some(t))),
+                                content_length: item.plain_size,
+                            }
+                        } else {
+                            SystemMetadata::default()
                         },
                     });
                 }
