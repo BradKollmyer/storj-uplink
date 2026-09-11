@@ -32,7 +32,14 @@ jobs:
         run: |
           python3 - <<'PY'
           import subprocess
-          for target in ("x86_64-unknown-illumos", "x86_64-unknown-fuchsia"):
+          # tokio-tfo only implements Linux/Android, FreeBSD, Apple and Windows;
+          # other BSDs and every other Unix hit its compile_error!.
+          for target in (
+              "x86_64-unknown-illumos",
+              "x86_64-unknown-fuchsia",
+              "x86_64-unknown-openbsd",
+              "x86_64-unknown-netbsd",
+          ):
               tree = subprocess.check_output([
                   "cargo", "tree", "--locked", "--target", target,
                   "-p", "storj-rpc", "--edges", "normal", "--prefix", "none",

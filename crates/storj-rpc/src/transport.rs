@@ -621,14 +621,12 @@ async fn noise_exchange(
         fast_open,
         |addr, fast| async move {
             let socket = crate::socket::socket(addr, network)?;
+            // Keep in sync with the tokio-tfo target gate in Cargo.toml.
             #[cfg(any(
                 windows,
                 target_os = "linux",
                 target_os = "android",
                 target_os = "freebsd",
-                target_os = "openbsd",
-                target_os = "netbsd",
-                target_os = "dragonfly",
                 target_os = "macos",
                 target_os = "ios",
                 target_os = "watchos",

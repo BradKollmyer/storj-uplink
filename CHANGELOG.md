@@ -63,7 +63,11 @@ published so the facade can resolve on crates.io; they are not a stable API.
   exhaust the handshake budget for healthy alternatives. Each handshake has at
   most two identical copies when duplicate suppression is advertised, otherwise
   one. Authenticate responses before selecting the winning address.
-- Gate `tokio-tfo` to its supported targets; other targets use ordinary TCP.
+- Gate `tokio-tfo` to exactly the targets it implements (Windows, Linux,
+  Android, FreeBSD, and Apple platforms). Other targets, including OpenBSD,
+  NetBSD, and DragonFly, which previously failed to build `storj-rpc` with
+  `compile_error!`, use ordinary TCP. CI probes OpenBSD and NetBSD alongside
+  illumos and Fuchsia to keep the dependency off unsupported targets.
 - Test stalled and unavailable Fast Open using controlled connections instead
   of requiring the host kernel to enable TFO.
 - Clarify that Noise early data currently contains DRPC INVOKE only; the first

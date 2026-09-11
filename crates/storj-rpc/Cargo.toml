@@ -26,7 +26,9 @@ zeroize.workspace = true
 futures-util.workspace = true
 x509-parser.workspace = true
 
-[target.'cfg(any(windows, target_os = "linux", target_os = "android", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd", target_os = "dragonfly", target_os = "macos", target_os = "ios", target_os = "watchos", target_os = "tvos"))'.dependencies]
+# Exactly the targets tokio-tfo 0.4 implements (src/sys/unix/{mod,bsd/mod}.rs);
+# every other Unix hits its compile_error!, so keep transport.rs's cfg in sync.
+[target.'cfg(any(windows, target_os = "linux", target_os = "android", target_os = "freebsd", target_os = "macos", target_os = "ios", target_os = "watchos", target_os = "tvos"))'.dependencies]
 tokio-tfo.workspace = true
 
 [dev-dependencies]

@@ -109,7 +109,9 @@ address cannot prevent another from authenticating. The Fast Open and ordinary
 TCP legs for one address send at most two identical copies; without advertised
 suppression, that address sends one copy over ordinary TCP.
 Unavailable Fast Open support allows ordinary TCP to proceed. The optional
-TFO dependency is compiled only on platforms supported by `tokio-tfo`. TCP address candidates also race
+TFO dependency is compiled only on the platforms `tokio-tfo` implements
+(Windows, Linux, Android, FreeBSD, and Apple platforms); other targets,
+including the other BSDs, build without it and use ordinary TCP. TCP address candidates also race
 to avoid a stalled IPv6 route blocking IPv4. On Linux, background QoS requests
 Lower Effort DSCP; `congestion_control` can name a kernel TCP controller. These
 socket hints are best-effort. Disable `noise_early_data` for an eager, empty-payload
