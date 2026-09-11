@@ -405,6 +405,26 @@ pub(crate) fn verify_chain(chain_der: &[&[u8]]) -> Result<(), IdentityError> {
     Ok(())
 }
 
+/// Validate concatenated DER certificates from a piecestore response and pin
+/// the CA's NodeID to the satellite's order limit. Returns the verified leaf.
+pub fn verified_leaf(chain: &[u8], expected: NodeId) -> Result<&[u8], IdentityError> {
+    let mut rest = chain;
+    let mut certs = Vec::new();
+    while !rest.is_empty() {
+        let (remaining, _) = X509Certificate::from_der(rest)
+            .map_err(|e| IdentityError::Certificate(e.to_string()))?;
+        certs.push(&rest[..rest.len() - remaining.len()]);
+        rest = remaining;
+    }
+    verify_chain(&certs)?;
+    if NodeId::from_certificate_der(certs[1])? != expected {
+        return Err(IdentityError::Certificate(
+            "piece response NodeID mismatch".into(),
+        ));
+    }
+    Ok(certs[0])
+}
+
 fn verify_signed_by(
     child: &X509Certificate<'_>,
     parent: &X509Certificate<'_>,
@@ -474,6 +494,31 @@ mod tests {
 
     const GO_DUMP: &str = include_str!("../testdata/go-identity.pem");
     const GO_NODE_ID: &str = "123tRdwfDZbVeCxX117eztrC2GLZP3hPWixgAphjoQoCoW7V51G";
+
+    #[test]
+    fn response_chain_requires_valid_signatures_and_expected_node_id() {
+        let identity = Identity::generate_signed().unwrap();
+        let chain: Vec<u8> = identity
+            .cert_chain()
+            .iter()
+            .flat_map(|c| c.as_ref().iter().copied())
+            .collect();
+        assert_eq!(
+            verified_leaf(&chain, identity.node_id()).unwrap(),
+            identity.leaf_der().as_ref()
+        );
+        assert!(verified_leaf(&chain, NodeId::ZERO).is_err());
+        assert!(verified_leaf(&[], identity.node_id()).is_err());
+        assert!(verified_leaf(identity.leaf_der().as_ref(), identity.node_id()).is_err());
+        assert!(verified_leaf(&chain[..chain.len() - 1], identity.node_id()).is_err());
+        let mut corrupt = chain.clone();
+        let last = corrupt.len() - 1;
+        corrupt[last] ^= 1;
+        assert!(verified_leaf(&corrupt, identity.node_id()).is_err());
+        let mut trailing = chain;
+        trailing.push(0);
+        assert!(verified_leaf(&trailing, identity.node_id()).is_err());
+    }
 
     #[test]
     fn known_ids_roundtrip() {

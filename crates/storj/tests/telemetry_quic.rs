@@ -23,9 +23,19 @@ fn observer(mode: TransportMode) -> (Config, Arc<Mutex<Vec<TelemetryEvent>>>) {
 }
 
 #[tokio::test]
-async fn quic_remote_upload_download_and_multipart() {
-    for mode in [TransportMode::Quic, TransportMode::Auto] {
-        let mock = MockSatellite::start_with_quic(true).await;
+async fn transports_remote_upload_download_and_multipart() {
+    for (mode, noise) in [
+        (TransportMode::Quic, None),
+        (TransportMode::Auto, None),
+        (TransportMode::Noise, Some(1)),
+        (TransportMode::Noise, Some(2)),
+        (TransportMode::Noise, None),
+    ] {
+        let mock = if let Some(protocol) = noise {
+            MockSatellite::start_with_noise(protocol).await
+        } else {
+            MockSatellite::start_with_quic(mode != TransportMode::Noise).await
+        };
         let (config, events) = observer(mode);
         let project = Project::open_with_config(&mock.access(), config)
             .await
@@ -74,6 +84,7 @@ async fn quic_remote_upload_download_and_multipart() {
         let events = events.lock().unwrap();
         let mut operations = Vec::new();
         let mut connections = 0;
+        let mut noise_connections = 0;
         for event in events.iter() {
             match event {
                 TelemetryEvent::Connection {
@@ -81,7 +92,17 @@ async fn quic_remote_upload_download_and_multipart() {
                     outcome: Outcome::Success,
                     ..
                 } => {
-                    assert_eq!(*transport, TransportKind::Quic);
+                    if mode == TransportMode::Noise {
+                        assert!(matches!(
+                            transport,
+                            TransportKind::Noise | TransportKind::Tcp
+                        ));
+                        if *transport == TransportKind::Noise {
+                            noise_connections += 1;
+                        }
+                    } else {
+                        assert_eq!(*transport, TransportKind::Quic);
+                    }
                     connections += 1;
                 }
                 TelemetryEvent::Transfer {
@@ -103,8 +124,17 @@ async fn quic_remote_upload_download_and_multipart() {
         }
         assert!(
             connections >= 5,
-            "satellite and multiple storage nodes must use QUIC"
+            "satellite and multiple storage nodes must connect"
         );
+        if noise.is_some() {
+            assert!(
+                noise_connections >= 4,
+                "piece transfers must use the Noise-only listeners"
+            );
+            assert!(connections > noise_connections, "metadata must use TLS");
+        } else {
+            assert_eq!(noise_connections, 0);
+        }
         assert_eq!(
             operations,
             [

@@ -24,6 +24,7 @@ use tokio::task::JoinHandle;
 pub struct MockStorageNode {
     identity: Identity,
     address: String,
+    noise_info: Option<storj_proto::noise::NoiseInfo>,
     delay: Arc<Mutex<Duration>>,
     fail_next: Arc<Mutex<bool>>,
     fail_next_download: Arc<Mutex<bool>>,
@@ -40,8 +41,21 @@ impl MockStorageNode {
 
     /// Start a storage node on a QUIC-only listener when enabled.
     pub async fn start_with_quic(satellite_cert: Vec<u8>, quic: bool) -> Self {
+        Self::start_with_transports(satellite_cert, quic, None).await
+    }
+
+    pub(crate) async fn start_with_transports(
+        satellite_cert: Vec<u8>,
+        quic: bool,
+        noise: Option<i32>,
+    ) -> Self {
         let identity = Identity::generate_signed().expect("mock SN identity");
-        let listener = Listener::bind(&identity, quic).await;
+        let (listener, noise_info) = if let Some(protocol) = noise {
+            let (listener, info) = Listener::bind_noise(protocol).await;
+            (listener, Some(info))
+        } else {
+            (Listener::bind(&identity, quic).await, None)
+        };
         let addr = listener.local_addr().expect("sn local addr");
         let address = addr.to_string();
         let delay = Arc::new(Mutex::new(Duration::ZERO));
@@ -85,6 +99,7 @@ impl MockStorageNode {
         Self {
             identity,
             address,
+            noise_info,
             delay,
             fail_next,
             fail_next_download,
@@ -96,6 +111,10 @@ impl MockStorageNode {
     /// `host:port` for addressed order limits.
     pub fn address(&self) -> &str {
         &self.address
+    }
+
+    pub(crate) fn noise_info(&self) -> Option<storj_proto::noise::NoiseInfo> {
+        self.noise_info.clone()
     }
 
     /// Node identity (NodeID + CA for order limits / piece hashes).
@@ -292,7 +311,11 @@ async fn serve_upload(
     sign_piece_hash_node(&mut sn_hash, sn)?;
     let resp = PieceUploadResponse {
         done: Some(sn_hash),
-        node_certchain: Vec::new(),
+        node_certchain: sn
+            .cert_chain()
+            .iter()
+            .flat_map(|c| c.as_ref().iter().copied())
+            .collect(),
     };
     conn.write_packet(&Packet {
         stream_id,

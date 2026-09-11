@@ -25,7 +25,7 @@ use crate::{Error, Result};
 pub struct SnTransport {
     /// Established DRPC connection. `None` while a piece RPC owns it.
     pub conn: Option<Conn<Transport>>,
-    /// Storage-node leaf certificate DER from the handshake.
+    /// Storage-node leaf certificate DER from TLS; empty on Noise connections.
     pub peer_cert: Vec<u8>,
 }
 
@@ -43,6 +43,8 @@ pub struct PieceAssignment {
     pub address: String,
     /// Storage-node id (order limit / NodeID pin).
     pub node_id: NodeId,
+    /// Noise key advertised by the authenticated satellite, if supported.
+    pub noise_info: Option<storj_proto::noise::NoiseInfo>,
     /// Placement tags for [`cohort_requirements::Requirement::Withhold`].
     pub tags: HashMap<String, Vec<u8>>,
 }
@@ -65,6 +67,7 @@ impl PieceAssignment {
             limit,
             address,
             node_id,
+            noise_info: addressed.storage_node_address.and_then(|a| a.noise_info),
             tags: addressed.tags,
         })
     }
@@ -196,6 +199,7 @@ pub async fn dial_sn(
         timeout,
         message_timeout,
         &ConnectionOptions::default(),
+        None,
     )
     .await
 }
@@ -208,16 +212,30 @@ pub async fn dial_sn_with_options(
     timeout: Duration,
     message_timeout: Duration,
     options: &ConnectionOptions,
+    noise_info: Option<&storj_proto::noise::NoiseInfo>,
 ) -> Result<SnTransport> {
-    let transport = dial(
-        identity,
-        node_id,
-        address,
-        options.mode,
-        timeout,
-        options.telemetry.as_ref(),
-    )
-    .await
+    let transport = if options.mode == storj_rpc::transport::TransportMode::Noise
+        && let Some(info) = noise_info.filter(|i| i.proto != 0 || !i.public_key.is_empty())
+    {
+        storj_rpc::transport::dial_noise(
+            address,
+            info.proto,
+            &info.public_key,
+            timeout,
+            options.telemetry.as_ref(),
+        )
+        .await
+    } else {
+        dial(
+            identity,
+            node_id,
+            address,
+            options.mode,
+            timeout,
+            options.telemetry.as_ref(),
+        )
+        .await
+    }
     .map_err(|e| {
         if e.kind() == std::io::ErrorKind::TimedOut {
             Error::DialTimeout
@@ -468,6 +486,7 @@ async fn upload_one_piece(
                 dial_timeout,
                 message_timeout,
                 &connection_options,
+                asg.noise_info.as_ref(),
             )
             .await
         })
@@ -547,6 +566,46 @@ async fn put_piece(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn invalid_noise_advertisement_does_not_downgrade_to_tls() {
+        use storj_rpc::{
+            telemetry::{Outcome, Telemetry, TelemetryEvent},
+            transport::{TransportKind, TransportMode},
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = events.clone();
+        let options = ConnectionOptions {
+            mode: TransportMode::Noise,
+            telemetry: Some(Telemetry::new(move |event| {
+                sink.lock().unwrap().push(event)
+            })),
+        };
+        let info = storj_proto::noise::NoiseInfo {
+            proto: 99,
+            public_key: vec![9; 32],
+        };
+        let result = dial_sn_with_options(
+            &Identity::generate().unwrap(),
+            NodeId::ZERO,
+            &listener.local_addr().unwrap().to_string(),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            &options,
+            Some(&info),
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(matches!(
+            events.lock().unwrap().as_slice(),
+            [TelemetryEvent::Connection {
+                transport: TransportKind::Noise,
+                outcome: Outcome::Error,
+                ..
+            }]
+        ));
+    }
 
     fn tags(pairs: &[(&str, &str)]) -> HashMap<String, Vec<u8>> {
         pairs

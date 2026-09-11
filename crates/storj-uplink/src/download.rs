@@ -517,6 +517,7 @@ async fn download_one_piece(
                 dial_timeout,
                 message_timeout,
                 &connection_options,
+                asg.noise_info.as_ref(),
             )
             .await
         })

@@ -71,7 +71,7 @@ cargo run -p storj --example walkthrough -- "$STORJ_ACCESS"
 `commit()` is the only path that publishes an upload. Dropping `Upload` without
 `commit` aborts. `poll_shutdown` does not commit.
 
-## QUIC and telemetry
+## Network transports and telemetry
 
 Configure both satellite and storage-node connections with `Config::transport`:
 `Tcp` (the default), `Quic` (QUIC only), or `Auto`. Auto gives QUIC a 250 ms
@@ -79,6 +79,16 @@ head start, then races TCP/TLS; a failed QUIC attempt starts TCP immediately.
 DNS, TLS authentication, and fallback share the configured dial deadline.
 Both transports pin the peer's Storj NodeID and present the client identity.
 QUIC carries DRPC directly with the `storj` ALPN, using Quinn and TLS 1.3.
+
+`TransportMode::Noise` selects TCP with Noise IK for storage-node uploads and
+downloads when the authenticated satellite advertises a Noise key. Metadata
+calls and nodes without an advertised key use TCP/TLS. Invalid keys, unsupported
+protocols, or failed Noise handshakes fail the dial without a TLS downgrade.
+Both advertised ciphers (ChaCha20-Poly1305 and AES-GCM, with X25519/BLAKE2b) are
+supported. The handshake completes before application data is sent; 0-RTT and
+TCP Fast Open are not enabled. Upload response certificate chains are verified
+against the order limit's NodeID before checking the signed piece hash.
+Connection telemetry reports `TransportKind::Noise` for these connections.
 
 ```rust
 use storj::{Config, Telemetry, TransportMode};

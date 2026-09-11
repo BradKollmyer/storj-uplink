@@ -59,8 +59,9 @@ impl<T> Client<T> {
     /// Wrap an established SN connection.
     ///
     /// `satellite_cert_der` verifies order limits. `peer_cert_der` is the storage
-    /// node's leaf certificate (`peer_certificates()[0]`) used to verify the
-    /// signed piece hash it returns. NodeID comes from the CA.
+    /// node's TLS leaf certificate (`peer_certificates()[0]`), or empty for Noise.
+    /// Upload responses carrying a chain are verified against the order limit's
+    /// NodeID and supply their own leaf for verifying the signed piece hash.
     #[must_use]
     pub fn new(conn: Conn<T>, satellite_cert_der: Vec<u8>, peer_cert_der: Vec<u8>) -> Self {
         Self {
@@ -217,7 +218,25 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Client<T> {
         let sn_hash = resp
             .done
             .ok_or_else(|| Error::protocol("expected piece hash"))?;
-        verify_sn_piece_hash(&sn_hash, limit, digest, self.hash_algo, &self.peer_cert_der)?;
+        // Noise has no TLS certificate. Go includes its identity chain in the
+        // response; validate every signature and the order limit's NodeID before
+        // trusting that leaf for the piece hash. Also validate supplied chains
+        // on TLS/QUIC, matching Go's preference for the response identity.
+        let leaf = if resp.node_certchain.is_empty() {
+            self.peer_cert_der.as_slice()
+        } else {
+            let id = limit
+                .storage_node_id
+                .as_slice()
+                .try_into()
+                .map_err(|_| Error::protocol("storage node id is not 32 bytes"))?;
+            storj_rpc::identity::verified_leaf(
+                &resp.node_certchain,
+                storj_rpc::NodeId::from_bytes(id),
+            )
+            .map_err(|e| Error::protocol(e.to_string()))?
+        };
+        verify_sn_piece_hash(&sn_hash, limit, digest, self.hash_algo, leaf)?;
         Ok(sn_hash)
     }
 

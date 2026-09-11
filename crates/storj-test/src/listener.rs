@@ -16,8 +16,30 @@ pub(crate) type Incoming = Pin<Box<dyn Future<Output = io::Result<Stream>> + Sen
 pub(crate) enum Listener {
     Tcp(tokio::net::TcpListener, tokio_rustls::TlsAcceptor),
     Quic(quinn::Endpoint),
+    Noise(tokio::net::TcpListener, i32, Vec<u8>),
 }
 impl Listener {
+    pub(crate) async fn bind_noise(protocol: i32) -> (Self, storj_proto::noise::NoiseInfo) {
+        let name = match protocol {
+            1 => "Noise_IK_25519_ChaChaPoly_BLAKE2b",
+            2 => "Noise_IK_25519_AESGCM_BLAKE2b",
+            _ => panic!("unsupported test protocol"),
+        };
+        let key = snow::Builder::new(name.parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        (
+            Self::Noise(
+                tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap(),
+                protocol,
+                key.private,
+            ),
+            storj_proto::noise::NoiseInfo {
+                proto: protocol,
+                public_key: key.public,
+            },
+        )
+    }
     pub(crate) async fn bind(identity: &Identity, quic: bool) -> Self {
         let mut tls = storj_rpc::server_config(identity).unwrap();
         if quic {
@@ -36,11 +58,29 @@ impl Listener {
         match self {
             Self::Tcp(l, _) => l.local_addr(),
             Self::Quic(e) => e.local_addr(),
+            Self::Noise(l, _, _) => l.local_addr(),
         }
     }
     // Handshake in the connection task so failed/slow peers cannot stop accepts.
     pub(crate) async fn accept(&self) -> io::Result<Incoming> {
         match self {
+            Self::Noise(l, protocol, key) => {
+                let (mut tcp, _) = l.accept().await?;
+                let protocol = *protocol;
+                let key = key.clone();
+                Ok(Box::pin(async move {
+                    use tokio::io::AsyncReadExt;
+                    let mut prefix = [0; 8];
+                    tcp.read_exact(&mut prefix).await?;
+                    if &prefix != storj_rpc::noise::HEADER {
+                        return Err(io::Error::other("expected Noise prefix"));
+                    }
+                    Ok(
+                        Box::new(storj_rpc::noise::NoiseStream::accept(tcp, protocol, &key).await?)
+                            as Stream,
+                    )
+                }))
+            }
             Self::Tcp(l, a) => {
                 let (mut tcp, _) = l.accept().await?;
                 let a = a.clone();

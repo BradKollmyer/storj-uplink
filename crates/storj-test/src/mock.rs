@@ -159,6 +159,15 @@ impl MockSatellite {
 
     /// Start satellite and storage nodes on QUIC-only listeners when enabled.
     pub async fn start_with_quic(quic: bool) -> Self {
+        Self::start_with_transports(quic, None).await
+    }
+
+    /// Start TLS metadata and Noise-only storage nodes using protocol 1 or 2.
+    pub async fn start_with_noise(protocol: i32) -> Self {
+        Self::start_with_transports(false, Some(protocol)).await
+    }
+
+    async fn start_with_transports(quic: bool, noise: Option<i32>) -> Self {
         // Signed identity: [leaf, CA, signer], as production satellites present.
         let identity = Identity::generate_signed().expect("mock satellite identity");
         let listener = Listener::bind(&identity, quic).await;
@@ -175,7 +184,7 @@ impl MockSatellite {
         let mut sns = Vec::new();
         for _ in 0..6 {
             sns.push(Arc::new(
-                MockStorageNode::start_with_quic(sat_cert.clone(), quic).await,
+                MockStorageNode::start_with_transports(sat_cert.clone(), quic, noise).await,
             ));
         }
 
@@ -2014,6 +2023,7 @@ fn signed_limit(
         limit: Some(ol),
         storage_node_address: Some(NodeAddress {
             address: sn.address().to_string(),
+            noise_info: sn.noise_info(),
             ..Default::default()
         }),
         tags,

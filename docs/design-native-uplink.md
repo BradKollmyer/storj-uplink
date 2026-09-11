@@ -232,7 +232,7 @@ Crate root (2025): `Bucket`, `Error`, `Object`, `Project`, `Config`, `Encryption
 - FFI *out* (exposing a C ABI). This crate *consumes* the network; it does not replace `uplink-c`.
 - Source compatibility with crates.io `uplink` 0.11.0, and publishing under the `uplink` crate name.
 - Bucket-notification configuration RPCs. Object Lock **RPCs** and `Permission` lock bits **are** in v1.0 (K19).
-- Noise transport (follow-on). TCP/TLS is the default; QUIC and automatic TCP fallback are available through `Config::transport`.
+- TCP Fast Open and Noise 0-RTT. TCP/TLS is the default; QUIC, automatic TCP fallback, and opt-in Noise for advertised replay-safe storage-node endpoints are available through `Config::transport`.
 - Partner User-Agent attribution beyond a config string.
 
 ---
@@ -1384,7 +1384,7 @@ There is **no production-quality Rust DRPC** (`zeebo/drpc-rs` is marked incomple
 | `DRPC!!!1` | DRPC over TLS |
 | `DRPC!N!1` | DRPC over Noise IK |
 
-v1: **TLS only**. Noise (`NOISE_IK_25519_CHACHAPOLY_BLAKE2B`) is a v1.x item; satellites and nodes still speak TLS.
+The 1.0.0 release used TLS only. `TransportMode::Noise` now supports both advertised IK/X25519/BLAKE2b suites (ChaChaPoly and AESGCM) for storage-node Upload/Download. Satellite metadata and nodes without Noise advertisements use TLS. Invalid advertisements or failed Noise authentication do not trigger a TLS downgrade. Noise completes an empty-payload handshake before sending application data; TCP Fast Open and 0-RTT are not enabled. Upload response identity chains are verified and pinned to the order limit's NodeID before checking piece signatures. Snow handles the handshake and ciphers; a bounded record layer supports Go noiseconn's 65535-byte plaintext records, including the 16-byte authentication tag.
 
 ### Identity and TLS
 
@@ -1715,7 +1715,7 @@ CLA: none assumed; DCO sign-off in CONTRIBUTING.
 | R9 | Encryption block size comment/code disagreement (`twice` vs `29*256`) | Medium | Follow **code** (7424); vector against a Go-uploaded object |
 | R10 | Object Lock caveats stripped on `share()`, or lock RPCs omitted | Low | Emit Go v1.14 granular lock bits from `Permission`; implement lock RPCs in v1.0 (K19); preserve unknown caveat bytes |
 | R11 | Existing `uplink` crate name collision / user confusion | Low | README comparison table; K13: familiarity not source compatibility |
-| R12 | Incomplete Noise support vs SN that disable TLS | Low (2026: TLS still present) | Track Storj transport; add Noise before TLS removal |
+| R12 | Noise protocol drift | Low | Local Go interoperability tests cover both cipher suites and maximum-size records; malformed/authentication failure tests cover the record layer |
 
 ---
 
@@ -1725,7 +1725,7 @@ None remaining as product decisions.
 
 **Watch (not product questions):**
 
-- **Noise timeline** — Noise remains a follow-on; current transports are TCP/TLS and QUIC/TLS 1.3.
+- **Noise** — opt-in for advertised storage-node Upload/Download endpoints, with local connection telemetry. Metadata continues to use TLS. Go interoperability covers both cipher suites; early data and TCP Fast Open remain deferred.
 - **QUIC** — implemented with Quinn, Storj ALPN and NodeID pinning; `Auto` races TCP after a 250 ms head start within one dial deadline. TCP remains the default, matching Go's disabled-by-default QUIC rollout.
 
 **Resolved (not open):**
@@ -1971,7 +1971,7 @@ Incremental, each PR independently reviewable and mergeable. First PRs leave the
 - **Depends on:** PR 6 only (Access + HTTP). **Not** PR 21.
 - **Changes:** HTTPS Auth client; `register_gateway_access`; `share_url`. Feature `edge`. Can land anytime after grants work.
 
-Later: Noise, `object_store`. QUIC and local telemetry callbacks are implemented. Bucket notifications remain a non-goal.
+Later: `object_store`. QUIC, Noise piece transfers, and local telemetry callbacks are implemented. Bucket notifications remain a non-goal.
 
 ```
 PR1 → PR2 → PR3 → PR4 → PR6 ──────────────────────────────────────────┐

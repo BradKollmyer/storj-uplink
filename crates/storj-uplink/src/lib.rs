@@ -68,7 +68,7 @@ pub enum Error {
     /// Requested byte count exceeds the signed transfer allowance.
     #[error("download size {size} exceeds order byte limit {limit} (offset {offset})")]
     DownloadLimit { offset: i64, size: i64, limit: i64 },
-    /// TCP/TLS connection establishment exceeded its deadline.
+    /// Connection establishment and authentication exceeded the dial deadline.
     #[error("storage-node dial timed out")]
     DialTimeout,
     /// Too few pieces were downloaded; retains all node failures.

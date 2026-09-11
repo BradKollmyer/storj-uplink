@@ -9,6 +9,7 @@ publish = false
 homepage.workspace = true
 
 [dependencies]
+snow.workspace = true
 quinn.workspace = true
 prost.workspace = true
 prost-types.workspace = true

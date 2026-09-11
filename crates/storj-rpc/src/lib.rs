@@ -10,6 +10,7 @@ pub mod conn;
 pub mod frame;
 pub mod identity;
 pub mod known_ids;
+pub mod noise;
 pub mod telemetry;
 pub mod tls;
 pub mod transport;

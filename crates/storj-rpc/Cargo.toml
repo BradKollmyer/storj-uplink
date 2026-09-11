@@ -19,6 +19,8 @@ rcgen.workspace = true
 rustls.workspace = true
 tokio-rustls.workspace = true
 quinn.workspace = true
+snow.workspace = true
+zeroize.workspace = true
 futures-util.workspace = true
 x509-parser.workspace = true
 

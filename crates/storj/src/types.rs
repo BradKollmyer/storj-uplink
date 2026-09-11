@@ -237,6 +237,7 @@ pub struct Part {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Config {
     /// Transport for satellite and storage-node connections. Defaults to TCP/TLS.
+    /// `Noise` uses advertised keys for piece transfers and TCP/TLS for metadata.
     pub transport: storj_rpc::transport::TransportMode,
     /// Optional local observer for connection and transfer events.
     pub telemetry: Option<storj_rpc::telemetry::Telemetry>,

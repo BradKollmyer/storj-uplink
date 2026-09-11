@@ -1,4 +1,4 @@
-//! Authenticated TCP/TLS and QUIC byte streams carrying Storj DRPC.
+//! Authenticated TCP/TLS, QUIC and Noise byte streams carrying Storj DRPC.
 
 use crate::telemetry::{Outcome, Telemetry, TelemetryEvent};
 use crate::{Identity, NodeId, client_config, write_tls_mux_prefix};
@@ -25,6 +25,10 @@ pub enum TransportMode {
     Quic,
     /// Prefer QUIC, allowing TCP/TLS to race after 250 ms.
     Auto,
+    /// Noise for replay-safe storage-node RPCs with a satellite-advertised key.
+    /// Uses TCP/TLS for metadata and nodes without Noise support. An advertised
+    /// key that fails authentication is an error, with no TLS downgrade.
+    Noise,
 }
 
 /// Actual wire transport selected for a connection.
@@ -34,6 +38,8 @@ pub enum TransportKind {
     Tcp,
     /// QUIC over UDP.
     Quic,
+    /// TCP with Noise IK, authenticated by a satellite-advertised public key.
+    Noise,
 }
 
 /// Shared transport selection and observer for satellite and storage-node dials.
@@ -46,7 +52,7 @@ pub struct ConnectionOptions {
 trait Io: AsyncRead + AsyncWrite + Unpin + Send + Sync {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send + Sync> Io for T {}
 
-/// A connected stream and the authenticated peer's leaf certificate.
+/// A connected stream and the peer's TLS leaf certificate (empty for Noise).
 pub struct Transport {
     io: Box<dyn Io>,
     pub peer_cert: Vec<u8>,
@@ -247,6 +253,7 @@ async fn attempt(
         match kind {
             TransportKind::Tcp => tcp(identity, node, address).await,
             TransportKind::Quic => quic(identity, node, address).await,
+            TransportKind::Noise => unreachable!("Noise uses dial_noise with an advertised key"),
         }
     };
     let result = if let Some(deadline) = deadline {
@@ -280,7 +287,7 @@ pub async fn dial(
     let deadline = tokio::time::Instant::now().checked_add(timeout);
     let connect = async {
         match mode {
-            TransportMode::Tcp => {
+            TransportMode::Tcp | TransportMode::Noise => {
                 attempt(
                     identity,
                     node,
@@ -335,11 +342,83 @@ pub async fn dial(
     connect.await
 }
 
+/// Dial a replay-safe endpoint using a key obtained over an authenticated
+/// satellite connection. Noise authenticates this key; it supplies no TLS leaf.
+pub async fn dial_noise(
+    address: &str,
+    protocol: i32,
+    public_key: &[u8],
+    timeout: Duration,
+    telemetry: Option<&Telemetry>,
+) -> io::Result<Transport> {
+    let mut event = Attempt {
+        telemetry,
+        kind: TransportKind::Noise,
+        start: Instant::now(),
+        outcome: Outcome::Cancelled,
+    };
+    let connect = async {
+        let tcp = TcpStream::connect(address).await?;
+        tcp.set_nodelay(true)?;
+        let io = crate::noise::NoiseStream::connect(tcp, protocol, public_key).await?;
+        Ok(Transport {
+            io: Box::new(io),
+            peer_cert: Vec::new(),
+            kind: TransportKind::Noise,
+        })
+    };
+    let result = if let Some(deadline) = tokio::time::Instant::now().checked_add(timeout) {
+        tokio::time::timeout_at(deadline, connect)
+            .await
+            .unwrap_or_else(|_| {
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "Noise connection dial timed out",
+                ))
+            })
+    } else {
+        connect.await
+    };
+    event.outcome = if result.is_ok() {
+        Outcome::Success
+    } else {
+        Outcome::Error
+    };
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Mutex;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn stalled_noise_handshake_obeys_deadline_and_reports_error() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone();
+        let telemetry = Telemetry::new(move |event| sink.lock().unwrap().push(event));
+        let error = dial_noise(
+            &listener.local_addr().unwrap().to_string(),
+            1,
+            &[9; 32],
+            Duration::from_millis(50),
+            Some(&telemetry),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(matches!(
+            events.lock().unwrap().as_slice(),
+            [TelemetryEvent::Connection {
+                transport: TransportKind::Noise,
+                outcome: Outcome::Error,
+                ..
+            }]
+        ));
+    }
 
     fn quic_server(identity: &Identity) -> quinn::Endpoint {
         let mut tls = crate::server_config(identity).unwrap();
