@@ -54,6 +54,8 @@ published so the facade can resolve on crates.io; they are not a stable API.
 
 ### Fixed
 
+- Probe previously failing encryption blocks when retrying malformed pieces
+  to avoid repeated full-segment decoding for late corruption.
 - Treat `ETAG_NONCE` / `CHECKSUM_NONCE` and the unpublished `storj-test` mock
   as CodeQL hard-coded-crypto false positives, matching `ZERO_NONCE`.
 - Download a remote segment successfully when one of the initially fetched

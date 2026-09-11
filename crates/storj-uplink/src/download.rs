@@ -245,6 +245,13 @@ pub struct RemoteDecrypt<'a> {
 
 /// Decrypt a (possibly ranged) remote segment after RS decode.
 pub fn decrypt_remote(job: RemoteDecrypt<'_>) -> Result<Vec<u8>> {
+    decrypt_remote_tracking_failure(job, &mut None)
+}
+
+fn decrypt_remote_tracking_failure(
+    job: RemoteDecrypt<'_>,
+    failed_block: &mut Option<i64>,
+) -> Result<Vec<u8>> {
     if job.plain_len <= 0 || job.plain_size <= 0 {
         return Ok(Vec::new());
     }
@@ -276,7 +283,16 @@ pub fn decrypt_remote(job: RemoteDecrypt<'_>) -> Result<Vec<u8>> {
     }
     let local = want_start - job.decoded_offset;
     let blocks = &job.decoded[local..local + want_len];
-    let decrypted = transform_blocks(decrypter.as_ref(), blocks, first_block)?;
+    let mut decrypted = Vec::with_capacity((blocks.len() / enc_block) * plain_block);
+    for (block_num, chunk) in (first_block..).zip(blocks.chunks(enc_block)) {
+        if let Err(err) = decrypter.transform_into(chunk, block_num, &mut decrypted) {
+            let err = Error::Encryption(err);
+            if is_content_auth_failure(&err) {
+                *failed_block = Some(block_num);
+            }
+            return Err(err);
+        }
+    }
     let block_plain_start = first_block.saturating_mul(plain_block as i64);
     let skip = usize::try_from(job.plain_start.saturating_sub(block_plain_start)).unwrap_or(0);
     let take = usize::try_from(job.plain_len).unwrap_or(0);
@@ -346,22 +362,44 @@ pub fn reconstruct_remote(
         )));
     }
     let probe_first = shares.len() > rs.k;
+    let mut failed_blocks = Vec::new();
     let mut last_err: Option<Error> = None;
     for combo in k_subsets(shares.len(), rs.k) {
         let subset: Vec<(i32, &[u8])> = combo
             .iter()
             .map(|&i| (shares[i].0, shares[i].1.as_slice()))
             .collect();
-        if probe_first && !probe_share_set(&subset, rs, params) {
+        if probe_first
+            && (!probe_share_set(&subset, rs, params, None)
+                || failed_blocks
+                    .iter()
+                    .any(|&block| !probe_share_set(&subset, rs, params, Some(block))))
+        {
             last_err = Some(content_auth_error());
             continue;
         }
-        match decode_encrypted_slices(&subset, rs, 0, None) {
-            Ok(decoded) => match decrypt_remote(params.as_remote(&decoded)) {
-                Ok(plain) => return Ok(plain),
-                Err(e) => last_err = Some(e),
-            },
-            Err(e) => last_err = Some(e),
+        #[cfg(test)]
+        tests::FULL_DECODE_COUNT.with(|count| count.set(count.get() + 1));
+        let decoded = match decode_encrypted_slices(&subset, rs, 0, None) {
+            Ok(decoded) => decoded,
+            Err(err) => {
+                last_err = Some(err);
+                continue;
+            }
+        };
+        let mut failed_block = None;
+        match decrypt_remote_tracking_failure(params.as_remote(&decoded), &mut failed_block) {
+            Ok(plain) => return Ok(plain),
+            Err(err) => {
+                if let Some(block) = failed_block {
+                    // A valid first block says nothing about later corruption. Keep
+                    // every failing block as a cheap filter for subsequent k-sets.
+                    failed_blocks.push(block);
+                } else {
+                    return Err(err);
+                }
+                last_err = Some(err);
+            }
         }
     }
     Err(last_err.unwrap_or_else(content_auth_error))
@@ -383,9 +421,14 @@ pub fn is_content_auth_failure(err: &Error) -> bool {
     )
 }
 
-/// Authenticate the first encryption block of `subset` without decoding the
-/// whole segment. A matching AEAD tag means this `k`-set is the right one.
-fn probe_share_set(subset: &[(i32, &[u8])], rs: &Redundancy, params: &DecryptParams<'_>) -> bool {
+/// Authenticate one block without decoding the whole segment. Success only
+/// validates that block; the complete requested range must still authenticate.
+fn probe_share_set(
+    subset: &[(i32, &[u8])],
+    rs: &Redundancy,
+    params: &DecryptParams<'_>,
+    block: Option<i64>,
+) -> bool {
     if params.plain_len <= 0 || params.plain_size <= 0 {
         return true;
     }
@@ -407,6 +450,7 @@ fn probe_share_set(subset: &[(i32, &[u8])], rs: &Redundancy, params: &DecryptPar
     if nblocks <= 0 {
         return true;
     }
+    let first_block = block.unwrap_or(first_block);
     let want_start = usize::try_from(first_block)
         .unwrap_or(0)
         .saturating_mul(enc_block);
@@ -918,6 +962,9 @@ async fn get_piece(
 
 #[cfg(test)]
 mod tests {
+    std::thread_local! {
+        pub(super) static FULL_DECODE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
 
     fn failure(piece_num: i32, error: Error) -> PieceDownloadFailure {
         PieceDownloadFailure {
@@ -1267,6 +1314,81 @@ mod tests {
         ];
         let got = reconstruct_remote(&with_extra, &rs, &params).unwrap();
         assert_eq!(got, remote);
+    }
+
+    #[test]
+    fn late_corruption_probes_failed_blocks_before_full_decode() {
+        let rs = Redundancy {
+            k: 29,
+            m: 29,
+            o: 31,
+            n: 31,
+            share_size: 256,
+        };
+        let remote = vec![7; 256 * 1024];
+        let key = random_key();
+        let nonce = random_nonce();
+        for cipher in [CipherSuite::AES_GCM, CipherSuite::SECRET_BOX] {
+            let encrypted =
+                encrypt_remote(&remote, cipher, &key, &nonce, DEFAULT_ENCRYPTED_BLOCK_SIZE)
+                    .unwrap();
+            let clean = encode_pieces(&encrypted, &rs).unwrap();
+            for second_bad in [1, rs.k] {
+                let mut pieces = clean.clone();
+                // Two different late blocks exercise learning more than one
+                // failing block, including corruption in the first extra piece.
+                let stripes = encrypted.len() / rs.stripe_size();
+                pieces[0][(stripes / 3) * rs.share_size] ^= 0xff;
+                pieces[second_bad][(2 * stripes / 3) * rs.share_size] ^= 0xff;
+                for ranged in [false, true] {
+                    let (start, len) = if ranged {
+                        (remote.len() / 5, remote.len() * 3 / 4)
+                    } else {
+                        (0, remote.len())
+                    };
+                    let decrypter =
+                        new_decrypter(cipher, &key, &nonce, DEFAULT_ENCRYPTED_BLOCK_SIZE).unwrap();
+                    let (offset, size) = piece_byte_range(
+                        start as i64,
+                        len as i64,
+                        decrypter.out_block_size(),
+                        decrypter.in_block_size(),
+                        &rs,
+                    );
+                    let shares: Vec<_> = pieces
+                        .iter()
+                        .enumerate()
+                        .map(|(i, p)| {
+                            (
+                                i as i32,
+                                p[offset as usize..(offset + size) as usize].to_vec(),
+                            )
+                        })
+                        .collect();
+                    let params = DecryptParams {
+                        decoded_offset: offset as usize * rs.k,
+                        encrypted_size: encrypted.len(),
+                        cipher,
+                        key: &key,
+                        nonce: &nonce,
+                        encrypted_block_size: DEFAULT_ENCRYPTED_BLOCK_SIZE,
+                        plain_start: start as i64,
+                        plain_len: len as i64,
+                        plain_size: remote.len() as i64,
+                    };
+                    FULL_DECODE_COUNT.set(0);
+                    assert_eq!(
+                        reconstruct_remote(&shares, &rs, &params).unwrap(),
+                        remote[start..start + len]
+                    );
+                    assert!(
+                        FULL_DECODE_COUNT.get() <= 3,
+                        "two corrupt blocks should need at most two failed full decodes and one successful decode, got {}",
+                        FULL_DECODE_COUNT.get()
+                    );
+                }
+            }
+        }
     }
 
     #[test]
