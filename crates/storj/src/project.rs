@@ -67,6 +67,7 @@ impl Project {
                 connection_options: storj_rpc::transport::ConnectionOptions {
                     mode: config.transport,
                     telemetry: config.telemetry.clone(),
+                    network: config.network.clone(),
                 },
                 metainfo,
                 store,

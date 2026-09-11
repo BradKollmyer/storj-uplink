@@ -46,6 +46,8 @@ rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "aws_lc_rs"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["tls12", "aws_lc_rs"] }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"] }
+tokio-tfo = "0.4.3"
+socket2 = { version = "0.6", features = ["all"] }
 snow = { version = "0.10", default-features = false, features = ["std", "default-resolver", "use-getrandom", "use-curve25519", "use-aes-gcm", "use-chacha20poly1305", "use-blake2", "risky-raw-split"] }
 x509-parser = "0.18"
 reed-solomon-erasure = "6"

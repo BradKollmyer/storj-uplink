@@ -21,7 +21,7 @@ use storj_proto::metainfo::{
     batch_request_item, batch_response_item,
 };
 use storj_proto::rpc;
-use storj_rpc::transport::{ConnectionOptions, Transport, dial};
+use storj_rpc::transport::{ConnectionOptions, Transport, dial_with_options};
 use storj_rpc::{Conn, Identity, NodeUrl, parse_node_url};
 
 use crate::bucket::{bucket_from_list_item, bucket_from_proto, proto_timestamp};
@@ -131,6 +131,7 @@ impl MetainfoClient {
             connection_options: ConnectionOptions {
                 mode: config.transport,
                 telemetry: config.telemetry.clone(),
+                network: config.network.clone(),
             },
             satellite_cert: Mutex::new(Vec::new()),
             idle: std::sync::Mutex::new(Vec::new()),
@@ -193,13 +194,12 @@ impl MetainfoClient {
     }
 
     async fn dial(&self) -> Result<Conn<SatelliteStream>> {
-        let transport = dial(
+        let transport = dial_with_options(
             &self.identity,
             self.node.id,
             &self.node.address,
-            self.connection_options.mode,
             self.dial_timeout,
-            self.connection_options.telemetry.as_ref(),
+            &self.connection_options,
         )
         .await?;
         *self.satellite_cert.lock().await = transport.peer_cert.clone();

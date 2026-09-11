@@ -11,7 +11,7 @@ use storj_proto::metainfo::{
     AddressedOrderLimit, CohortRequirements, SegmentPieceUploadResult, cohort_requirements,
 };
 use storj_proto::orders::OrderLimit;
-use storj_rpc::transport::{ConnectionOptions, Transport, dial};
+use storj_rpc::transport::{ConnectionOptions, Transport, dial_with_options};
 use storj_rpc::{Conn, Identity, NodeId};
 use tokio::task::JoinSet;
 
@@ -45,6 +45,8 @@ pub struct PieceAssignment {
     pub node_id: NodeId,
     /// Noise key advertised by the authenticated satellite, if supported.
     pub noise_info: Option<storj_proto::noise::NoiseInfo>,
+    /// Satellite-advertised Fast Open with duplicate-handshake suppression.
+    pub fast_open: bool,
     /// Placement tags for [`cohort_requirements::Requirement::Withhold`].
     pub tags: HashMap<String, Vec<u8>>,
 }
@@ -67,6 +69,10 @@ impl PieceAssignment {
             limit,
             address,
             node_id,
+            fast_open: addressed
+                .storage_node_address
+                .as_ref()
+                .is_some_and(|a| a.debounce_limit >= 2 && a.features & 1 != 0),
             noise_info: addressed.storage_node_address.and_then(|a| a.noise_info),
             tags: addressed.tags,
         })
@@ -200,11 +206,13 @@ pub async fn dial_sn(
         message_timeout,
         &ConnectionOptions::default(),
         None,
+        false,
     )
     .await
 }
 
 /// Dial an authenticated storage-node stream using the configured transport.
+#[allow(clippy::too_many_arguments)]
 pub async fn dial_sn_with_options(
     identity: &Identity,
     node_id: NodeId,
@@ -213,28 +221,22 @@ pub async fn dial_sn_with_options(
     message_timeout: Duration,
     options: &ConnectionOptions,
     noise_info: Option<&storj_proto::noise::NoiseInfo>,
+    fast_open: bool,
 ) -> Result<SnTransport> {
     let transport = if options.mode == storj_rpc::transport::TransportMode::Noise
         && let Some(info) = noise_info.filter(|i| i.proto != 0 || !i.public_key.is_empty())
     {
-        storj_rpc::transport::dial_noise(
+        storj_rpc::transport::dial_noise_with_options(
             address,
             info.proto,
             &info.public_key,
             timeout,
-            options.telemetry.as_ref(),
+            options,
+            fast_open,
         )
         .await
     } else {
-        dial(
-            identity,
-            node_id,
-            address,
-            options.mode,
-            timeout,
-            options.telemetry.as_ref(),
-        )
-        .await
+        dial_with_options(identity, node_id, address, timeout, options).await
     }
     .map_err(|e| {
         if e.kind() == std::io::ErrorKind::TimedOut {
@@ -487,6 +489,7 @@ async fn upload_one_piece(
                 message_timeout,
                 &connection_options,
                 asg.noise_info.as_ref(),
+                asg.fast_open,
             )
             .await
         })
@@ -581,6 +584,7 @@ mod tests {
             telemetry: Some(Telemetry::new(move |event| {
                 sink.lock().unwrap().push(event)
             })),
+            ..Default::default()
         };
         let info = storj_proto::noise::NoiseInfo {
             proto: 99,
@@ -594,6 +598,7 @@ mod tests {
             Duration::from_secs(1),
             &options,
             Some(&info),
+            false,
         )
         .await;
         assert!(result.is_err());

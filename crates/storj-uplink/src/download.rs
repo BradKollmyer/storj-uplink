@@ -518,6 +518,7 @@ async fn download_one_piece(
                 message_timeout,
                 &connection_options,
                 asg.noise_info.as_ref(),
+                asg.fast_open,
             )
             .await
         })

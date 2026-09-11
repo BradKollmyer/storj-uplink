@@ -236,9 +236,11 @@ pub struct Part {
 /// Client configuration.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Config {
-    /// Transport for satellite and storage-node connections. Defaults to TCP/TLS.
+    /// Transport policy. Defaults to advertised Noise for pieces and TLS otherwise.
     /// `Noise` uses advertised keys for piece transfers and TCP/TLS for metadata.
     pub transport: storj_rpc::transport::TransportMode,
+    /// Early data, Fast Open, and best-effort TCP QoS controls.
+    pub network: storj_rpc::transport::NetworkOptions,
     /// Optional local observer for connection and transfer events.
     pub telemetry: Option<storj_rpc::telemetry::Telemetry>,
     /// Partner User-Agent (RFC 7231 §5.5.3). Sent as `RequestHeader.user_agent`.

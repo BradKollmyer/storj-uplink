@@ -19,7 +19,6 @@ use tokio::{
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum TransportMode {
     /// TCP with NodeID-pinned TLS; no UDP traffic.
-    #[default]
     Tcp,
     /// QUIC with NodeID-pinned TLS 1.3; no TCP fallback.
     Quic,
@@ -28,6 +27,7 @@ pub enum TransportMode {
     /// Noise for replay-safe storage-node RPCs with a satellite-advertised key.
     /// Uses TCP/TLS for metadata and nodes without Noise support. An advertised
     /// key that fails authentication is an error, with no TLS downgrade.
+    #[default]
     Noise,
 }
 
@@ -47,6 +47,31 @@ pub enum TransportKind {
 pub struct ConnectionOptions {
     pub mode: TransportMode,
     pub telemetry: Option<Telemetry>,
+    pub network: NetworkOptions,
+}
+
+/// TCP performance controls. Unsupported platform/kernel options are ignored.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NetworkOptions {
+    /// Put the first replay-safe piece RPC bytes in the Noise IK handshake.
+    pub noise_early_data: bool,
+    /// Race Fast Open against ordinary TCP only for nodes advertising support
+    /// and capacity to suppress at least two identical handshakes.
+    pub tcp_fast_open: bool,
+    /// Request Lower Effort DSCP on Linux TCP sockets, matching Go.
+    pub background_qos: bool,
+    /// Optional Linux TCP congestion controller; unavailable controllers are ignored.
+    pub congestion_control: Option<String>,
+}
+impl Default for NetworkOptions {
+    fn default() -> Self {
+        Self {
+            noise_early_data: true,
+            tcp_fast_open: true,
+            background_qos: true,
+            congestion_control: None,
+        }
+    }
 }
 
 trait Io: AsyncRead + AsyncWrite + Unpin + Send + Sync {}
@@ -126,8 +151,13 @@ fn host(address: &str) -> &str {
     address.rsplit_once(':').map_or(address, |(host, _)| host)
 }
 
-async fn tcp(identity: &Identity, node: NodeId, address: &str) -> io::Result<Transport> {
-    let mut tcp = TcpStream::connect(address).await?;
+async fn tcp(
+    identity: &Identity,
+    node: NodeId,
+    address: &str,
+    network: &NetworkOptions,
+) -> io::Result<Transport> {
+    let mut tcp = crate::socket::connect(address, network).await?;
     tcp.set_nodelay(true)?;
     write_tls_mux_prefix(&mut tcp).await?;
     let config = client_config(identity, node).map_err(io::Error::other)?;
@@ -218,15 +248,15 @@ async fn quic(identity: &Identity, node: NodeId, address: &str) -> io::Result<Tr
     Err(last)
 }
 
-struct Attempt<'a> {
-    telemetry: Option<&'a Telemetry>,
+struct Attempt {
+    telemetry: Option<Telemetry>,
     kind: TransportKind,
     start: Instant,
     outcome: Outcome,
 }
-impl Drop for Attempt<'_> {
+impl Drop for Attempt {
     fn drop(&mut self) {
-        if let Some(t) = self.telemetry {
+        if let Some(t) = self.telemetry.as_ref() {
             t.emit(TelemetryEvent::Connection {
                 transport: self.kind,
                 elapsed: self.start.elapsed(),
@@ -242,16 +272,17 @@ async fn attempt(
     kind: TransportKind,
     telemetry: Option<&Telemetry>,
     deadline: Option<tokio::time::Instant>,
+    network: &NetworkOptions,
 ) -> io::Result<Transport> {
     let mut event = Attempt {
-        telemetry,
+        telemetry: telemetry.cloned(),
         kind,
         start: Instant::now(),
         outcome: Outcome::Cancelled,
     };
     let connect = async {
         match kind {
-            TransportKind::Tcp => tcp(identity, node, address).await,
+            TransportKind::Tcp => tcp(identity, node, address, network).await,
             TransportKind::Quic => quic(identity, node, address).await,
             TransportKind::Noise => unreachable!("Noise uses dial_noise with an advertised key"),
         }
@@ -284,6 +315,31 @@ pub async fn dial(
     timeout: Duration,
     telemetry: Option<&Telemetry>,
 ) -> io::Result<Transport> {
+    dial_with_options(
+        identity,
+        node,
+        address,
+        timeout,
+        &ConnectionOptions {
+            mode,
+            telemetry: telemetry.cloned(),
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+/// Dial a metadata/TLS endpoint with TCP socket policy.
+pub async fn dial_with_options(
+    identity: &Identity,
+    node: NodeId,
+    address: &str,
+    timeout: Duration,
+    options: &ConnectionOptions,
+) -> io::Result<Transport> {
+    let mode = options.mode;
+    let telemetry = options.telemetry.as_ref();
+    let network = &options.network;
     let deadline = tokio::time::Instant::now().checked_add(timeout);
     let connect = async {
         match mode {
@@ -295,6 +351,7 @@ pub async fn dial(
                     TransportKind::Tcp,
                     telemetry,
                     deadline,
+                    network,
                 )
                 .await
             }
@@ -306,6 +363,7 @@ pub async fn dial(
                     TransportKind::Quic,
                     telemetry,
                     deadline,
+                    network,
                 )
                 .await
             }
@@ -317,10 +375,11 @@ pub async fn dial(
                     TransportKind::Quic,
                     telemetry,
                     deadline,
+                    network,
                 );
                 tokio::pin!(q);
                 tokio::select! {
-                    result = &mut q => match result { Ok(c) => return Ok(c), Err(_) => return attempt(identity, node, address, TransportKind::Tcp, telemetry, deadline).await },
+                    result = &mut q => match result { Ok(c) => return Ok(c), Err(_) => return attempt(identity, node, address, TransportKind::Tcp, telemetry, deadline, network).await },
                     _ = tokio::time::sleep(Duration::from_millis(250)) => {}
                 }
                 let t = attempt(
@@ -330,6 +389,7 @@ pub async fn dial(
                     TransportKind::Tcp,
                     telemetry,
                     deadline,
+                    network,
                 );
                 tokio::pin!(t);
                 tokio::select! {
@@ -352,7 +412,7 @@ pub async fn dial_noise(
     telemetry: Option<&Telemetry>,
 ) -> io::Result<Transport> {
     let mut event = Attempt {
-        telemetry,
+        telemetry: telemetry.cloned(),
         kind: TransportKind::Noise,
         start: Instant::now(),
         outcome: Outcome::Cancelled,
@@ -387,11 +447,314 @@ pub async fn dial_noise(
     result
 }
 
+type NoiseFuture = Pin<Box<dyn Future<Output = io::Result<Transport>> + Send + Sync>>;
+type NoiseStart = Box<dyn FnOnce(Vec<u8>) -> NoiseFuture + Send + Sync>;
+
+// The first write becomes IK payload. Subsequent I/O completes authentication;
+// only replay-safe Upload/Download connections are wrapped this way.
+struct DeferredNoise {
+    start: Option<NoiseStart>,
+    pending: Option<NoiseFuture>,
+    connected: Option<Transport>,
+    failed: bool,
+}
+impl DeferredNoise {
+    fn poll_connect(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.failed {
+            return Poll::Ready(Err(io::Error::other("Noise connection failed")));
+        }
+        if let Some(start) = self.start.take() {
+            self.pending = Some(start(Vec::new()));
+        }
+        if let Some(pending) = &mut self.pending {
+            match std::task::ready!(pending.as_mut().poll(cx)) {
+                Ok(io) => self.connected = Some(io),
+                Err(error) => {
+                    self.failed = true;
+                    self.pending = None;
+                    return Poll::Ready(Err(error));
+                }
+            }
+            self.pending = None;
+        }
+        Poll::Ready(Ok(()))
+    }
+}
+impl AsyncWrite for DeferredNoise {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        data: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        if data.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        if let Some(start) = self.start.take() {
+            let n = data.len().min(crate::noise::MAX_EARLY_DATA);
+            self.pending = Some(start(data[..n].to_vec()));
+            return Poll::Ready(Ok(n));
+        }
+        std::task::ready!(self.poll_connect(cx))?;
+        Pin::new(self.connected.as_mut().expect("connected")).poll_write(cx, data)
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        std::task::ready!(self.poll_connect(cx))?;
+        Pin::new(self.connected.as_mut().expect("connected")).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        std::task::ready!(self.poll_connect(cx))?;
+        Pin::new(self.connected.as_mut().expect("connected")).poll_shutdown(cx)
+    }
+}
+impl AsyncRead for DeferredNoise {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        out: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if out.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        std::task::ready!(self.poll_connect(cx))?;
+        Pin::new(self.connected.as_mut().expect("connected")).poll_read(cx, out)
+    }
+}
+
+/// Dial a replay-safe piece endpoint. When early data is enabled, authentication
+/// is deferred to the first I/O; connection telemetry records its actual outcome.
+pub async fn dial_noise_with_options(
+    address: &str,
+    protocol: i32,
+    public_key: &[u8],
+    timeout: Duration,
+    options: &ConnectionOptions,
+    fast_open_advertised: bool,
+) -> io::Result<Transport> {
+    let mut event = Attempt {
+        telemetry: options.telemetry.clone(),
+        kind: TransportKind::Noise,
+        start: Instant::now(),
+        outcome: Outcome::Error,
+    };
+    let mut initiator = crate::noise::Initiator::new(protocol, public_key)?;
+    event.outcome = Outcome::Cancelled;
+    let address = address.to_owned();
+    let network = options.network.clone();
+    let early = network.noise_early_data;
+    let start: NoiseStart = Box::new(move |payload| {
+        Box::pin(async move {
+            // Start the deadline when first I/O triggers the actual dial, not while
+            // an unused connection is held. It covers DNS, both candidates and IK.
+            let connect = async {
+                initiator.set_payload(&payload)?;
+                let (stream, response) = noise_exchange(
+                    &address,
+                    &initiator.message,
+                    &network,
+                    fast_open_advertised && network.tcp_fast_open,
+                )
+                .await?;
+                let stream = initiator.finish(stream, &response)?;
+                Ok(Transport {
+                    io: Box::new(stream),
+                    peer_cert: Vec::new(),
+                    kind: TransportKind::Noise,
+                })
+            };
+            let result = if let Some(deadline) = tokio::time::Instant::now().checked_add(timeout) {
+                tokio::time::timeout_at(deadline, connect)
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "Noise dial timed out",
+                        ))
+                    })
+            } else {
+                connect.await
+            };
+            event.outcome = if result.is_ok() {
+                Outcome::Success
+            } else {
+                Outcome::Error
+            };
+            drop(event);
+            result
+        })
+    });
+    if !early {
+        return start(Vec::new()).await;
+    }
+    Ok(Transport {
+        io: Box::new(DeferredNoise {
+            start: Some(start),
+            pending: None,
+            connected: None,
+            failed: false,
+        }),
+        peer_cert: Vec::new(),
+        kind: TransportKind::Noise,
+    })
+}
+
+async fn noise_exchange(
+    address: &str,
+    message: &[u8],
+    network: &NetworkOptions,
+    fast_open: bool,
+) -> io::Result<(Box<dyn Io>, Vec<u8>)> {
+    use futures_util::{StreamExt, stream::FuturesUnordered};
+    let mut candidates = FuturesUnordered::new();
+    for (i, addr) in tokio::net::lookup_host(address).await?.enumerate() {
+        candidates.push(async move {
+            if i > 0 { tokio::time::sleep(Duration::from_millis(250).saturating_mul(i as u32)).await; }
+            let normal = async {
+                let socket = crate::socket::socket(addr, network)?;
+                let stream: Box<dyn Io> = Box::new(socket.connect(addr).await?);
+                crate::noise::exchange(stream, message).await
+            };
+            if !fast_open { return normal.await; }
+            let fast = async {
+                let socket = crate::socket::socket(addr, network)?;
+                let stream: Box<dyn Io> = Box::new(tokio_tfo::TfoStream::connect_with_socket(socket, addr).await?);
+                crate::noise::exchange(stream, message).await
+            };
+            tokio::pin!(fast);
+            tokio::select! {
+                result = &mut fast => return match result { Ok(v) => Ok(v), Err(_) => normal.await },
+                _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+            }
+            tokio::pin!(normal);
+            tokio::select! {
+                result = &mut fast => match result { Ok(v) => Ok(v), Err(_) => normal.await },
+                result = &mut normal => match result { Ok(v) => Ok(v), Err(_) => fast.await },
+            }
+        });
+    }
+    let mut last = io::Error::other("address resolved to no endpoints");
+    while let Some(result) = candidates.next().await {
+        match result {
+            Ok(v) => return Ok(v),
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Mutex;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn fast_open_fallback_reuses_identical_early_handshake() {
+        let key = snow::Builder::new("Noise_IK_25519_ChaChaPoly_BLAKE2b".parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move {
+            async fn first(tcp: &mut TcpStream) -> Vec<u8> {
+                let mut prefix = [0; 8];
+                tcp.read_exact(&mut prefix).await.unwrap();
+                assert_eq!(&prefix, crate::noise::HEADER);
+                let mut h = [0; 4];
+                tcp.read_exact(&mut h).await.unwrap();
+                let n = ((h[1] as usize) << 16) | ((h[2] as usize) << 8) | h[3] as usize;
+                let mut record = h.to_vec();
+                record.resize(n + 4, 0);
+                tcp.read_exact(&mut record[4..]).await.unwrap();
+                record
+            }
+            let (mut stalled, _) = listener.accept().await.unwrap();
+            let a = first(&mut stalled).await;
+            let (mut tcp, _) = listener.accept().await.unwrap();
+            let b = first(&mut tcp).await;
+            assert_eq!(a, b, "duplicate suppression requires identical handshakes");
+            let (read, write) = tcp.into_split();
+            let io = tokio::io::join(std::io::Cursor::new(b).chain(read), write);
+            let mut noise = crate::noise::NoiseStream::accept(io, 1, &key.private)
+                .await
+                .unwrap();
+            let mut payload = [0; 4];
+            noise.read_exact(&mut payload).await.unwrap();
+            assert_eq!(&payload, b"ping");
+            noise.write_all(b"pong").await.unwrap();
+            noise.flush().await.unwrap();
+        });
+        let options = ConnectionOptions::default();
+        let mut io = dial_noise_with_options(
+            &address,
+            1,
+            &key.public,
+            Duration::from_secs(3),
+            &options,
+            true,
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(4), async {
+            io.write_all(b"ping").await.unwrap();
+            io.flush().await.unwrap();
+            let mut got = [0; 4];
+            io.read_exact(&mut got).await.unwrap();
+            assert_eq!(&got, b"pong");
+            server.await.unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn deferred_handshake_timeout_and_unused_drop_report_actual_outcomes() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone();
+        let options = ConnectionOptions {
+            telemetry: Some(Telemetry::new(move |e| sink.lock().unwrap().push(e))),
+            ..Default::default()
+        };
+        let address = listener.local_addr().unwrap().to_string();
+        let unused = dial_noise_with_options(
+            &address,
+            1,
+            &[9; 32],
+            Duration::from_millis(30),
+            &options,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(events.lock().unwrap().is_empty());
+        drop(unused);
+        let mut stream = dial_noise_with_options(
+            &address,
+            1,
+            &[9; 32],
+            Duration::from_millis(30),
+            &options,
+            false,
+        )
+        .await
+        .unwrap();
+        stream.write_all(b"request").await.unwrap();
+        assert_eq!(
+            stream.flush().await.unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert!(stream.write_all(b"cannot reuse").await.is_err());
+        let outcomes: Vec<_> = events
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|e| match e {
+                TelemetryEvent::Connection { outcome, .. } => *outcome,
+                _ => panic!(),
+            })
+            .collect();
+        assert_eq!(outcomes, [Outcome::Cancelled, Outcome::Error]);
+    }
 
     #[tokio::test]
     async fn stalled_noise_handshake_obeys_deadline_and_reports_error() {

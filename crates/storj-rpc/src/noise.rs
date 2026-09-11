@@ -1,6 +1,6 @@
 //! Storj's `noiseconn` framing over TCP. Only replay-safe RPCs may use this stream.
 //! The responder key must come from a trusted source (the authenticated satellite).
-//! We complete IK with empty payloads before sending any application data.
+//! Early payloads are permitted only for replay-safe piece operations.
 
 use snow::{
     HandshakeState,
@@ -111,6 +111,83 @@ async fn read_record<S: AsyncRead + Unpin>(io: &mut S) -> io::Result<Vec<u8>> {
     io.read_exact(&mut body).await?;
     Ok(body)
 }
+
+/// Prepared once so Fast Open and ordinary TCP can send an identical first
+/// handshake to servers advertising duplicate-handshake suppression.
+pub(crate) struct Initiator {
+    hs: HandshakeState,
+    cipher: CipherChoice,
+    pub message: Vec<u8>,
+}
+pub(crate) const MAX_EARLY_DATA: usize = 65535 - 96;
+impl Initiator {
+    pub fn new(protocol: i32, public_key: &[u8]) -> io::Result<Self> {
+        if public_key.len() != 32 {
+            return Err(invalid("invalid Noise key length"));
+        }
+        let mut dh = Resolver
+            .resolve_dh(&DHChoice::Curve25519)
+            .ok_or_else(|| invalid("missing X25519"))?;
+        dh.set(&[42; 32]);
+        dh.dh(public_key, &mut [0; 32]).map_err(noise_error)?;
+        let params = params(protocol)?;
+        let cipher = params.cipher;
+        let builder = builder(params);
+        let key = Zeroizing::new(builder.generate_keypair().map_err(noise_error)?.private);
+        let hs = builder
+            .local_private_key(&key)
+            .map_err(noise_error)?
+            .remote_public_key(public_key)
+            .map_err(noise_error)?
+            .build_initiator()
+            .map_err(noise_error)?;
+        Ok(Self {
+            hs,
+            cipher,
+            message: Vec::new(),
+        })
+    }
+    pub fn set_payload(&mut self, payload: &[u8]) -> io::Result<()> {
+        if payload.len() > MAX_EARLY_DATA {
+            return Err(invalid("Noise early payload too large"));
+        }
+        let mut body = vec![0; 65535];
+        let n = self
+            .hs
+            .write_message(payload, &mut body)
+            .map_err(noise_error)?;
+        let mut message = HEADER.to_vec();
+        message.extend_from_slice(&header(n));
+        message.extend_from_slice(&body[..n]);
+        self.message = message;
+        Ok(())
+    }
+    pub fn finish<S: AsyncRead + AsyncWrite + Unpin>(
+        mut self,
+        io: S,
+        response: &[u8],
+    ) -> io::Result<NoiseStream<S>> {
+        let mut payload = vec![0; MAX_RECORD];
+        let n = self
+            .hs
+            .read_message(response, &mut payload)
+            .map_err(noise_error)?;
+        let mut stream = NoiseStream::established(io, &mut self.hs, self.cipher, true)?;
+        payload.truncate(n);
+        stream.plain = payload;
+        Ok(stream)
+    }
+}
+
+pub(crate) async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(
+    mut io: S,
+    first: &[u8],
+) -> io::Result<(S, Vec<u8>)> {
+    io.write_all(first).await?;
+    io.flush().await?;
+    let response = read_record(&mut io).await?;
+    Ok((io, response))
+}
 async fn write_handshake<S: AsyncWrite + Unpin>(
     io: &mut S,
     hs: &mut HandshakeState,
@@ -173,7 +250,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> NoiseStream<S> {
     }
 
     /// Accept an IK connection after the caller has consumed [`HEADER`].
-    /// Intended for local protocol test servers; early application data is rejected.
+    /// Intended for local protocol test servers serving replay-safe operations.
     pub async fn accept(mut io: S, protocol: i32, private_key: &[u8]) -> io::Result<Self> {
         let params = params(protocol)?;
         let cipher = params.cipher;
@@ -184,15 +261,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> NoiseStream<S> {
             .map_err(noise_error)?;
         let record = read_record(&mut io).await?;
         let mut payload = vec![0; MAX_RECORD];
-        if hs
+        let n = hs
             .read_message(&record, &mut payload)
-            .map_err(noise_error)?
-            != 0
-        {
-            return Err(invalid("early Noise application data is unsupported"));
-        }
+            .map_err(noise_error)?;
         write_handshake(&mut io, &mut hs).await?;
-        Self::established(io, &mut hs, cipher, false)
+        let mut stream = Self::established(io, &mut hs, cipher, false)?;
+        payload.truncate(n);
+        stream.plain = payload;
+        Ok(stream)
     }
 
     fn established(

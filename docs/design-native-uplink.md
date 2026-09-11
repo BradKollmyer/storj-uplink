@@ -232,7 +232,6 @@ Crate root (2025): `Bucket`, `Error`, `Object`, `Project`, `Config`, `Encryption
 - FFI *out* (exposing a C ABI). This crate *consumes* the network; it does not replace `uplink-c`.
 - Source compatibility with crates.io `uplink` 0.11.0, and publishing under the `uplink` crate name.
 - Bucket-notification configuration RPCs. Object Lock **RPCs** and `Permission` lock bits **are** in v1.0 (K19).
-- TCP Fast Open and Noise 0-RTT. TCP/TLS is the default; QUIC, automatic TCP fallback, and opt-in Noise for advertised replay-safe storage-node endpoints are available through `Config::transport`.
 - Partner User-Agent attribution beyond a config string.
 
 ---
@@ -1384,7 +1383,7 @@ There is **no production-quality Rust DRPC** (`zeebo/drpc-rs` is marked incomple
 | `DRPC!!!1` | DRPC over TLS |
 | `DRPC!N!1` | DRPC over Noise IK |
 
-The 1.0.0 release used TLS only. `TransportMode::Noise` now supports both advertised IK/X25519/BLAKE2b suites (ChaChaPoly and AESGCM) for storage-node Upload/Download. Satellite metadata and nodes without Noise advertisements use TLS. Invalid advertisements or failed Noise authentication do not trigger a TLS downgrade. Noise completes an empty-payload handshake before sending application data; TCP Fast Open and 0-RTT are not enabled. Upload response identity chains are verified and pinned to the order limit's NodeID before checking piece signatures. Snow handles the handshake and ciphers; a bounded record layer supports Go noiseconn's 65535-byte plaintext records, including the 16-byte authentication tag.
+The 1.0.0 release used TLS only. The default `TransportMode::Noise` supports both advertised IK/X25519/BLAKE2b suites (ChaChaPoly and AESGCM) for storage-node Upload/Download. Satellite metadata and nodes without Noise advertisements use TLS. Invalid advertisements or failed Noise authentication do not trigger a TLS downgrade. Replay-safe first RPC bytes can travel in the Noise handshake; `Config::network.noise_early_data = false` restores an eager empty-payload handshake. Fast Open races ordinary TCP only for advertised endpoints with sufficient debounce capacity, using identical handshake bytes. Authentication, DNS and fallback share a dial deadline. Linux DSCP and optional congestion-controller hints are best-effort. Upload response identity chains are verified and pinned to the order limit's NodeID before checking piece signatures. Snow handles the handshake and ciphers; a bounded record layer supports Go noiseconn's 65535-byte plaintext records, including the 16-byte authentication tag.
 
 ### Identity and TLS
 
@@ -1725,8 +1724,8 @@ None remaining as product decisions.
 
 **Watch (not product questions):**
 
-- **Noise** — opt-in for advertised storage-node Upload/Download endpoints, with local connection telemetry. Metadata continues to use TLS. Go interoperability covers both cipher suites; early data and TCP Fast Open remain deferred.
-- **QUIC** — implemented with Quinn, Storj ALPN and NodeID pinning; `Auto` races TCP after a 250 ms head start within one dial deadline. TCP remains the default, matching Go's disabled-by-default QUIC rollout.
+- **Noise** — selected by default for advertised storage-node Upload/Download endpoints, with local connection telemetry. Metadata continues to use TLS. Go interoperability covers both cipher suites, early data, and Fast Open.
+- **QUIC** — implemented with Quinn, Storj ALPN and NodeID pinning; explicit `Auto` races TCP after a 250 ms head start within one dial deadline. QUIC remains opt-in.
 
 **Resolved (not open):**
 

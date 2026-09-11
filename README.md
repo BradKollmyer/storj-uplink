@@ -74,7 +74,7 @@ cargo run -p storj --example walkthrough -- "$STORJ_ACCESS"
 ## Network transports and telemetry
 
 Configure both satellite and storage-node connections with `Config::transport`:
-`Tcp` (the default), `Quic` (QUIC only), or `Auto`. Auto gives QUIC a 250 ms
+`Noise` (the default), `Tcp` (TLS only), `Quic` (QUIC only), or `Auto`. Auto gives QUIC a 250 ms
 head start, then races TCP/TLS; a failed QUIC attempt starts TCP immediately.
 DNS, TLS authentication, and fallback share the configured dial deadline.
 Both transports pin the peer's Storj NodeID and present the client identity.
@@ -85,10 +85,20 @@ downloads when the authenticated satellite advertises a Noise key. Metadata
 calls and nodes without an advertised key use TCP/TLS. Invalid keys, unsupported
 protocols, or failed Noise handshakes fail the dial without a TLS downgrade.
 Both advertised ciphers (ChaCha20-Poly1305 and AES-GCM, with X25519/BLAKE2b) are
-supported. The handshake completes before application data is sent; 0-RTT and
-TCP Fast Open are not enabled. Upload response certificate chains are verified
+supported. The first replay-safe piece RPC bytes are sent inside the IK handshake;
+authentication completes during I/O and shares the dial deadline. Upload response certificate chains are verified
 against the order limit's NodeID before checking the signed piece hash.
 Connection telemetry reports `TransportKind::Noise` for these connections.
+
+`Config::network` controls `noise_early_data`, `tcp_fast_open`, and
+`background_qos` (all enabled by default). Fast Open races ordinary TCP after
+250 ms only when the satellite advertises Fast Open and a debounce limit of at
+least two. Both attempts send identical handshake bytes, and failures or unavailable
+Fast Open support allow ordinary TCP to proceed. TCP address candidates also race
+to avoid a stalled IPv6 route blocking IPv4. On Linux, background QoS requests
+Lower Effort DSCP; `congestion_control` can name a kernel TCP controller. These
+socket hints are best-effort. Disable `noise_early_data` for an eager, empty-payload
+handshake, or select `Tcp` to force TLS. Early data is restricted to piece Upload/Download.
 
 ```rust
 use storj::{Config, Telemetry, TransportMode};

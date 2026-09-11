@@ -46,7 +46,14 @@ async fn noise_interoperates_with_go_both_ciphers_and_maximum_records() {
             let _ = self.0.wait();
         }
     }
-    for protocol in [1, 2] {
+    for (protocol, early, fast) in [
+        (1, false, false),
+        (2, false, false),
+        (1, true, false),
+        (2, true, false),
+        (1, true, true),
+        (2, true, true),
+    ] {
         let mut child = Child(
             Command::new(&binary)
                 .arg(protocol.to_string())
@@ -62,12 +69,20 @@ async fn noise_interoperates_with_go_both_ciphers_and_maximum_records() {
         let (address, key) = line.trim().split_once(' ').unwrap();
         let key = hex::decode(key).unwrap();
         tokio::time::timeout(Duration::from_secs(10), async {
-            let mut stream = storj_rpc::transport::dial_noise(
+            let mut stream = storj_rpc::transport::dial_noise_with_options(
                 address,
                 protocol,
                 &key,
                 Duration::from_secs(5),
-                None,
+                &storj_rpc::transport::ConnectionOptions {
+                    network: storj::NetworkOptions {
+                        noise_early_data: early,
+                        tcp_fast_open: fast,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                fast,
             )
             .await
             .unwrap();
