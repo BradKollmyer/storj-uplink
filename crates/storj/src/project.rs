@@ -238,6 +238,7 @@ impl Project {
     ) -> Result<()> {
         require_bucket_name(bucket)?;
         require_object_key(key)?;
+        crate::verify_custom_metadata(&metadata)?;
         let enc_path =
             storj_encryption::encrypt_path(bucket, key, &self.inner.store).map_err(map_enc)?;
         let resp = self
@@ -436,6 +437,7 @@ impl Project {
     ) -> Result<Object> {
         require_bucket_name(bucket)?;
         require_object_key(key)?;
+        crate::verify_custom_metadata(&opts.custom_metadata)?;
         let stream_id = decode_upload_id(upload_id)?;
         let content_key =
             storj_encryption::derive_content_key(bucket, key.as_bytes(), &self.inner.store)
@@ -1139,6 +1141,8 @@ pub(crate) async fn commit_upload(mut inner: UploadInner) -> Result<Object> {
         stream_id: inner.stream_id.clone(),
     };
     let mut abort_on_drop = AbortOnDrop(Some(abort));
+
+    crate::verify_custom_metadata(&inner.custom)?;
 
     if let Some(handle) = inner.pending_flush.take() {
         let flushed = handle.await??;

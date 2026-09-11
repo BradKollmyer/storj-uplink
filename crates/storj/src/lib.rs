@@ -72,7 +72,7 @@ pub use types::{
     Bucket, BucketObjectLockConfiguration, CommitUploadOptions, CustomMetadata, DefaultRetention,
     DownloadOptions, ListBucketsOptions, ListObjectsOptions, ListUploadPartsOptions,
     ListUploadsOptions, Object, Part, Retention, RetentionMode, SetObjectRetentionOptions,
-    SystemMetadata, UploadInfo, UploadOptions,
+    SystemMetadata, UploadInfo, UploadOptions, verify_custom_metadata,
 };
 pub use upload::{Download, PartUpload, Upload};
 

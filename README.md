@@ -71,6 +71,11 @@ cargo run -p storj --example walkthrough -- "$STORJ_ACCESS"
 `commit()` is the only path that publishes an upload. Dropping `Upload` without
 `commit` aborts. `poll_shutdown` does not commit.
 
+Custom metadata is validated before upload setters, multipart commit, and metadata
+updates: keys must be nonempty, and keys/values cannot contain NUL bytes. Empty
+values and Unicode are accepted. Use `verify_custom_metadata(&metadata)` for
+preflight validation; invalid input returns `ErrorKind::MetadataInvalid`.
+
 ## Network transports and telemetry
 
 Configure both satellite and storage-node connections with `Config::transport`:

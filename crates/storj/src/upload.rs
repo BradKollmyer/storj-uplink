@@ -167,6 +167,7 @@ impl Upload {
                 "upload done: already committed or aborted",
             )
         })?;
+        crate::verify_custom_metadata(&meta)?;
         inner.custom = meta;
         Ok(())
     }

@@ -159,6 +159,8 @@ impl From<tokio::task::JoinError> for Error {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 #[non_exhaustive]
 pub enum ErrorKind {
+    /// Custom metadata contains an empty key or NUL byte.
+    MetadataInvalid,
     /// Rate limited by the satellite.
     TooManyRequests,
     /// Project bandwidth limit exceeded.
@@ -221,6 +223,7 @@ impl fmt::Display for ErrorKind {
             Self::InvalidGrant => "invalid grant",
             Self::DecryptionFailed => "decryption failed",
             Self::Protocol => "protocol",
+            Self::MetadataInvalid => "invalid custom metadata",
             Self::Io => "i/o",
             Self::EdgeAuthDialFailed => "dial to auth service failed",
             Self::EdgeRegisterAccessFailed => "register access for edge service failed",

@@ -50,6 +50,27 @@ pub struct SystemMetadata {
 /// App convention: `app:key` (e.g. `image-board:title`).
 pub type CustomMetadata = BTreeMap<String, String>;
 
+/// Validate custom metadata before making a request, like Go's `CustomMetadata.Verify`.
+/// Keys must be nonempty; neither keys nor values may contain NUL bytes.
+/// Empty values and Unicode are allowed. Rust strings already guarantee UTF-8.
+pub fn verify_custom_metadata(metadata: &CustomMetadata) -> Result<()> {
+    for (key, value) in metadata {
+        if key.is_empty() {
+            return Err(Error::new(
+                ErrorKind::MetadataInvalid,
+                "custom metadata contains an empty key",
+            ));
+        }
+        if key.contains('\0') || value.contains('\0') {
+            return Err(Error::new(
+                ErrorKind::MetadataInvalid,
+                "custom metadata contains a NUL byte",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Options for `Project::list_buckets`.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ListBucketsOptions {
