@@ -293,6 +293,23 @@ impl Project {
                     meta.number_of_segments,
                 )
             };
+        // Updating metadata rotates its random key. Preserve the checksum by
+        // decrypting it under the old key before encrypting both values anew.
+        // GetObject returns checksum fields together with the metadata key.
+        let checksum = if pb.encrypted_checksum.is_empty() {
+            None
+        } else {
+            Some(
+                storj_uplink::pipeline::decrypt_object_checksum(
+                    &pb.encrypted_checksum,
+                    &pb.encrypted_metadata_encrypted_key,
+                    &pb.encrypted_metadata_nonce,
+                    cipher,
+                    &content_key,
+                )
+                .map_err(map_uplink)?,
+            )
+        };
         let custom_pairs: Vec<(String, String)> = metadata.into_iter().collect();
         let user = storj_uplink::pipeline::encrypt_user_data(
             &custom_pairs,
@@ -302,12 +319,19 @@ impl Project {
             cipher,
             &content_key,
             block_size,
-            None,
+            checksum.as_deref(),
         )
         .map_err(map_uplink)?;
         self.inner
             .metainfo
-            .update_object_metadata(bucket, key, enc_path, pb.stream_id, user)
+            .update_object_metadata(
+                bucket,
+                key,
+                enc_path,
+                pb.stream_id,
+                user,
+                (pb.checksum_algorithm, pb.is_checksum_composite),
+            )
             .await
     }
 

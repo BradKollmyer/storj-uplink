@@ -54,6 +54,8 @@ published so the facade can resolve on crates.io; they are not a stable API.
 
 ### Fixed
 
+- Preserve object checksums when replacing custom metadata by re-encrypting
+  them under the new metadata key and including them in the update request.
 - Reject invalid nonempty exact-key pending-upload cursors instead of silently
   restarting the listing.
 - Piece response identities now match Go's validation: verify leaf against CA,

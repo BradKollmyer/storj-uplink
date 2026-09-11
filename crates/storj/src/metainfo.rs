@@ -1055,6 +1055,7 @@ impl MetainfoClient {
         encrypted_object_key: Vec<u8>,
         stream_id: Vec<u8>,
         user: storj_uplink::upload::EncryptedUserData,
+        checksum: (i32, bool),
     ) -> Result<()> {
         let req = UpdateObjectMetadataRequest {
             header: Some(self.header()),
@@ -1066,6 +1067,15 @@ impl MetainfoClient {
             encrypted_metadata_encrypted_key: user.encrypted_metadata_encrypted_key,
             encrypted_etag: user.encrypted_etag,
             set_encrypted_etag: false,
+            includes: Some(metainfo::ObjectMetadataIncludes {
+                custom: true,
+                checksum: true,
+                // Do not silently erase an ETag this API does not preserve.
+                etag: false,
+            }),
+            checksum_algorithm: checksum.0,
+            is_checksum_composite: checksum.1,
+            encrypted_checksum: user.encrypted_checksum,
             ..Default::default()
         };
         let body = self

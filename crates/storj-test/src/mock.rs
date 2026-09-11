@@ -44,6 +44,8 @@ use crate::mock_sn::MockStorageNode;
 use tokio::task::JoinHandle;
 
 const RPC_INVALID_ARGUMENT: u64 = 3;
+const RPC_METADATA_INCLUDES_INVALID: u64 = 10033;
+const RPC_INSUFFICIENT_METADATA_INCLUDES: u64 = 10034;
 const RPC_NOT_FOUND: u64 = 5;
 const RPC_ALREADY_EXISTS: u64 = 6;
 const RPC_PERMISSION_DENIED: u64 = 7;
@@ -2484,11 +2486,53 @@ fn update_object_metadata(
     if !req.stream_id.is_empty() && req.stream_id != rec.object.stream_id {
         return Err((RPC_NOT_FOUND, "object not found".into()));
     }
-    rec.object.encrypted_metadata = req.encrypted_metadata;
+    check_checksum_options(
+        req.checksum_algorithm,
+        req.is_checksum_composite,
+        &req.encrypted_checksum,
+        true,
+    )?;
+    let includes = req
+        .includes
+        .unwrap_or(storj_proto::metainfo::ObjectMetadataIncludes {
+            custom: true,
+            etag: req.set_encrypted_etag,
+            checksum: false,
+        });
+    if !includes.custom && !includes.etag && !includes.checksum {
+        return Err((
+            RPC_METADATA_INCLUDES_INVALID,
+            "Includes must not be empty".into(),
+        ));
+    }
+    // Like metabase, reject before replacing the shared key if any populated
+    // value is omitted. Otherwise it would be left encrypted under the old key.
+    if (!includes.custom && !rec.object.encrypted_metadata.is_empty())
+        || (!includes.etag && !rec.object.encrypted_etag.is_empty())
+        || (!includes.checksum && rec.object.checksum_algorithm != 0)
+    {
+        // The satellite maps this to NotFound for legacy clients.
+        return if req.includes.is_none() {
+            Err((RPC_NOT_FOUND, "object not found".into()))
+        } else {
+            Err((
+                RPC_INSUFFICIENT_METADATA_INCLUDES,
+                "insufficient object metadata includes".into(),
+            ))
+        };
+    }
+    if includes.custom {
+        rec.object.encrypted_metadata = req.encrypted_metadata;
+    }
     rec.object.encrypted_metadata_nonce = req.encrypted_metadata_nonce;
     rec.object.encrypted_metadata_encrypted_key = req.encrypted_metadata_encrypted_key;
-    if req.set_encrypted_etag {
+    if includes.etag {
         rec.object.encrypted_etag = req.encrypted_etag;
+    }
+    if includes.checksum {
+        rec.object.checksum_algorithm = req.checksum_algorithm;
+        rec.object.is_checksum_composite = req.is_checksum_composite;
+        rec.object.encrypted_checksum = req.encrypted_checksum;
     }
     Ok(UpdateObjectMetadataResponse {})
 }
@@ -2515,5 +2559,121 @@ fn timestamp(t: SystemTime) -> prost_types::Timestamp {
     prost_types::Timestamp {
         seconds: d.as_secs() as i64,
         nanos: d.subsec_nanos() as i32,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use storj::{ObjectChecksum, ObjectChecksumAlgorithm, Project, UploadOptions};
+    use tokio::io::AsyncWriteExt;
+
+    async fn checksummed_object() -> (MockSatellite, Project, ProtoObject) {
+        let mock = MockSatellite::start().await;
+        let project = Project::open(&mock.access()).await.unwrap();
+        project.ensure_bucket("checksums").await.unwrap();
+        let mut upload = project
+            .upload_object(
+                "checksums",
+                "data",
+                UploadOptions {
+                    checksum: Some(ObjectChecksum {
+                        algorithm: ObjectChecksumAlgorithm::Sha256,
+                        value: vec![7; 32],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        upload.write_all(b"body").await.unwrap();
+        upload.commit().await.unwrap();
+        let object = mock
+            .state
+            .lock()
+            .unwrap()
+            .committed
+            .values()
+            .next()
+            .unwrap()
+            .object
+            .clone();
+        (mock, project, object)
+    }
+
+    #[tokio::test]
+    async fn metadata_update_rejects_omitted_checksum_before_mutation() {
+        let (mock, _project, object) = checksummed_object().await;
+        for (includes, code) in [
+            (None, RPC_NOT_FOUND),
+            (
+                Some(storj_proto::metainfo::ObjectMetadataIncludes {
+                    custom: true,
+                    ..Default::default()
+                }),
+                RPC_INSUFFICIENT_METADATA_INCLUDES,
+            ),
+        ] {
+            let request = UpdateObjectMetadataRequest {
+                header: Some(RequestHeader {
+                    api_key: mock.api_key_raw.clone(),
+                    ..Default::default()
+                }),
+                bucket: object.bucket.clone(),
+                encrypted_object_key: object.encrypted_object_key.clone(),
+                stream_id: object.stream_id.clone(),
+                includes,
+                encrypted_metadata: vec![1],
+                encrypted_metadata_encrypted_key: vec![2; 48],
+                encrypted_metadata_nonce: vec![3; 24],
+                ..Default::default()
+            };
+            assert_eq!(
+                update_object_metadata(request, &mock.state).unwrap_err().0,
+                code
+            );
+            assert_eq!(
+                mock.state
+                    .lock()
+                    .unwrap()
+                    .committed
+                    .values()
+                    .next()
+                    .unwrap()
+                    .object,
+                object
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn corrupt_checksum_aborts_metadata_update_before_mutation() {
+        let (mock, project, mut object) = checksummed_object().await;
+        object.encrypted_checksum[0] ^= 1;
+        mock.state
+            .lock()
+            .unwrap()
+            .committed
+            .values_mut()
+            .next()
+            .unwrap()
+            .object = object.clone();
+        let error = project
+            .update_object_metadata("checksums", "data", Default::default())
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), storj::ErrorKind::DecryptionFailed);
+        assert_eq!(
+            mock.state
+                .lock()
+                .unwrap()
+                .committed
+                .values()
+                .next()
+                .unwrap()
+                .object,
+            object
+        );
     }
 }

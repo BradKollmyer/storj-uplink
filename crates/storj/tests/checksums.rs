@@ -9,7 +9,7 @@ use storj::{
     CommitUploadOptions, ErrorKind, ObjectChecksum, ObjectChecksumAlgorithm, Project, UploadOptions,
 };
 use storj_test::MockSatellite;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const SHA256_PROTO: i32 = storj_proto::metainfo::ObjectChecksumAlgorithm::Sha256 as i32;
 
@@ -55,6 +55,91 @@ fn assert_round_trip(mock: &MockSatellite, bucket: &str, key: &str, plain: &[u8]
         Ok(plain),
         "decrypts under the metadata key"
     );
+}
+
+#[tokio::test]
+async fn metadata_updates_preserve_regular_and_multipart_checksums() {
+    let mock = MockSatellite::start().await;
+    let project = open_project(&mock).await;
+    let bucket = unique("cksum-metadata");
+    project.ensure_bucket(&bucket).await.unwrap();
+    let plain = vec![0x5a; 32];
+    let body = b"checksummed body";
+    for multipart in [false, true] {
+        let key = if multipart { "multipart" } else { "regular" };
+        let checksum = ObjectChecksum {
+            algorithm: ObjectChecksumAlgorithm::Sha256,
+            composite: multipart,
+            value: plain.clone(),
+        };
+        if multipart {
+            let pending = project
+                .begin_upload(&bucket, key, Default::default())
+                .await
+                .unwrap();
+            let mut part = project
+                .upload_part(&bucket, key, &pending.upload_id, 1)
+                .await
+                .unwrap();
+            part.write_all(body).await.unwrap();
+            part.commit().await.unwrap();
+            project
+                .commit_upload(
+                    &bucket,
+                    key,
+                    &pending.upload_id,
+                    CommitUploadOptions {
+                        checksum: Some(checksum),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+        } else {
+            let mut upload = project
+                .upload_object(
+                    &bucket,
+                    key,
+                    UploadOptions {
+                        checksum: Some(checksum),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            upload.write_all(body).await.unwrap();
+            upload.commit().await.unwrap();
+        }
+        assert_round_trip(&mock, &bucket, key, &plain, multipart);
+        for value in ["first update", "second update"] {
+            let before = mock.committed_checksum(&bucket, key).unwrap();
+            let metadata = [("label".to_owned(), value.to_owned())]
+                .into_iter()
+                .collect();
+            project
+                .update_object_metadata(&bucket, key, metadata)
+                .await
+                .unwrap();
+            assert_round_trip(&mock, &bucket, key, &plain, multipart);
+            let after = mock.committed_checksum(&bucket, key).unwrap();
+            assert_ne!(
+                before.encrypted_value, after.encrypted_value,
+                "checksum must be encrypted under the new metadata key"
+            );
+            let mut download = project
+                .download_object(&bucket, key, Default::default())
+                .await
+                .unwrap();
+            assert_eq!(
+                download.info().custom.get("label").map(String::as_str),
+                Some(value)
+            );
+            assert_eq!(download.info().system.content_length, body.len() as i64);
+            let mut got = Vec::new();
+            download.read_to_end(&mut got).await.unwrap();
+            assert_eq!(got, body);
+        }
+    }
 }
 
 #[tokio::test]
