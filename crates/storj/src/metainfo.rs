@@ -118,7 +118,10 @@ impl MetainfoClient {
     }
     /// Dial the satellite, pin NodeID, write the TLS mux prefix, complete TLS.
     pub(crate) async fn connect(node: NodeUrl, api_key: Vec<u8>, config: &Config) -> Result<Self> {
-        let identity = Identity::generate().map_err(map_identity_err)?;
+        let identity = match &config.tls_identity {
+            Some(identity) => identity.identity().clone(),
+            None => Identity::generate().map_err(map_identity_err)?,
+        };
         let client = Self {
             node,
             api_key,

@@ -142,6 +142,7 @@ struct MockState {
 
 /// Loopback TLS satellite that speaks `ProjectInfo`, buckets, and upload RPCs.
 pub struct MockSatellite {
+    peer_log: crate::listener::PeerLog,
     node_url: String,
     api_key: String,
     api_key_raw: Vec<u8>,
@@ -171,6 +172,7 @@ impl MockSatellite {
         // Signed identity: [leaf, CA, signer], as production satellites present.
         let identity = Identity::generate_signed().expect("mock satellite identity");
         let listener = Listener::bind(&identity, quic).await;
+        let peer_log = listener.peer_log();
         let addr = listener.local_addr().expect("local addr");
         let node_url = format!("{}@{}", identity.node_id(), addr);
 
@@ -233,6 +235,7 @@ impl MockSatellite {
         });
 
         Self {
+            peer_log,
             node_url,
             api_key,
             api_key_raw,
@@ -246,6 +249,11 @@ impl MockSatellite {
     /// `NodeID@127.0.0.1:port` for grants and `request_with_passphrase`.
     pub fn node_url(&self) -> &str {
         &self.node_url
+    }
+
+    /// Client NodeIDs observed on authenticated TLS/QUIC connections.
+    pub fn tls_client_node_ids(&self) -> Vec<storj_rpc::NodeId> {
+        self.peer_log.lock().unwrap().clone()
     }
 
     /// Serialized (Base58Check) API key accepted by this mock.

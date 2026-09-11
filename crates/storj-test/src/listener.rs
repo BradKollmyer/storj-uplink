@@ -12,13 +12,20 @@ pub(crate) trait Io: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Io for T {}
 pub(crate) type Stream = Box<dyn Io>;
 pub(crate) type Incoming = Pin<Box<dyn Future<Output = io::Result<Stream>> + Send>>;
+pub(crate) type PeerLog = Arc<std::sync::Mutex<Vec<storj_rpc::NodeId>>>;
 
 pub(crate) enum Listener {
-    Tcp(tokio::net::TcpListener, tokio_rustls::TlsAcceptor),
-    Quic(quinn::Endpoint),
+    Tcp(tokio::net::TcpListener, tokio_rustls::TlsAcceptor, PeerLog),
+    Quic(quinn::Endpoint, PeerLog),
     Noise(tokio::net::TcpListener, i32, Vec<u8>),
 }
 impl Listener {
+    pub(crate) fn peer_log(&self) -> PeerLog {
+        match self {
+            Self::Tcp(_, _, log) | Self::Quic(_, log) => log.clone(),
+            Self::Noise(..) => PeerLog::default(),
+        }
+    }
     pub(crate) async fn bind_noise(protocol: i32) -> (Self, storj_proto::noise::NoiseInfo) {
         let name = match protocol {
             1 => "Noise_IK_25519_ChaChaPoly_BLAKE2b",
@@ -46,18 +53,22 @@ impl Listener {
             tls.alpn_protocols = vec![b"storj".to_vec()];
             let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls).unwrap();
             let config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
-            Self::Quic(quinn::Endpoint::server(config, "127.0.0.1:0".parse().unwrap()).unwrap())
+            Self::Quic(
+                quinn::Endpoint::server(config, "127.0.0.1:0".parse().unwrap()).unwrap(),
+                PeerLog::default(),
+            )
         } else {
             Self::Tcp(
                 tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap(),
                 tokio_rustls::TlsAcceptor::from(Arc::new(tls)),
+                PeerLog::default(),
             )
         }
     }
     pub(crate) fn local_addr(&self) -> io::Result<std::net::SocketAddr> {
         match self {
-            Self::Tcp(l, _) => l.local_addr(),
-            Self::Quic(e) => e.local_addr(),
+            Self::Tcp(l, _, _) => l.local_addr(),
+            Self::Quic(e, _) => e.local_addr(),
             Self::Noise(l, _, _) => l.local_addr(),
         }
     }
@@ -81,20 +92,32 @@ impl Listener {
                     )
                 }))
             }
-            Self::Tcp(l, a) => {
+            Self::Tcp(l, a, log) => {
                 let (mut tcp, _) = l.accept().await?;
                 let a = a.clone();
+                let log = log.clone();
                 Ok(Box::pin(async move {
                     storj_rpc::read_tls_mux_prefix(&mut tcp)
                         .await
                         .map_err(io::Error::other)?;
-                    Ok(Box::new(a.accept(tcp).await?) as Stream)
+                    let tls = a.accept(tcp).await?;
+                    record_peer(&log, tls.get_ref().1.peer_certificates().unwrap_or(&[]))?;
+                    Ok(Box::new(tls) as Stream)
                 }))
             }
-            Self::Quic(e) => {
+            Self::Quic(e, log) => {
+                let log = log.clone();
                 let incoming = e.accept().await.ok_or_else(|| io::Error::other("closed"))?;
                 Ok(Box::pin(async move {
                     let conn = incoming.await.map_err(io::Error::other)?;
+                    let certs = conn
+                        .peer_identity()
+                        .and_then(|p| {
+                            p.downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
+                                .ok()
+                        })
+                        .ok_or_else(|| io::Error::other("missing client certificates"))?;
+                    record_peer(&log, &certs)?;
                     let (send, recv) = conn.accept_bi().await.map_err(io::Error::other)?;
                     Ok(Box::new(QuicIo {
                         io: tokio::io::join(recv, send),
@@ -104,6 +127,14 @@ impl Listener {
             }
         }
     }
+}
+fn record_peer(log: &PeerLog, certs: &[rustls::pki_types::CertificateDer<'_>]) -> io::Result<()> {
+    let ca = certs
+        .get(1)
+        .ok_or_else(|| io::Error::other("missing client CA"))?;
+    let id = storj_rpc::NodeId::from_certificate_der(ca).map_err(io::Error::other)?;
+    log.lock().unwrap().push(id);
+    Ok(())
 }
 struct QuicIo {
     io: tokio::io::Join<quinn::RecvStream, quinn::SendStream>,

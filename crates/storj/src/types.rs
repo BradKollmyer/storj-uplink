@@ -257,6 +257,10 @@ pub struct Part {
 /// Client configuration.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Config {
+    /// Optional caller-supplied TLS identity, reused for all satellite and
+    /// storage-node TLS/QUIC connections. `None` generates an ephemeral identity.
+    /// Noise uses its own ephemeral X25519 initiator key.
+    pub tls_identity: Option<crate::config::TlsIdentity>,
     /// Transport policy. Defaults to advertised Noise for pieces and TLS otherwise.
     /// `Noise` uses advertised keys for piece transfers and TCP/TLS for metadata.
     pub transport: storj_rpc::transport::TransportMode,

@@ -66,7 +66,7 @@ pub mod types;
 pub mod upload;
 
 pub use access::{Access, Permission, SharePrefix};
-pub use config::Config;
+pub use config::{Config, TlsIdentity};
 pub use encryption::EncryptionKey;
 pub use error::{Error, ErrorKind, Result};
 pub use project::{BucketStream, ObjectStream, PartStream, Project, UploadStream};

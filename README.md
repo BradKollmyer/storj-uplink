@@ -143,6 +143,25 @@ active from its first poll until it returns Ready or the transfer terminates;
 the underlying `AsyncRead`/`AsyncWrite` traits cannot observe cancellation of an
 individual caller-owned I/O future. It measures wall time, not CPU usage.
 
+To reuse a TLS identity, parse a leaf-first certificate chain and its matching
+unencrypted P-256 private key (PKCS#8 or SEC1 PEM) before opening the project:
+
+```rust
+use storj::{Config, TlsIdentity};
+
+let config = Config {
+    tls_identity: Some(TlsIdentity::from_pem(&chain_pem, &key_pem)?),
+    ..Default::default()
+};
+```
+
+The constructor validates chain signatures and the leaf/key match, returning
+`ErrorKind::InvalidTlsIdentity` for invalid input. All satellite and storage-node
+TLS/QUIC connections reuse that identity, including new pooled connections.
+`None` retains ephemeral identity generation. Noise still generates its own
+X25519 initiator key. Debug output excludes PEM material, and stored private-key
+bytes are zeroized when dropped.
+
 Callbacks run synchronously and may run concurrently; keep them fast and
 nonblocking. With panic unwinding, callback panics are caught. There is no
 automatic network exporter or background delivery queue. Existing `Config`

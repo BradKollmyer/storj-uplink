@@ -22,6 +22,7 @@ use tokio::task::JoinHandle;
 
 /// Loopback TLS storage node speaking piecestore Upload.
 pub struct MockStorageNode {
+    peer_log: crate::listener::PeerLog,
     identity: Identity,
     address: String,
     noise_info: Option<storj_proto::noise::NoiseInfo>,
@@ -57,6 +58,7 @@ impl MockStorageNode {
             (Listener::bind(&identity, quic).await, None)
         };
         let addr = listener.local_addr().expect("sn local addr");
+        let peer_log = listener.peer_log();
         let address = addr.to_string();
         let delay = Arc::new(Mutex::new(Duration::ZERO));
         let fail_next = Arc::new(Mutex::new(false));
@@ -97,6 +99,7 @@ impl MockStorageNode {
             }
         });
         Self {
+            peer_log,
             identity,
             address,
             noise_info,
@@ -111,6 +114,11 @@ impl MockStorageNode {
     /// `host:port` for addressed order limits.
     pub fn address(&self) -> &str {
         &self.address
+    }
+
+    /// Client NodeIDs observed on authenticated TLS/QUIC connections.
+    pub fn tls_client_node_ids(&self) -> Vec<storj_rpc::NodeId> {
+        self.peer_log.lock().unwrap().clone()
     }
 
     pub(crate) fn noise_info(&self) -> Option<storj_proto::noise::NoiseInfo> {

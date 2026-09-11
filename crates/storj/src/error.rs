@@ -159,6 +159,8 @@ impl From<tokio::task::JoinError> for Error {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 #[non_exhaustive]
 pub enum ErrorKind {
+    /// Invalid caller-supplied TLS certificate chain or private key.
+    InvalidTlsIdentity,
     /// Custom metadata contains an empty key or NUL byte.
     MetadataInvalid,
     /// Rate limited by the satellite.
@@ -224,6 +226,7 @@ impl fmt::Display for ErrorKind {
             Self::DecryptionFailed => "decryption failed",
             Self::Protocol => "protocol",
             Self::MetadataInvalid => "invalid custom metadata",
+            Self::InvalidTlsIdentity => "invalid TLS identity",
             Self::Io => "i/o",
             Self::EdgeAuthDialFailed => "dial to auth service failed",
             Self::EdgeRegisterAccessFailed => "register access for edge service failed",

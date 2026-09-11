@@ -5,7 +5,7 @@ use std::str::FromStr;
 
 use p256::ecdsa::signature::{Signer, Verifier};
 use p256::ecdsa::{Signature, SigningKey, VerifyingKey};
-use p256::pkcs8::{DecodePrivateKey, EncodePublicKey};
+use p256::pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey};
 use rcgen::{
     BasicConstraints, CertificateParams, CustomExtension, DistinguishedName, DnType,
     ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose, PKCS_ECDSA_P256_SHA256,
@@ -13,6 +13,7 @@ use rcgen::{
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use sha2::{Digest, Sha256};
 use x509_parser::prelude::*;
+use zeroize::Zeroizing;
 
 /// Storj identity-version x509 extension (`peertls/extensions.IdentityVersionExtID`).
 ///
@@ -133,7 +134,7 @@ pub struct Identity {
     /// Certificates above the CA (Go "signed identity": the Storj signer that
     /// signed the CA, then any further parents). Empty for unsigned identities.
     parents: Vec<CertificateDer<'static>>,
-    key_pkcs8: Vec<u8>,
+    key_pkcs8: Zeroizing<Vec<u8>>,
 }
 
 impl Identity {
@@ -212,7 +213,7 @@ impl Identity {
             leaf: leaf_der,
             ca: ca_der,
             parents,
-            key_pkcs8: leaf_key.serialize_der(),
+            key_pkcs8: Zeroizing::new(leaf_key.serialize_der()),
         })
     }
 
@@ -233,7 +234,7 @@ impl Identity {
     /// Leaf PKCS#8 private key for rustls.
     #[must_use]
     pub fn private_key(&self) -> PrivateKeyDer<'static> {
-        PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(self.key_pkcs8.clone()))
+        PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(self.key_pkcs8.to_vec()))
     }
 
     /// CA certificate DER.
@@ -256,22 +257,85 @@ impl Identity {
             let pem = item.map_err(|e| IdentityError::Certificate(e.to_string()))?;
             match pem.label.as_str() {
                 "CERTIFICATE" => certs.push(CertificateDer::from(pem.contents)),
-                "PRIVATE KEY" => keys.push(pem.contents),
+                "PRIVATE KEY" => keys.push(Zeroizing::new(pem.contents)),
                 _ => {}
             }
         }
+        let key_pkcs8 = keys.into_iter().next().ok_or_else(|| {
+            IdentityError::Certificate("identity dump missing PRIVATE KEY".into())
+        })?;
+        Self::from_certificates_and_key(certs, key_pkcs8)
+    }
+
+    /// Load a leaf-first certificate chain and exactly one P-256 private key.
+    /// Accepts PKCS#8 (`PRIVATE KEY`) and SEC1 (`EC PRIVATE KEY`) PEM keys.
+    pub fn from_pem_parts(chain_pem: &str, key_pem: &str) -> Result<Self, IdentityError> {
+        let mut certs = Vec::new();
+        for item in x509_parser::pem::Pem::iter_from_buffer(chain_pem.as_bytes()) {
+            let pem = item.map_err(|e| IdentityError::Certificate(e.to_string()))?;
+            if pem.label != "CERTIFICATE" {
+                return Err(IdentityError::Certificate(
+                    "identity chain must contain only certificates".into(),
+                ));
+            }
+            certs.push(CertificateDer::from(pem.contents));
+        }
+        let mut key = None;
+        for item in x509_parser::pem::Pem::iter_from_buffer(key_pem.as_bytes()) {
+            let pem = item.map_err(|e| IdentityError::Certificate(e.to_string()))?;
+            if key.is_some() {
+                return Err(IdentityError::Certificate(
+                    "expected exactly one identity private key".into(),
+                ));
+            }
+            let bytes = Zeroizing::new(pem.contents);
+            key = Some(match pem.label.as_str() {
+                "PRIVATE KEY" => bytes,
+                "EC PRIVATE KEY" => {
+                    let secret = p256::SecretKey::from_sec1_der(&bytes).map_err(|_| {
+                        IdentityError::Certificate("invalid P-256 SEC1 private key".into())
+                    })?;
+                    let der = secret.to_pkcs8_der().map_err(|_| {
+                        IdentityError::Certificate("invalid P-256 private key".into())
+                    })?;
+                    Zeroizing::new(der.as_bytes().to_vec())
+                }
+                _ => {
+                    return Err(IdentityError::Certificate(
+                        "expected unencrypted P-256 private key".into(),
+                    ));
+                }
+            });
+        }
+        let key = key
+            .ok_or_else(|| IdentityError::Certificate("identity private key is missing".into()))?;
+        Self::from_certificates_and_key(certs, key)
+    }
+
+    fn from_certificates_and_key(
+        certs: Vec<CertificateDer<'static>>,
+        key_pkcs8: Zeroizing<Vec<u8>>,
+    ) -> Result<Self, IdentityError> {
         if certs.len() < 2 {
             return Err(IdentityError::Certificate(
                 "identity chain does not contain a CA certificate".into(),
             ));
         }
-        let key_pkcs8 = keys.into_iter().next().ok_or_else(|| {
-            IdentityError::Certificate("identity dump missing PRIVATE KEY".into())
-        })?;
         let leaf = certs[0].clone();
         let ca = certs[1].clone();
         let chain: Vec<&[u8]> = certs.iter().map(|c| c.as_ref()).collect();
         verify_chain(&chain)?;
+        let signing_key = SigningKey::from_pkcs8_der(&key_pkcs8)
+            .map_err(|_| IdentityError::Certificate("invalid P-256 PKCS#8 private key".into()))?;
+        let leaf_cert = parse_cert(leaf.as_ref())?;
+        let leaf_key =
+            VerifyingKey::from_sec1_bytes(leaf_cert.public_key().subject_public_key.as_ref())
+                .map_err(|_| IdentityError::Certificate("invalid P-256 leaf public key".into()))?;
+        if signing_key.verifying_key() != &leaf_key {
+            return Err(IdentityError::Certificate(
+                "identity private key does not match leaf certificate".into(),
+            ));
+        }
         let parents: Vec<CertificateDer<'static>> = certs[2..].to_vec();
         let id = NodeId::from_certificate_der(&ca)?;
         Ok(Self {
@@ -494,6 +558,24 @@ mod tests {
 
     const GO_DUMP: &str = include_str!("../testdata/go-identity.pem");
     const GO_NODE_ID: &str = "123tRdwfDZbVeCxX117eztrC2GLZP3hPWixgAphjoQoCoW7V51G";
+
+    #[test]
+    fn custom_identity_accepts_sec1_and_rejects_mismatched_pkcs8() {
+        let identity = Identity::from_pem(GO_DUMP).unwrap();
+        let chain = GO_DUMP.split("-----BEGIN PRIVATE KEY-----").next().unwrap();
+        let secret = p256::SecretKey::from_pkcs8_der(&identity.key_pkcs8).unwrap();
+        let sec1 = secret.to_sec1_pem(p256::pkcs8::LineEnding::LF).unwrap();
+        let loaded = Identity::from_pem_parts(chain, &sec1).unwrap();
+        assert_eq!(loaded.node_id(), identity.node_id());
+        hash_and_verify(
+            loaded.leaf_der(),
+            b"proof",
+            &loaded.hash_and_sign(b"proof").unwrap(),
+        )
+        .unwrap();
+        let wrong = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+        assert!(Identity::from_pem_parts(chain, &wrong.serialize_pem()).is_err());
+    }
 
     #[test]
     fn response_chain_requires_valid_signatures_and_expected_node_id() {

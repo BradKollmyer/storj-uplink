@@ -1391,6 +1391,8 @@ Storj uses **mTLS without a public CA**. NodeID = hash of the **CA root public k
 
 Uplink itself generates an **ephemeral identity** with difficulty 0 ([`uplink/tls.go`](https://github.com/storj/uplink/blob/v1.14.2/tls.go) `NewFullIdentity`). The satellite authenticates the **API key**, not the uplink NodeID. Storage nodes authenticate **order limits** signed by the satellite.
 
+Rust also accepts `Config::tls_identity = Some(TlsIdentity::from_pem(chain, key)?)`, matching Go's caller-supplied `ChainPEM`/`KeyPEM` capability. Construction verifies the leaf-first chain and the matching P-256 private key (PKCS#8 or SEC1); invalid input returns `InvalidTlsIdentity`. The parsed identity is reused by satellite pools and storage-node TLS/QUIC connections. Debug formatting omits key/certificate material and stored private keys are zeroized on drop. Noise retains independent ephemeral X25519 initiator keys.
+
 `storj-rpc` must:
 
 1. Generate a self-signed CA + leaf using **ECDSA P-256** (`pkcrypto.GeneratePrivateKey` in `storj.io/common`; Open Question 7 is closed). Include the Storj ID-version x509 extension (`PeerIDVersions: "0"`). Handshake-test against Go.
