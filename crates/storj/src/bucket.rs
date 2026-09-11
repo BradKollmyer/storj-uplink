@@ -9,7 +9,7 @@ use storj_proto::metainfo::{Bucket as ProtoBucket, BucketListItem};
 
 use crate::error::{Error, ErrorKind, Result};
 use crate::project::{BucketStream, Project};
-use crate::types::{Bucket, ListBucketsOptions};
+use crate::types::{Bucket, CreateBucketOptions, ListBucketsOptions};
 
 /// Empty name is invalid (Go `metaclient.ErrNoBucket`).
 pub(crate) fn require_bucket_name(name: &str) -> Result<()> {
@@ -103,8 +103,20 @@ pub(crate) fn bucket_from_list_item(item: BucketListItem) -> Result<Bucket> {
 impl Project {
     /// Create a bucket. Already-exists → `BucketAlreadyExists` with `Error::bucket()`.
     pub async fn create_bucket(&self, name: &str) -> Result<Bucket> {
+        self.create_bucket_with(name, CreateBucketOptions::default())
+            .await
+    }
+
+    /// Create a bucket with [`CreateBucketOptions`].
+    ///
+    /// Already-exists → `BucketAlreadyExists` with `Error::bucket()`.
+    pub async fn create_bucket_with(
+        &self,
+        name: &str,
+        opts: CreateBucketOptions,
+    ) -> Result<Bucket> {
         require_bucket_name(name)?;
-        match self.inner.metainfo.create_bucket(name).await {
+        match self.inner.metainfo.create_bucket(name, opts).await {
             Ok(bucket) => Ok(bucket),
             Err(e) if e.kind() == ErrorKind::BucketAlreadyExists => {
                 match self.inner.metainfo.get_bucket(name).await {

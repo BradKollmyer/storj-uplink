@@ -71,11 +71,11 @@ pub use encryption::EncryptionKey;
 pub use error::{Error, ErrorKind, Result};
 pub use project::{BucketStream, ObjectStream, PartStream, Project, UploadStream};
 pub use types::{
-    Bucket, BucketObjectLockConfiguration, CommitUploadOptions, CustomMetadata, DefaultRetention,
-    DownloadOptions, ListBucketsOptions, ListObjectsOptions, ListUploadPartsOptions,
-    ListUploadsOptions, Object, ObjectChecksum, ObjectChecksumAlgorithm, Part, Retention,
-    RetentionMode, SetObjectRetentionOptions, SystemMetadata, UploadInfo, UploadOptions,
-    verify_custom_metadata,
+    Bucket, BucketObjectLockConfiguration, CommitUploadOptions, CreateBucketOptions,
+    CustomMetadata, DefaultRetention, DownloadOptions, ListBucketsOptions, ListObjectsOptions,
+    ListUploadPartsOptions, ListUploadsOptions, Object, ObjectChecksum, ObjectChecksumAlgorithm,
+    Part, Retention, RetentionMode, SetObjectRetentionOptions, SystemMetadata, UploadInfo,
+    UploadOptions, verify_custom_metadata,
 };
 pub use upload::{Download, PartUpload, Upload};
 

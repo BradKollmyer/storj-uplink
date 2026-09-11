@@ -30,8 +30,8 @@ use crate::object_lock::{
     lock_config_from_proto, lock_config_to_proto, retention_from_proto, retention_to_proto,
 };
 use crate::types::{
-    Bucket, BucketObjectLockConfiguration, Config, CustomMetadata, Object, ObjectChecksum,
-    Retention, SystemMetadata,
+    Bucket, BucketObjectLockConfiguration, Config, CreateBucketOptions, CustomMetadata, Object,
+    ObjectChecksum, Retention, SystemMetadata,
 };
 
 use storj_proto::{decode_batch_response, encode_batch_request};
@@ -293,10 +293,16 @@ impl MetainfoClient {
         ProjectInfoResponse::decode(body.as_slice()).map_err(map_decode)
     }
 
-    pub(crate) async fn create_bucket(&self, name: &str) -> Result<Bucket> {
+    pub(crate) async fn create_bucket(
+        &self,
+        name: &str,
+        opts: CreateBucketOptions,
+    ) -> Result<Bucket> {
         let req = CreateBucketRequest {
             header: Some(self.header()),
             name: name.as_bytes().to_vec(),
+            object_lock_enabled: opts.object_lock_enabled,
+            placement: opts.placement,
             ..Default::default()
         };
         let body = self

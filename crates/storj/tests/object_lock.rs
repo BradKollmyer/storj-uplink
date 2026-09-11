@@ -2,8 +2,8 @@
 
 use std::time::{Duration, SystemTime};
 use storj::{
-    BucketObjectLockConfiguration, DefaultRetention, ErrorKind, Permission, Project, Retention,
-    RetentionMode, SetObjectRetentionOptions, UploadOptions,
+    BucketObjectLockConfiguration, CreateBucketOptions, DefaultRetention, ErrorKind, Permission,
+    Project, Retention, RetentionMode, SetObjectRetentionOptions, UploadOptions,
 };
 use storj_test::MockSatellite;
 use tokio::io::AsyncWriteExt;
@@ -213,6 +213,57 @@ async fn begin_object_retention_and_legal_hold_applied_at_commit() {
             .get_object_legal_hold(&bucket, key, None)
             .await
             .expect("get legal hold")
+    );
+}
+
+#[tokio::test]
+async fn create_bucket_with_object_lock_allows_retention_at_upload() {
+    let mock = MockSatellite::start().await;
+    let project = open_test_project(&mock).await;
+    let bucket = unique_bucket();
+    project
+        .create_bucket_with(
+            &bucket,
+            CreateBucketOptions {
+                object_lock_enabled: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create with lock");
+
+    let cfg = project
+        .get_bucket_object_lock_configuration(&bucket)
+        .await
+        .expect("get lock config");
+    assert!(cfg.enabled);
+
+    let until = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+    let retention = Retention {
+        mode: RetentionMode::Compliance,
+        retain_until: until,
+    };
+    let key = "locked-at-create-bucket";
+    let mut upload = project
+        .upload_object(
+            &bucket,
+            key,
+            UploadOptions {
+                retention: Some(retention.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("upload_object");
+    upload.write_all(b"lock-at-create").await.expect("write");
+    upload.commit().await.expect("commit");
+
+    assert_eq!(
+        project
+            .get_object_retention(&bucket, key, None)
+            .await
+            .expect("get retention"),
+        Some(retention)
     );
 }
 

@@ -543,12 +543,16 @@ fn handle_rpc(
                 return Err((RPC_ALREADY_EXISTS, format!("bucket already exists: {name}")));
             }
             let created = SystemTime::now();
+            let lock_config = req.object_lock_enabled.then_some(ObjectLockConfiguration {
+                enabled: true,
+                ..Default::default()
+            });
             state.buckets.insert(
                 name.clone(),
                 BucketRec {
                     created,
                     objects: 0,
-                    lock_config: None,
+                    lock_config,
                     object_locks: BTreeMap::new(),
                 },
             );

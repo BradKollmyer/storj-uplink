@@ -1,7 +1,7 @@
 //! Bucket operations against the in-process mock satellite.
 
 use futures_util::StreamExt;
-use storj::{ErrorKind, ListBucketsOptions, Project};
+use storj::{CreateBucketOptions, ErrorKind, ListBucketsOptions, Project};
 use storj_test::MockSatellite;
 
 #[tokio::test]
@@ -105,6 +105,43 @@ async fn empty_bucket_name_is_invalid() {
     let project = open_test_project(&mock).await;
     let err = project.create_bucket("").await.unwrap_err();
     assert_eq!(err.kind(), ErrorKind::BucketNameInvalid);
+}
+
+#[tokio::test]
+async fn create_bucket_with_object_lock_enabled() {
+    let mock = MockSatellite::start().await;
+    let project = open_test_project(&mock).await;
+
+    let locked = unique_bucket();
+    project
+        .create_bucket_with(
+            &locked,
+            CreateBucketOptions {
+                object_lock_enabled: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create with lock");
+    let cfg = project
+        .get_bucket_object_lock_configuration(&locked)
+        .await
+        .expect("get lock config");
+    assert!(cfg.enabled);
+
+    let plain = unique_bucket();
+    project.create_bucket(&plain).await.expect("plain create");
+    let unset = project
+        .get_bucket_object_lock_configuration(&plain)
+        .await
+        .unwrap_err();
+    assert_eq!(unset.kind(), ErrorKind::Protocol);
+    assert!(
+        unset
+            .to_string()
+            .contains("object lock is not enabled for this bucket"),
+        "{unset}"
+    );
 }
 
 async fn open_test_project(mock: &MockSatellite) -> Project {

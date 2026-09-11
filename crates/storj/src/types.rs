@@ -78,6 +78,15 @@ pub struct ListBucketsOptions {
     pub cursor: Option<String>,
 }
 
+/// Options for `Project::create_bucket_with`.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CreateBucketOptions {
+    /// Enable Object Lock at creation (satellite also enables versioning).
+    pub object_lock_enabled: bool,
+    /// Self-serve placement constraint name (empty = satellite project default).
+    pub placement: Vec<u8>,
+}
+
 /// Options for `Project::list_objects`.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ListObjectsOptions {
