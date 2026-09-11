@@ -54,6 +54,8 @@ published so the facade can resolve on crates.io; they are not a stable API.
 
 ### Fixed
 
+- Treat `ETAG_NONCE` / `CHECKSUM_NONCE` and the unpublished `storj-test` mock
+  as CodeQL hard-coded-crypto false positives, matching `ZERO_NONCE`.
 - Download a remote segment successfully when one of the initially fetched
   pieces is malformed: extra pieces are requested and `k`-subsets retried
   until AEAD decrypt succeeds (`storj/uplink#176`).

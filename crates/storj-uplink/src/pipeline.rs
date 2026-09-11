@@ -253,6 +253,8 @@ pub struct EncryptedUserData {
 }
 
 /// Nonce for `encrypted_etag` under the metadata key (Go `storj.Nonce{1}`).
+/// Uniqueness is the per-object metadata key, not the nonce.
+// codeql[rust/hard-coded-cryptographic-value]: Storj protocol nonce (Go storj.Nonce{1}); uniqueness is the per-object metadata key.
 pub const ETAG_NONCE: [u8; NONCE_SIZE] = user_data_nonce(1);
 
 /// Nonce for `encrypted_checksum` under the metadata key.
@@ -261,6 +263,7 @@ pub const ETAG_NONCE: [u8; NONCE_SIZE] = user_data_nonce(1);
 /// takes the next value so the three ciphertexts never share a nonce under
 /// the same key. No Go client produces this field yet, so this is our
 /// convention rather than a Go-pinned one.
+// codeql[rust/hard-coded-cryptographic-value]: Storj protocol nonce (checksum slot after ETag); uniqueness is the per-object metadata key.
 pub const CHECKSUM_NONCE: [u8; NONCE_SIZE] = user_data_nonce(2);
 
 const fn user_data_nonce(first: u8) -> [u8; NONCE_SIZE] {

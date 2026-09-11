@@ -2,10 +2,11 @@
 """Drop CodeQL results that sit in test code or documented false positives.
 
 Removes:
-  * paths under a `tests/` directory
+  * paths under a `tests/` directory or the unpublished `storj-test` crate
   * locations at or after a trailing item-level `#[cfg(test)] mod ...`
-  * `rust/hard-coded-cryptographic-value` on `pub const ZERO_NONCE` or
-    inside `csprng_bytes` (Go `storj.Nonce{}` / CSPRNG scratch buffer)
+  * `rust/hard-coded-cryptographic-value` on protocol nonces (`ZERO_NONCE`,
+    `ETAG_NONCE`, `CHECKSUM_NONCE`, `user_data_nonce`) or inside
+    `csprng_bytes` (Go `storj.Nonce{}` / CSPRNG scratch buffer)
 
 The hard-coded-crypto query stays enabled for every other production site.
 String literals and comments are ignored when finding the test-mod cutoff.
@@ -21,6 +22,12 @@ from pathlib import Path
 _CRYPTO_RULE = "hard-coded-cryptographic-value"
 _IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _CSPRNG_SCRATCH_RE = re.compile(r"let\s+mut\s+bytes\s*=\s*\[0u8;\s*N\]")
+_PROTOCOL_NONCE_IDENTS = (
+    "ZERO_NONCE",
+    "ETAG_NONCE",
+    "CHECKSUM_NONCE",
+    "user_data_nonce",
+)
 
 
 def _is_ident_start(ch: str) -> bool:
@@ -329,9 +336,14 @@ def uri_path(uri: str) -> str:
 
 
 def is_tests_dir(uri: str) -> bool:
-    """Return True if the URI is under a `tests/` directory."""
+    """Return True if the URI is under a `tests/` directory or `storj-test`."""
     p = uri_path(uri).replace("\\", "/")
-    return "/tests/" in p or p.endswith("/tests")
+    return (
+        "/tests/" in p
+        or p.endswith("/tests")
+        or "/storj-test/" in p
+        or p.endswith("/storj-test")
+    )
 
 
 def location_in_tests(loc: dict, cutoffs: dict[str, int | None], repo: Path) -> bool:
@@ -492,12 +504,15 @@ def is_documented_crypto_fp_text(
     start_col: int | None = None,
     end_col: int | None = None,
 ) -> bool:
-    """Return True if this span is `ZERO_NONCE` or the `csprng_bytes` scratch init."""
+    """Return True if this span is a protocol nonce or the `csprng_bytes` scratch init."""
     lines = text.splitlines()
     if start_line < 1 or start_line > len(lines):
         return False
     line = lines[start_line - 1]
-    if _region_hits_ident(line, "ZERO_NONCE", start_col, end_col):
+    if any(
+        _region_hits_ident(line, ident, start_col, end_col)
+        for ident in _PROTOCOL_NONCE_IDENTS
+    ):
         return True
     if not _CSPRNG_SCRATCH_RE.search(line.split("//", 1)[0]):
         return False
@@ -660,6 +675,15 @@ const KEY: [u8; 32] = [0; 32];
     assert not is_documented_crypto_fp_text(crypto, 8)
     assert not is_documented_crypto_fp_text(crypto, 11)
     assert is_documented_crypto_fp_text("encrypt(&ZERO_NONCE)\n", 1)
+    assert is_documented_crypto_fp_text(
+        "pub const ETAG_NONCE: [u8; 24] = user_data_nonce(1);\n", 1
+    )
+    assert is_documented_crypto_fp_text(
+        "pub const CHECKSUM_NONCE: [u8; 24] = user_data_nonce(2);\n",
+        1,
+        start_col=42,
+        end_col=60,
+    )
     # Comment beside an unrelated key must not match ZERO_NONCE.
     assert not is_documented_crypto_fp_text(
         "let key = [0u8; 32]; // ZERO_NONCE protocol constant\n", 1
@@ -716,8 +740,26 @@ const KEY: [u8; 32] = [0; 32];
             }
         ]
     }
+    (td / "crates").mkdir()
+    (td / "crates" / "storj-test").mkdir()
+    (td / "crates" / "storj-test" / "mock.rs").write_text("const KEY: [u8; 32] = [0x42; 32];\n")
+    sarif["runs"][0]["results"].append(
+        {
+            "ruleId": "rust/hard-coded-cryptographic-value",
+            "locations": [
+                {
+                    "physicalLocation": {
+                        "artifactLocation": {
+                            "uri": "crates/storj-test/mock.rs"
+                        },
+                        "region": {"startLine": 1},
+                    }
+                }
+            ],
+        }
+    )
     kept, dropped = filter_sarif(sarif, td)
-    assert dropped == 1 and kept == 2, (kept, dropped)
+    assert dropped == 2 and kept == 2, (kept, dropped)
     kept_lines = [
         r["locations"][0]["physicalLocation"]["region"]["startLine"]
         for r in sarif["runs"][0]["results"]

@@ -1,11 +1,13 @@
 name: storj-uplink
 # Integration tests and goldens pin Go vectors with fixed passphrases/keys/nonces.
-# `filter-test-alerts.py` strips trailing `#[cfg(test)] mod` blocks and two
-# documented production false positives (`ZERO_NONCE`, `csprng_bytes`). The
-# `rust/hard-coded-cryptographic-value` query itself stays enabled.
+# `filter-test-alerts.py` strips trailing `#[cfg(test)] mod` blocks, the
+# unpublished `storj-test` mock crate, and documented production false
+# positives (`ZERO_NONCE`, `ETAG_NONCE`, `CHECKSUM_NONCE`, `csprng_bytes`).
+# The `rust/hard-coded-cryptographic-value` query itself stays enabled.
 paths-ignore:
   - "crates/storj/tests/**"
   - "crates/*/tests/**"
+  - "crates/storj-test/**"
   - "fuzz/**"
   - "scripts/**"
   - "crates/storj-proto/src/gen/**"
