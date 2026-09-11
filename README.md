@@ -2,7 +2,7 @@
 
 Native Rust [Uplink](https://pkg.go.dev/storj.io/uplink) client for [Storj](https://storj.io).
 
-**2.0.0 (unreleased)** extends the public `storj::*` API: access grants, buckets, objects
+**1.1.0 (unreleased)** extends the public `storj::*` API: access grants, buckets, objects
 (multi-segment upload/download), listing, copy/move, multipart, revoke, and
 Object Lock. Spec: [docs/design-native-uplink.md](docs/design-native-uplink.md).
 
@@ -17,15 +17,15 @@ Edge credential registration and linksharing are outside this crate's scope.
 
 ```toml
 [dependencies]
-storj = "2.0"
+storj = "1.1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util"] }
 ```
 
 Callers need their own Tokio runtime; `tokio` is not re-exported.
 
-2.0.0 is not published yet; the version above is for the upcoming release.
+1.1.0 is not published yet; the version above is for the upcoming release.
 For local development use a path dependency on `crates/storj`. The published
-1.0.0 remains available as `storj = "1.0"` or Git tag `v1.0.0`.
+1.0.0 remains available as `storj = "=1.0.0"` or Git tag `v1.0.0`.
 From this workspace: `storj = { path = "crates/storj" }`.
 
 The public API is `storj::*` only. Implementation crates (`storj-access`,
@@ -185,7 +185,7 @@ types are not part of the facade API.
 
 ## Comparison with `uplink` 0.11.0 (FFI)
 
-| `uplink` 0.11.0 | `storj` 2.0.0 |
+| `uplink` 0.11.0 | `storj` 1.1.0 |
 |---|---|
 | crate name `uplink` | crate name `storj` |
 | `uplink::access::Grant` | `storj::Access` (`Access::parse`) |

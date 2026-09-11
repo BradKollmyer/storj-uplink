@@ -13,7 +13,7 @@
 ---
 
 This document retains the original 1.0 design and method mapping. Current
-development targets **2.0.0 (unreleased)**: the expanded literal-constructible
+development targets **1.1.0 (unreleased)**: the expanded literal-constructible
 `Config` is a breaking change, and public transport/telemetry types are owned
 by the `storj` facade with private conversions to RPC types. See `CHANGELOG.md`
 for migration details. Earlier Edge/GatewayMT follow-on plans below are
