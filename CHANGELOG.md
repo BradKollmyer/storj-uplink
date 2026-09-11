@@ -48,6 +48,8 @@ published so the facade can resolve on crates.io; they are not a stable API.
 
 ### Fixed
 
+- Reject invalid nonempty exact-key pending-upload cursors instead of silently
+  restarting the listing.
 - Piece response identities now match Go's validation: verify leaf against CA,
   pin the CA's NodeID, and parse optional remaining certificates without
   requiring a self-signed tail. TLS/QUIC retain full-chain validation.

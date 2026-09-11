@@ -299,7 +299,8 @@ pub struct ListUploadsOptions {
     /// exact object key via `ListPendingObjectStreams`.
     pub prefix: String,
     /// Relative to `prefix`. For an exact-key listing, a valid multipart
-    /// upload id is used as the exclusive `stream_id` cursor.
+    /// upload id is used as the exclusive `stream_id` cursor. An invalid nonempty
+    /// upload id yields `ErrorKind::UploadIdInvalid`.
     pub cursor: String,
     /// Do not collapse prefixes.
     pub recursive: bool,

@@ -400,6 +400,20 @@ async fn list_uploads_exact_key_pending_streams() {
     assert!(listed.iter().all(|u| u.key == key));
     assert!(listed.iter().any(|u| u.upload_id == first.upload_id));
     assert!(listed.iter().any(|u| u.upload_id == second.upload_id));
+    let resumed: Vec<_> = project
+        .list_uploads(
+            &bucket,
+            ListUploadsOptions {
+                prefix: key.into(),
+                cursor: listed[0].upload_id.clone(),
+                ..Default::default()
+            },
+        )
+        .collect()
+        .await;
+    let resumed: Vec<_> = resumed.into_iter().collect::<Result<Vec<_>, _>>().unwrap();
+    assert_eq!(resumed.len(), 1);
+    assert_eq!(resumed[0].upload_id, listed[1].upload_id);
     assert!(
         listed
             .iter()
@@ -466,6 +480,34 @@ async fn list_uploads_exact_key_pending_streams() {
     let all: Vec<_> = all.into_iter().collect::<Result<Vec<_>, _>>().unwrap();
     assert!(all.iter().any(|u| u.upload_id == first.upload_id));
     assert!(all.iter().any(|u| u.upload_id == second.upload_id));
+}
+
+#[tokio::test]
+async fn list_uploads_exact_key_rejects_invalid_cursor() {
+    let mock = MockSatellite::start().await;
+    let project = open_project(&mock).await;
+    for cursor in [
+        "garbage".to_owned(),
+        storj_access::check_encode(b"stream", STREAM_ID_BASE58_VERSION + 1),
+    ] {
+        // A nonexistent bucket also ensures validation happens before the RPC.
+        let results: Vec<_> = project
+            .list_uploads(
+                "missing-bucket",
+                ListUploadsOptions {
+                    prefix: "same-key".into(),
+                    cursor,
+                    ..Default::default()
+                },
+            )
+            .collect()
+            .await;
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].as_ref().unwrap_err().kind(),
+            ErrorKind::UploadIdInvalid
+        );
+    }
 }
 
 #[tokio::test]

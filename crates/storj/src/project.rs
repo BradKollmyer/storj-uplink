@@ -723,7 +723,14 @@ fn list_uploads_by_key(project: Project, bucket: String, opts: ListUploadsOption
         Ok(k) => k,
         Err(e) => return Box::pin(stream::once(async move { Err(map_enc(e)) })),
     };
-    let cursor = decode_upload_id(&opts.cursor).unwrap_or_default();
+    let cursor = if opts.cursor.is_empty() {
+        Vec::new()
+    } else {
+        match decode_upload_id(&opts.cursor) {
+            Ok(cursor) => cursor,
+            Err(error) => return Box::pin(stream::once(async move { Err(error) })),
+        }
+    };
     Box::pin(stream::try_unfold(
         ListPendingStreamsState {
             project,
