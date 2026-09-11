@@ -94,6 +94,7 @@ fn download_options_match_go_defaults() {
     let d = DownloadOptions::default();
     assert_eq!(d.offset, 0);
     assert_eq!(d.length, -1);
+    assert!(d.version.is_empty());
 }
 
 #[tokio::test]

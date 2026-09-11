@@ -35,6 +35,7 @@ async fn diagnostics_report_ranges_context_and_exclude_idle_time() {
             storj::DownloadOptions {
                 offset: -3,
                 length: -1,
+                ..Default::default()
             },
         )
         .await
@@ -112,6 +113,7 @@ async fn failed_initialization_keeps_unknown_size_and_reports_only_error_kind() 
             storj::DownloadOptions {
                 offset: 5,
                 length: 10,
+                ..Default::default()
             },
         )
         .await

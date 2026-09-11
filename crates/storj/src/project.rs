@@ -220,7 +220,7 @@ impl Project {
         let resp = self
             .inner
             .metainfo
-            .download_object(bucket, key, enc_path, range)
+            .download_object(bucket, key, enc_path, range, &opts.version)
             .await?;
         download_segments(
             Arc::clone(&self.inner),
@@ -1648,6 +1648,7 @@ mod tests {
                 DownloadOptions {
                     offset: -10,
                     length: 100,
+                    ..Default::default()
                 },
             )
             .await
@@ -1661,6 +1662,7 @@ mod tests {
                 DownloadOptions {
                     offset: -10,
                     length: 0,
+                    ..Default::default()
                 },
             )
             .await

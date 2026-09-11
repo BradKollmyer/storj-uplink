@@ -99,6 +99,7 @@ async fn ranged_download() {
     let opts = DownloadOptions {
         offset: 10,
         length: 20,
+        ..Default::default()
     };
     assert!(opts.validate().is_ok());
     let mut download = project
@@ -117,6 +118,7 @@ async fn ranged_download() {
             DownloadOptions {
                 offset: -8,
                 length: -1,
+                ..Default::default()
             },
         )
         .await
@@ -132,6 +134,7 @@ async fn ranged_download() {
             DownloadOptions {
                 offset: payload.len() as i64,
                 length: -1,
+                ..Default::default()
             },
         )
         .await
@@ -148,6 +151,7 @@ async fn ranged_download() {
             DownloadOptions {
                 offset: payload.len() as i64 + 50,
                 length: 10,
+                ..Default::default()
             },
         )
         .await
@@ -189,6 +193,7 @@ async fn remote_segment_round_trip() {
             DownloadOptions {
                 offset: 100,
                 length: 50,
+                ..Default::default()
             },
         )
         .await
@@ -215,10 +220,68 @@ async fn download_missing_object() {
 }
 
 #[tokio::test]
+async fn download_specific_object_version() {
+    let mock = MockSatellite::start().await;
+    let project = open_project(&mock).await;
+    let bucket = unique("ver");
+    project.ensure_bucket(&bucket).await.unwrap();
+
+    let mut upload = project
+        .upload_object(&bucket, "v.bin", Default::default())
+        .await
+        .unwrap();
+    upload.write_all(b"versioned body").await.unwrap();
+    let obj = upload.commit().await.expect("commit");
+    assert!(!obj.version.is_empty());
+    let st = project.stat_object(&bucket, "v.bin").await.expect("stat");
+    assert_eq!(st.version, obj.version);
+
+    let mut download = project
+        .download_object(
+            &bucket,
+            "v.bin",
+            DownloadOptions {
+                version: obj.version.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("download by version");
+    let mut got = Vec::new();
+    download.read_to_end(&mut got).await.expect("read");
+    assert_eq!(got, b"versioned body");
+
+    let err = match project
+        .download_object(
+            &bucket,
+            "v.bin",
+            DownloadOptions {
+                version: b"bogus-version".to_vec(),
+                ..Default::default()
+            },
+        )
+        .await
+    {
+        Ok(_) => panic!("bogus version must fail"),
+        Err(e) => e,
+    };
+    assert_eq!(err.kind(), ErrorKind::ObjectNotFound);
+
+    let mut latest = project
+        .download_object(&bucket, "v.bin", Default::default())
+        .await
+        .expect("download latest");
+    got.clear();
+    latest.read_to_end(&mut got).await.expect("read latest");
+    assert_eq!(got, b"versioned body");
+}
+
+#[tokio::test]
 async fn ranged_download_rejects_go_unsupported_combo() {
     let opts = DownloadOptions {
         offset: -10,
         length: 100,
+        ..Default::default()
     };
     assert_eq!(
         opts.validate().unwrap_err().kind(),
@@ -227,6 +290,7 @@ async fn ranged_download_rejects_go_unsupported_combo() {
     let zero = DownloadOptions {
         offset: -10,
         length: 0,
+        ..Default::default()
     };
     assert_eq!(
         zero.validate().unwrap_err().kind(),
@@ -318,6 +382,7 @@ async fn multi_segment_round_trip() {
             DownloadOptions {
                 offset: span_off,
                 length: 17,
+                ..Default::default()
             },
         )
         .await
@@ -334,6 +399,7 @@ async fn multi_segment_round_trip() {
             DownloadOptions {
                 offset: -8,
                 length: -1,
+                ..Default::default()
             },
         )
         .await

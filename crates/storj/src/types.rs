@@ -122,6 +122,9 @@ pub struct DownloadOptions {
     pub offset: i64,
     /// Length. Negative → until EOF. Default: -1.
     pub length: i64,
+    /// Empty downloads the latest object. Nonempty is sent as
+    /// `DownloadObject.object_version` (typically `Object.version`).
+    pub version: Vec<u8>,
 }
 
 impl Default for DownloadOptions {
@@ -129,6 +132,7 @@ impl Default for DownloadOptions {
         Self {
             offset: 0,
             length: -1,
+            version: Vec::new(),
         }
     }
 }
@@ -336,6 +340,7 @@ mod tests {
         let d = DownloadOptions::default();
         assert_eq!(d.offset, 0);
         assert_eq!(d.length, -1);
+        assert!(d.version.is_empty());
         assert!(d.validate().is_ok());
     }
 
@@ -344,6 +349,7 @@ mod tests {
         let d = DownloadOptions {
             offset: -100,
             length: -1,
+            version: Vec::new(),
         };
         assert!(d.validate().is_ok());
     }
@@ -353,12 +359,14 @@ mod tests {
         let d = DownloadOptions {
             offset: -10,
             length: 100,
+            version: Vec::new(),
         };
         let e = d.validate().unwrap_err();
         assert_eq!(e.kind(), ErrorKind::ObjectKeyInvalid);
         let zero = DownloadOptions {
             offset: -10,
             length: 0,
+            version: Vec::new(),
         };
         assert_eq!(
             zero.validate().unwrap_err().kind(),

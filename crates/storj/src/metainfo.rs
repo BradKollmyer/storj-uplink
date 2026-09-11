@@ -606,6 +606,7 @@ impl MetainfoClient {
         key: &str,
         encrypted_object_key: Vec<u8>,
         range: Option<Range>,
+        object_version: &[u8],
     ) -> Result<metainfo::DownloadObjectResponse> {
         let req = DownloadObjectRequest {
             header: Some(self.header()),
@@ -613,6 +614,7 @@ impl MetainfoClient {
             encrypted_object_key,
             range,
             limit: 0,
+            object_version: object_version.to_vec(),
             ..Default::default()
         };
         let items = self

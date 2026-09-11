@@ -951,7 +951,7 @@ fn commit_object(
         .first()
         .map(|s| s.scheme)
         .unwrap_or_else(test_scheme);
-    let obj = ProtoObject {
+    let mut obj = ProtoObject {
         bucket: pending.bucket.as_bytes().to_vec(),
         encrypted_object_key: pending.enc_key.clone(),
         stream_id: pending.stream_id.clone(),
@@ -968,6 +968,9 @@ fn commit_object(
         redundancy_scheme: Some(scheme),
         ..Default::default()
     };
+    if obj.object_version.is_empty() {
+        obj.object_version = obj.stream_id.clone();
+    }
     if let Some(rec) = st.buckets.get_mut(&pending.bucket) {
         rec.objects += 1;
         let lock_key = (pending.enc_key.clone(), Vec::new());
@@ -1650,10 +1653,12 @@ fn download_object(
     let st = state.lock().expect("mock state");
     check_key(&req.header, &st)?;
     check_action(&req.header, Action::Read)?;
-    let name = utf8_name(&req.bucket)?;
-    if !st.buckets.contains_key(&name) {
-        return Err((RPC_NOT_FOUND, format!("bucket not found: {name}")));
-    }
+    let name = require_committed_object(
+        &st,
+        &req.bucket,
+        &req.encrypted_object_key,
+        &req.object_version,
+    )?;
     let committed = st
         .committed
         .get(&(name, req.encrypted_object_key.clone()))

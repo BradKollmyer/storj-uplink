@@ -172,6 +172,7 @@ async fn auto_falls_back_to_tcp_and_telemetry_counts_range_errors_and_cancellati
             storj::DownloadOptions {
                 offset: 2,
                 length: 3,
+                ..Default::default()
             },
         )
         .await
