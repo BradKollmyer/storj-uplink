@@ -10,7 +10,56 @@ The public API is `storj::*` only. Implementation crates (`storj-access`,
 published so the facade can resolve on crates.io; they are not a stable API.
 `storj-test` stays unpublished.
 
-## [Unreleased]
+## [2.0.0] - Unreleased
+
+### Added
+
+- QUIC and Auto transport selection, plus Noise IK for advertised storage-node
+  piece uploads/downloads (both advertised cipher suites).
+- Opt-in local connection and transfer telemetry, with working time, ranges,
+  object size, environment and sanitized failure diagnostics.
+- Validated caller-supplied TLS identities, reused for satellite and storage-node
+  TLS/QUIC connections; PKCS#8 and SEC1 P-256 keys are supported.
+- Noise early data for DRPC INVOKE, optional TCP Fast Open, address racing,
+  and best-effort Linux QoS/congestion-controller options.
+- `verify_custom_metadata` and consistent validation before metadata mutation
+  or network requests.
+- Exact-key pending upload listing, downloads of a selected object version,
+  caller-supplied object checksum fields on begin/commit, and bucket creation
+  options for Object Lock and placement.
+
+### Breaking changes and migration
+
+- `Config` adds `tls_identity`, `transport`, `network`, and `telemetry`. Complete
+  1.0 literals must add these fields or end with `..Default::default()`.
+  Option structs remain constructible by literal.
+- `DownloadOptions` adds `version`; `UploadOptions` and `CommitUploadOptions`
+  add `checksum`. For 1.0 behavior use an empty version and `checksum: None`,
+  or supply the original fields with `..Default::default()`.
+- Default transport changes from TCP/TLS to advertised Noise for replay-safe
+  storage-node piece RPCs; metadata and unadvertised nodes still use TLS.
+  Set `transport: TransportMode::Tcp` to retain the 1.0 transport policy.
+- Transport options and telemetry events are facade-owned `storj` types. The
+  internal-crate re-exports present in unreleased development snapshots have
+  been removed. Applications should use `storj::{TransportMode, NetworkOptions,
+  Telemetry, TelemetryEvent, ...}`.
+- All published workspace crates move together to 2.0.0. This is release
+  preparation only; no crates have been published by this change.
+
+### Fixed
+
+- Piece response identities now match Go's validation: verify leaf against CA,
+  pin the CA's NodeID, and parse optional remaining certificates without
+  requiring a self-signed tail. TLS/QUIC retain full-chain validation.
+- Cap identical Noise handshakes across all resolved addresses at two when
+  duplicate suppression is advertised, otherwise one. Connections that fail
+  before any handshake write do not consume the budget.
+- Gate `tokio-tfo` to its supported targets; other targets use ordinary TCP.
+- Test stalled and unavailable Fast Open using controlled connections instead
+  of requiring the host kernel to enable TFO.
+- Clarify that Noise early data currently contains DRPC INVOKE only; the first
+  piece request is sent after authentication.
+
 
 ### Changed
 

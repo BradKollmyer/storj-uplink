@@ -19,7 +19,6 @@ rcgen.workspace = true
 rustls.workspace = true
 tokio-rustls.workspace = true
 quinn.workspace = true
-tokio-tfo.workspace = true
 socket2.workspace = true
 
 snow.workspace = true
@@ -27,8 +26,11 @@ zeroize.workspace = true
 futures-util.workspace = true
 x509-parser.workspace = true
 
+[target.'cfg(any(windows, target_os = "linux", target_os = "android", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd", target_os = "dragonfly", target_os = "macos", target_os = "ios", target_os = "watchos", target_os = "tvos"))'.dependencies]
+tokio-tfo.workspace = true
+
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util", "test-util"] }
 
 [lints]
 workspace = true

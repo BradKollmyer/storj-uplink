@@ -1604,7 +1604,7 @@ dependencies = [
 
 [[package]]
 name = "storj"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "futures-core",
  "futures-util",
@@ -1628,7 +1628,7 @@ dependencies = [
 
 [[package]]
 name = "storj-access"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "bs58",
  "getrandom 0.4.3",
@@ -1642,7 +1642,7 @@ dependencies = [
 
 [[package]]
 name = "storj-ec"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "hex",
  "reed-solomon-erasure",
@@ -1651,7 +1651,7 @@ dependencies = [
 
 [[package]]
 name = "storj-encryption"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -1665,7 +1665,7 @@ dependencies = [
 
 [[package]]
 name = "storj-proto"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "prost",
  "prost-types",
@@ -1675,7 +1675,7 @@ dependencies = [
 
 [[package]]
 name = "storj-rpc"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "bs58",
  "futures-util",
@@ -1696,7 +1696,7 @@ dependencies = [
 
 [[package]]
 name = "storj-test"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "prost",
  "prost-types",
@@ -1714,7 +1714,7 @@ dependencies = [
 
 [[package]]
 name = "storj-uplink"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "blake3",
  "ed25519-dalek",

@@ -30,6 +30,7 @@ pub type UploadStream = Pin<Box<dyn Stream<Item = Result<UploadInfo>> + Send>>;
 pub type PartStream = Pin<Box<dyn Stream<Item = Result<crate::types::Part>> + Send>>;
 
 pub(crate) struct ProjectInner {
+    pub(crate) telemetry_options: crate::telemetry::TelemetryOptions,
     pub(crate) connection_options: storj_rpc::transport::ConnectionOptions,
     pub(crate) metainfo: MetainfoClient,
     pub(crate) store: storj_encryption::Store,
@@ -64,11 +65,8 @@ impl Project {
         let message_timeout = config.message_timeout_or_default();
         Ok(Self {
             inner: Arc::new(ProjectInner {
-                connection_options: storj_rpc::transport::ConnectionOptions {
-                    mode: config.transport,
-                    telemetry: config.telemetry.clone(),
-                    network: config.network.clone(),
-                },
+                telemetry_options: config.telemetry_options(),
+                connection_options: config.connection_options(),
                 metainfo,
                 store,
                 identity,
@@ -99,7 +97,7 @@ impl Project {
     ) -> Result<Upload> {
         let mut telemetry = crate::telemetry::Transfer::new(
             crate::Operation::Upload,
-            &self.inner.connection_options,
+            &self.inner.telemetry_options,
             self.inner.metainfo.satellite_label(),
         );
         telemetry.diagnostics.expires = Some(opts.expires.is_some());
@@ -191,7 +189,7 @@ impl Project {
     ) -> Result<Download> {
         let mut telemetry = crate::telemetry::Transfer::new(
             crate::Operation::Download,
-            &self.inner.connection_options,
+            &self.inner.telemetry_options,
             self.inner.metainfo.satellite_label(),
         );
         telemetry.download_request(opts.offset, opts.length);
@@ -369,7 +367,7 @@ impl Project {
     ) -> Result<PartUpload> {
         let mut telemetry = crate::telemetry::Transfer::new(
             crate::Operation::UploadPart,
-            &self.inner.connection_options,
+            &self.inner.telemetry_options,
             self.inner.metainfo.satellite_label(),
         );
         match self
@@ -1632,6 +1630,7 @@ mod tests {
             inner: Arc::new(ProjectInner {
                 metainfo: placeholder_metainfo(),
                 connection_options: storj_rpc::transport::ConnectionOptions::default(),
+                telemetry_options: Default::default(),
                 store: storj_encryption::Store::new(),
                 identity: storj_rpc::Identity::generate().expect("ephemeral identity"),
                 pool: storj_uplink::pool::ConnectionPool::new(

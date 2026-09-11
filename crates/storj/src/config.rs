@@ -51,3 +51,19 @@ impl PartialEq for TlsIdentity {
     }
 }
 impl Eq for TlsIdentity {}
+
+impl Config {
+    pub(crate) fn connection_options(&self) -> storj_rpc::transport::ConnectionOptions {
+        storj_rpc::transport::ConnectionOptions {
+            mode: self.transport.to_rpc(),
+            network: self.network.to_rpc(),
+            telemetry: self.telemetry.as_ref().map(crate::Telemetry::to_rpc),
+        }
+    }
+    pub(crate) fn telemetry_options(&self) -> crate::telemetry::TelemetryOptions {
+        crate::telemetry::TelemetryOptions {
+            mode: self.transport,
+            telemetry: self.telemetry.clone(),
+        }
+    }
+}

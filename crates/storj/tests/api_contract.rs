@@ -70,10 +70,40 @@ fn permission_full_is_not_2025_four_flag_full() {
 }
 
 #[test]
-fn config_has_no_temp_dir() {
-    let c = Config::default();
+fn config_remains_constructible_by_literal() {
+    // 2.0 adds explicit options rather than making the public struct opaque.
+    let c = Config {
+        user_agent: None,
+        dial_timeout: None,
+        message_timeout: None,
+        tls_identity: None,
+        transport: storj::TransportMode::Noise,
+        network: storj::NetworkOptions {
+            noise_early_data: true,
+            tcp_fast_open: true,
+            background_qos: true,
+            congestion_control: None,
+        },
+        telemetry: None,
+    };
+    assert_eq!(c, Config::default());
     assert!(c.user_agent.is_none());
     assert_eq!(c.dial_timeout_or_default(), Duration::from_secs(20));
+}
+
+#[test]
+fn facade_options_and_events_are_not_internal_type_aliases() {
+    // Guard the public semver boundary: re-exporting an internal type makes
+    // changes to its fields/variants part of storj's public API.
+    fn distinct<A: 'static, B: 'static>() {
+        assert_ne!(std::any::TypeId::of::<A>(), std::any::TypeId::of::<B>());
+    }
+    distinct::<storj::TransportMode, storj_rpc::transport::TransportMode>();
+    distinct::<storj::TransportKind, storj_rpc::transport::TransportKind>();
+    distinct::<storj::NetworkOptions, storj_rpc::transport::NetworkOptions>();
+    distinct::<storj::Telemetry, storj_rpc::telemetry::Telemetry>();
+    distinct::<storj::TelemetryEvent, storj_rpc::telemetry::TelemetryEvent>();
+    distinct::<storj::Outcome, storj_rpc::telemetry::Outcome>();
 }
 
 #[test]

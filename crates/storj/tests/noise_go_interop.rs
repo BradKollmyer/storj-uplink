@@ -75,7 +75,7 @@ async fn noise_interoperates_with_go_both_ciphers_and_maximum_records() {
                 &key,
                 Duration::from_secs(5),
                 &storj_rpc::transport::ConnectionOptions {
-                    network: storj::NetworkOptions {
+                    network: storj_rpc::transport::NetworkOptions {
                         noise_early_data: early,
                         tcp_fast_open: fast,
                         ..Default::default()
@@ -87,7 +87,7 @@ async fn noise_interoperates_with_go_both_ciphers_and_maximum_records() {
             .await
             .unwrap();
             assert!(stream.peer_cert.is_empty());
-            assert_eq!(stream.kind, storj::TransportKind::Noise);
+            assert_eq!(stream.kind, storj_rpc::transport::TransportKind::Noise);
             for i in 1..=3 {
                 let payload = vec![i as u8; 256 * 1024 + i];
                 stream.write_all(&payload).await.unwrap();

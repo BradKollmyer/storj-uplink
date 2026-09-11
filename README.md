@@ -2,7 +2,7 @@
 
 Native Rust [Uplink](https://pkg.go.dev/storj.io/uplink) client for [Storj](https://storj.io).
 
-**1.0.0** freezes the public `storj::*` API: access grants, buckets, objects
+**2.0.0 (unreleased)** extends the public `storj::*` API: access grants, buckets, objects
 (multi-segment upload/download), listing, copy/move, multipart, revoke, and
 Object Lock. Spec: [docs/design-native-uplink.md](docs/design-native-uplink.md).
 
@@ -11,20 +11,21 @@ This is **not** an S3 SDK, **not** an FFI wrapper around
 crates.io [`uplink` 0.11.0](https://docs.rs/uplink/0.11.0/uplink/) (blocking,
 `!Send`). Go is never required to build or use the crate.
 
-`storj::edge` (GatewayMT / linksharing) is specified for 1.x and is not in this
-tree.
+Edge credential registration and linksharing are outside this crate's scope.
 
 ## Install
 
 ```toml
 [dependencies]
-storj = "1.0"
+storj = "2.0"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util"] }
 ```
 
 Callers need their own Tokio runtime; `tokio` is not re-exported.
 
-Git: `storj = { git = "https://github.com/BradKollmyer/storj-uplink", tag = "v1.0.0" }`.
+2.0.0 is not published yet; the version above is for the upcoming release.
+For local development use a path dependency on `crates/storj`. The published
+1.0.0 remains available as `storj = "1.0"` or Git tag `v1.0.0`.
 From this workspace: `storj = { path = "crates/storj" }`.
 
 The public API is `storj::*` only. Implementation crates (`storj-access`,
@@ -103,8 +104,11 @@ Connection telemetry reports `TransportKind::Noise` for these connections.
 `Config::network` controls `noise_early_data`, `tcp_fast_open`, and
 `background_qos` (all enabled by default). Fast Open races ordinary TCP after
 250 ms only when the satellite advertises Fast Open and a debounce limit of at
-least two. Both attempts send identical handshake bytes, and failures or unavailable
-Fast Open support allow ordinary TCP to proceed. TCP address candidates also race
+least two. Across all resolved addresses, at most two identical handshakes
+are sent (one without advertised suppression). Failed connects consume no
+handshake budget; attempts that may have written bytes are never refunded.
+Unavailable Fast Open support allows ordinary TCP to proceed. The optional
+TFO dependency is compiled only on platforms supported by `tokio-tfo`. TCP address candidates also race
 to avoid a stalled IPv6 route blocking IPv4. On Linux, background QoS requests
 Lower Effort DSCP; `congestion_control` can name a kernel TCP controller. These
 socket hints are best-effort. Disable `noise_early_data` for an eager, empty-payload
@@ -170,11 +174,15 @@ bytes are zeroized when dropped.
 Callbacks run synchronously and may run concurrently; keep them fast and
 nonblocking. With panic unwinding, callback panics are caught. There is no
 automatic network exporter or background delivery queue. Existing `Config`
-struct literals should use `..Default::default()` for the new fields.
+struct literals from 1.0 must add the four new fields or use
+`..Default::default()`. To retain the 1.0 transport policy, set
+`transport: TransportMode::Tcp`; the new default selects advertised Noise.
+Public transport and telemetry types are defined by `storj`; internal RPC
+types are not part of the facade API.
 
 ## Comparison with `uplink` 0.11.0 (FFI)
 
-| `uplink` 0.11.0 | `storj` 1.0.0 |
+| `uplink` 0.11.0 | `storj` 2.0.0 |
 |---|---|
 | crate name `uplink` | crate name `storj` |
 | `uplink::access::Grant` | `storj::Access` (`Access::parse`) |

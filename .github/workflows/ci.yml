@@ -28,6 +28,18 @@ jobs:
         run: cargo fmt --all -- --check
       - name: clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Fast Open dependency stays off unsupported targets
+        run: |
+          python3 - <<'PY'
+          import subprocess
+          for target in ("x86_64-unknown-illumos", "x86_64-unknown-fuchsia"):
+              tree = subprocess.check_output([
+                  "cargo", "tree", "--locked", "--target", target,
+                  "-p", "storj-rpc", "--edges", "normal", "--prefix", "none",
+              ], text=True)
+              if any(line.startswith("tokio-tfo ") for line in tree.splitlines()):
+                  raise SystemExit(f"tokio-tfo must not be built for {target}")
+          PY
       - name: fuzz targets compile
         run: cargo check --manifest-path fuzz/Cargo.toml --bins --locked
       - name: rustdoc

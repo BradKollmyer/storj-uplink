@@ -1,10 +1,14 @@
 use crate::{DiagnosticRange, Error, Operation, Outcome, TelemetryEvent, TransferDiagnostics};
 use std::time::Instant;
-use storj_rpc::transport::ConnectionOptions;
+#[derive(Clone, Default)]
+pub(crate) struct TelemetryOptions {
+    pub(crate) mode: crate::TransportMode,
+    pub(crate) telemetry: Option<crate::Telemetry>,
+}
 
 /// Owns one terminal event, including when its future/handle is dropped.
 pub(crate) struct Transfer {
-    options: ConnectionOptions,
+    options: TelemetryOptions,
     operation: Operation,
     start: Instant,
     bytes: u64,
@@ -14,11 +18,7 @@ pub(crate) struct Transfer {
     pub(crate) diagnostics: TransferDiagnostics,
 }
 impl Transfer {
-    pub(crate) fn new(
-        operation: Operation,
-        options: &ConnectionOptions,
-        satellite: String,
-    ) -> Self {
+    pub(crate) fn new(operation: Operation, options: &TelemetryOptions, satellite: String) -> Self {
         let now = Instant::now();
         let mut diagnostics = TransferDiagnostics::default();
         if options.telemetry.is_some() {

@@ -1,18 +1,7 @@
 //! Opt-in application telemetry. No network exporter is installed.
 
-use crate::transport::{TransportKind, TransportMode};
+use crate::transport::TransportKind;
 use std::{fmt, sync::Arc, time::Duration};
-
-/// Operation measured by a transfer event.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Operation {
-    /// A complete object upload, including commit.
-    Upload,
-    /// A requested object range read by the caller.
-    Download,
-    /// One multipart part, including its commit.
-    UploadPart,
-}
 
 /// Terminal outcome. Dropped unfinished transfers are cancelled.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -25,83 +14,14 @@ pub enum Outcome {
     Cancelled,
 }
 
-/// Download range, in plaintext bytes. Requested ranges can contain negative
-/// offsets/lengths; resolved ranges are clamped to the object and nonnegative.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct DiagnosticRange {
-    pub offset: i64,
-    pub length: i64,
-}
-
-/// Additional local diagnostics, without object paths, credentials or error text.
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[non_exhaustive]
-pub struct TransferDiagnostics {
-    /// Time inside initialization/control futures and read/write operations.
-    /// An I/O operation remains active from first poll until Ready or transfer
-    /// termination; abandoning just its future is not observable by AsyncRead/Write.
-    pub working_time: Duration,
-    pub requested_range: Option<DiagnosticRange>,
-    pub resolved_range: Option<DiagnosticRange>,
-    pub object_size: Option<u64>,
-    /// Canonical satellite NodeID@address, never an access grant.
-    pub satellite: String,
-    pub os: &'static str,
-    pub architecture: &'static str,
-    pub cpu_count: Option<usize>,
-    /// Whether object expiration is set, when known.
-    pub expires: Option<bool>,
-    /// Public error kind only, not the error's message or source chain.
-    pub error_kind: Option<String>,
-    pub retryable: Option<bool>,
-}
-impl Default for TransferDiagnostics {
-    fn default() -> Self {
-        Self {
-            working_time: Duration::ZERO,
-            requested_range: None,
-            resolved_range: None,
-            object_size: None,
-            satellite: String::new(),
-            os: std::env::consts::OS,
-            architecture: std::env::consts::ARCH,
-            cpu_count: None,
-            expires: None,
-            error_kind: None,
-            retryable: None,
-        }
-    }
-}
-
-/// Telemetry deliberately excludes credentials, bucket names, keys and error text.
+/// One low-level connection attempt. Transfer events belong to the facade.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum TelemetryEvent {
-    /// One connection attempt, including unsuccessful candidates in Auto mode.
     Connection {
-        /// Wire transport attempted (not necessarily selected).
         transport: TransportKind,
-        /// Time spent on this candidate, including name resolution.
         elapsed: Duration,
-        /// Authentication succeeded, failed, or the attempt was cancelled.
         outcome: Outcome,
-    },
-    /// One logical transfer. Bytes are plaintext accepted/written or delivered/read.
-    Transfer {
-        /// Upload, download, or multipart part.
-        operation: Operation,
-        /// Plaintext bytes accepted from the writer or delivered to the reader.
-        bytes: u64,
-        /// Time since the public operation was started, including initialization.
-        elapsed: Duration,
-        /// Time to the first nonzero write/read, or `None` if no bytes moved.
-        first_byte: Option<Duration>,
-        /// Final result; emitted once per transfer.
-        outcome: Outcome,
-        /// Configured policy. Connection events identify actual transports.
-        transport_mode: TransportMode,
-        /// Working time, range, environment and sanitized failure details.
-        diagnostics: Box<TransferDiagnostics>,
     },
 }
 

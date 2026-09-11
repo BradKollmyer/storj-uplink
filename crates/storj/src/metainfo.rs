@@ -134,11 +134,7 @@ impl MetainfoClient {
             identity,
             dial_timeout: config.dial_timeout_or_default(),
             message_timeout: config.message_timeout_or_default(),
-            connection_options: ConnectionOptions {
-                mode: config.transport,
-                telemetry: config.telemetry.clone(),
-                network: config.network.clone(),
-            },
+            connection_options: config.connection_options(),
             satellite_cert: Mutex::new(Vec::new()),
             idle: std::sync::Mutex::new(Vec::new()),
             slots: Arc::new(tokio::sync::Semaphore::new(MAX_SATELLITE_CONNS)),

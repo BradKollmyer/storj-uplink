@@ -7,10 +7,17 @@
 | **Date** | 2026-09-01 (1.0.0 on `main` 2026-09-02) |
 | **Status** | Implemented |
 | **Audience** | Engineers using or changing `storj-uplink` |
-| **Repo** | `storj-uplink` (`main` is 1.0.0) |
+| **Repo** | `storj-uplink` |
 | **Analog** | Go [`storj.io/uplink`](https://pkg.go.dev/storj.io/uplink) v1.14.5; prior Rust [`uplink` 0.11.0](https://docs.rs/uplink/0.11.0/uplink/) (FFI, May 2025) |
 
 ---
+
+This document retains the original 1.0 design and method mapping. Current
+development targets **2.0.0 (unreleased)**: the expanded literal-constructible
+`Config` is a breaking change, and public transport/telemetry types are owned
+by the `storj` facade with private conversions to RPC types. See `CHANGELOG.md`
+for migration details. Earlier Edge/GatewayMT follow-on plans below are
+superseded: credential registration and linksharing are outside this crate's scope.
 
 ## Overview
 
@@ -1383,7 +1390,7 @@ There is **no production-quality Rust DRPC** (`zeebo/drpc-rs` is marked incomple
 | `DRPC!!!1` | DRPC over TLS |
 | `DRPC!N!1` | DRPC over Noise IK |
 
-The 1.0.0 release used TLS only. The default `TransportMode::Noise` supports both advertised IK/X25519/BLAKE2b suites (ChaChaPoly and AESGCM) for storage-node Upload/Download. Satellite metadata and nodes without Noise advertisements use TLS. Invalid advertisements or failed Noise authentication do not trigger a TLS downgrade. Only the DRPC INVOKE frame travels in the Noise handshake: `Conn::open_stream` flushes before the first piece request, so its order limit and upload chunk are sent after the handshake, unlike Go's coalesced early data. `Config::network.noise_early_data = false` restores an eager empty-payload handshake. Fast Open races ordinary TCP only for advertised endpoints with sufficient debounce capacity, using identical handshake bytes. Authentication, DNS and fallback share a dial deadline. Linux DSCP and optional congestion-controller hints are best-effort. Upload response identities match Go `DecodePeerIdentity`: require leaf and CA, verify the leaf's signature against the CA, and pin the CA's NodeID to the order limit before checking piece signatures. Additional response certificates must parse but their signatures are not checked; a signed CA may omit its signer. TLS/QUIC handshakes retain full-chain signature validation. Snow handles the handshake and ciphers; a bounded record layer supports Go noiseconn's 65535-byte plaintext records, including the 16-byte authentication tag.
+The 1.0.0 release used TLS only. The default `TransportMode::Noise` supports both advertised IK/X25519/BLAKE2b suites (ChaChaPoly and AESGCM) for storage-node Upload/Download. Satellite metadata and nodes without Noise advertisements use TLS. Invalid advertisements or failed Noise authentication do not trigger a TLS downgrade. Only the DRPC INVOKE frame travels in the Noise handshake: `Conn::open_stream` flushes before the first piece request, so its order limit and upload chunk are sent after the handshake, unlike Go's coalesced early data. `Config::network.noise_early_data = false` restores an eager empty-payload handshake. Fast Open races ordinary TCP only for advertised endpoints with sufficient debounce capacity, sharing a maximum of two identical handshake copies across all resolved addresses (one without advertised suppression). Connect failures consume no copies; attempted handshake writes are never refunded. The optional TFO dependency is gated to supported platforms; other platforms use ordinary TCP. Authentication, DNS and fallback share a dial deadline. Linux DSCP and optional congestion-controller hints are best-effort. Upload response identities match Go `DecodePeerIdentity`: require leaf and CA, verify the leaf's signature against the CA, and pin the CA's NodeID to the order limit before checking piece signatures. Additional response certificates must parse but their signatures are not checked; a signed CA may omit its signer. TLS/QUIC handshakes retain full-chain signature validation. Snow handles the handshake and ciphers; a bounded record layer supports Go noiseconn's 65535-byte plaintext records, including the 16-byte authentication tag.
 
 ### Identity and TLS
 
