@@ -471,6 +471,9 @@ pub(crate) fn verify_chain(chain_der: &[&[u8]]) -> Result<(), IdentityError> {
 
 /// Validate concatenated DER certificates from a piecestore response and pin
 /// the CA's NodeID to the satellite's order limit. Returns the verified leaf.
+/// Like Go `DecodePeerIdentity`, validate the leaf's signature against the CA;
+/// additional certificates must parse but their signatures are not checked.
+/// A signed CA need not include its signer here. TLS uses full `verify_chain`.
 pub fn verified_leaf(chain: &[u8], expected: NodeId) -> Result<&[u8], IdentityError> {
     let mut rest = chain;
     let mut certs = Vec::new();
@@ -480,7 +483,12 @@ pub fn verified_leaf(chain: &[u8], expected: NodeId) -> Result<&[u8], IdentityEr
         certs.push(&rest[..rest.len() - remaining.len()]);
         rest = remaining;
     }
-    verify_chain(&certs)?;
+    if certs.len() < 2 {
+        return Err(IdentityError::Certificate(
+            "piece response certificate chain missing CA".into(),
+        ));
+    }
+    verify_signed_by(&parse_cert(certs[0])?, &parse_cert(certs[1])?)?;
     if NodeId::from_certificate_der(certs[1])? != expected {
         return Err(IdentityError::Certificate(
             "piece response NodeID mismatch".into(),
@@ -578,7 +586,7 @@ mod tests {
     }
 
     #[test]
-    fn response_chain_requires_valid_signatures_and_expected_node_id() {
+    fn response_chain_requires_leaf_signature_and_expected_node_id() {
         let identity = Identity::generate_signed().unwrap();
         let chain: Vec<u8> = identity
             .cert_chain()
@@ -594,12 +602,34 @@ mod tests {
         assert!(verified_leaf(identity.leaf_der().as_ref(), identity.node_id()).is_err());
         assert!(verified_leaf(&chain[..chain.len() - 1], identity.node_id()).is_err());
         let mut corrupt = chain.clone();
-        let last = corrupt.len() - 1;
+        let last = identity.leaf_der().len() - 1;
         corrupt[last] ^= 1;
         assert!(verified_leaf(&corrupt, identity.node_id()).is_err());
         let mut trailing = chain;
         trailing.push(0);
         assert!(verified_leaf(&trailing, identity.node_id()).is_err());
+    }
+
+    #[test]
+    fn response_chain_accepts_signed_ca_without_validating_rest_chain() {
+        let identity = Identity::generate_signed().unwrap();
+        let pair = [identity.leaf_der().as_ref(), identity.ca_der().as_ref()];
+        let chain = pair.concat();
+        assert_eq!(
+            verified_leaf(&chain, identity.node_id()).unwrap(),
+            identity.leaf_der().as_ref()
+        );
+        // TLS still requires the signer for this non-self-signed CA.
+        assert!(verify_chain(&pair).is_err());
+
+        let unrelated = Identity::generate().unwrap();
+        let with_unrelated_tail = [chain.as_slice(), unrelated.ca_der().as_ref()].concat();
+        assert!(verified_leaf(&with_unrelated_tail, identity.node_id()).is_ok());
+        assert!(verify_chain(&[pair[0], pair[1], unrelated.ca_der().as_ref()]).is_err());
+
+        // Pinning a CA cannot authorize a leaf signed by somebody else.
+        let wrong_leaf = [unrelated.leaf_der().as_ref(), pair[1]].concat();
+        assert!(verified_leaf(&wrong_leaf, identity.node_id()).is_err());
     }
 
     #[test]

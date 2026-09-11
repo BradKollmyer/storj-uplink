@@ -219,8 +219,8 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Client<T> {
             .done
             .ok_or_else(|| Error::protocol("expected piece hash"))?;
         // Noise has no TLS certificate. Go includes its identity chain in the
-        // response; validate every signature and the order limit's NodeID before
-        // trusting that leaf for the piece hash. Also validate supplied chains
+        // response; validate leaf<-CA and pin the CA's NodeID to the order limit
+        // before trusting that leaf for the piece hash. Also validate supplied chains
         // on TLS/QUIC, matching Go's preference for the response identity.
         let leaf = if resp.node_certchain.is_empty() {
             self.peer_cert_der.as_slice()
@@ -495,6 +495,7 @@ mod tests {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum UploadFault {
         None,
+        LeafCaResponse,
         WrongDigest,
         WrongSigner,
         ExpiredTimestamp,
@@ -639,7 +640,7 @@ mod tests {
             hash_algorithm: algo.to_i32(),
         };
         match fault {
-            UploadFault::None => {}
+            UploadFault::None | UploadFault::LeafCaResponse => {}
             UploadFault::WrongDigest => sn_hash.hash = vec![0xab; 32],
             UploadFault::WrongSigner => {}
             UploadFault::ExpiredTimestamp => {
@@ -660,7 +661,11 @@ mod tests {
         sign_piece_hash_node(&mut sn_hash, signer)?;
         let resp = PieceUploadResponse {
             done: Some(sn_hash),
-            node_certchain: Vec::new(),
+            node_certchain: if fault == UploadFault::LeafCaResponse {
+                [sn.leaf_der().as_ref(), sn.ca_der().as_ref()].concat()
+            } else {
+                Vec::new()
+            },
         };
         conn.write_packet(&Packet {
             stream_id,
@@ -971,6 +976,50 @@ mod tests {
             client.download(&limit, &key, 10, 0).await.unwrap_err(),
             Error::OrderLimitSignature
         ));
+    }
+
+    #[tokio::test]
+    async fn upload_accepts_signed_response_identity_without_its_signer() {
+        // Exercise response identity selection with and without a TLS leaf.
+        for has_tls_leaf in [false, true] {
+            let satellite = Identity::generate().unwrap();
+            let sn = Identity::generate_signed().unwrap();
+            let piece_key = PiecePrivateKey::generate();
+            let payload = b"signed CA without RestChain";
+            let limit = signed_limit(
+                &satellite,
+                &sn,
+                &piece_key,
+                &[0x42; 32],
+                PieceAction::Put,
+                payload.len() as i64,
+            );
+            let sat_cert = satellite.leaf_der().as_ref().to_vec();
+            let peer_cert = if has_tls_leaf {
+                sn.leaf_der().as_ref().to_vec()
+            } else {
+                Vec::new()
+            };
+            let (client_io, server_io) = tokio::io::duplex(16 * 1024);
+            let server = tokio::spawn(serve_mock_with_fault(
+                Conn::new(server_io),
+                sn,
+                sat_cert.clone(),
+                Arc::new(Mutex::new(HashMap::new())),
+                Arc::new(Mutex::new(UploadFault::LeafCaResponse)),
+            ));
+            let mut client = Client::new(Conn::new(client_io), sat_cert, peer_cert);
+            let hash = tokio::time::timeout(
+                Duration::from_secs(5),
+                client.upload(&limit, &piece_key, payload),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(hash.piece_size, payload.len() as i64);
+            drop(client);
+            server.await.unwrap();
+        }
     }
 
     #[tokio::test]

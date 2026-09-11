@@ -91,8 +91,10 @@ calls and nodes without an advertised key use TCP/TLS. Invalid keys, unsupported
 protocols, or failed Noise handshakes fail the dial without a TLS downgrade.
 Both advertised ciphers (ChaCha20-Poly1305 and AES-GCM, with X25519/BLAKE2b) are
 supported. The first replay-safe piece RPC bytes are sent inside the IK handshake;
-authentication completes during I/O and shares the dial deadline. Upload response certificate chains are verified
-against the order limit's NodeID before checking the signed piece hash.
+authentication completes during I/O and shares the dial deadline. Upload response identities require a leaf signed by the supplied CA, whose
+NodeID must match the order limit, before checking the signed piece hash.
+Additional response certificates must parse but need not form a complete chain,
+matching Go. TLS/QUIC handshakes still require full-chain signature validation.
 Connection telemetry reports `TransportKind::Noise` for these connections.
 
 `Config::network` controls `noise_early_data`, `tcp_fast_open`, and
