@@ -245,11 +245,36 @@ pub struct EncryptedUserData {
     pub encrypted_metadata_encrypted_key: Vec<u8>,
     /// Nonce used to encrypt the metadata key.
     pub encrypted_metadata_nonce: [u8; NONCE_SIZE],
-    /// Optional encrypted ETag (nonce `{1}`).
+    /// Optional encrypted ETag ([`ETAG_NONCE`]).
     pub encrypted_etag: Vec<u8>,
+    /// Encrypted object checksum ([`CHECKSUM_NONCE`]); empty when no
+    /// checksum was supplied.
+    pub encrypted_checksum: Vec<u8>,
+}
+
+/// Nonce for `encrypted_etag` under the metadata key (Go `storj.Nonce{1}`).
+pub const ETAG_NONCE: [u8; NONCE_SIZE] = user_data_nonce(1);
+
+/// Nonce for `encrypted_checksum` under the metadata key.
+///
+/// The stream info uses the zero nonce and the ETag uses `{1}`; the checksum
+/// takes the next value so the three ciphertexts never share a nonce under
+/// the same key. No Go client produces this field yet, so this is our
+/// convention rather than a Go-pinned one.
+pub const CHECKSUM_NONCE: [u8; NONCE_SIZE] = user_data_nonce(2);
+
+const fn user_data_nonce(first: u8) -> [u8; NONCE_SIZE] {
+    let mut n = ZERO_NONCE;
+    n[0] = first;
+    n
 }
 
 /// Encrypt stream + custom metadata with a random metadata key (Go uplink).
+///
+/// `checksum` is the plaintext object checksum. It is encrypted under the
+/// same metadata key as the ETag (see [`CHECKSUM_NONCE`]), so any reader that
+/// can decrypt the object's metadata can also decrypt the checksum.
+#[allow(clippy::too_many_arguments)]
 pub fn encrypt_user_data(
     custom: &[(String, String)],
     segment_size: i64,
@@ -258,6 +283,7 @@ pub fn encrypt_user_data(
     cipher: CipherSuite,
     derived_content_key: &Key,
     encryption_block_size: usize,
+    checksum: Option<&[u8]>,
 ) -> Result<EncryptedUserData> {
     let mut user_defined = std::collections::HashMap::new();
     for (k, v) in custom {
@@ -293,18 +319,46 @@ pub fn encrypt_user_data(
         number_of_segments,
     }
     .encode_to_vec();
-    let encrypted_etag = encrypt(&[], cipher, &metadata_key, &{
-        let mut n = ZERO_NONCE;
-        let _ = increment(&mut n, 1);
-        n
-    })?;
+    let encrypted_etag = encrypt(&[], cipher, &metadata_key, &ETAG_NONCE)?;
+    let encrypted_checksum = match checksum {
+        Some(plain) => encrypt(plain, cipher, &metadata_key, &CHECKSUM_NONCE)?,
+        None => Vec::new(),
+    };
 
     Ok(EncryptedUserData {
         encrypted_metadata,
         encrypted_metadata_encrypted_key,
         encrypted_metadata_nonce,
         encrypted_etag,
+        encrypted_checksum,
     })
+}
+
+/// Decrypt an object's `encrypted_checksum` (inverse of [`encrypt_user_data`]).
+///
+/// Unwraps the metadata key from `encrypted_metadata_encrypted_key` /
+/// `encrypted_metadata_nonce` with the derived content key, then decrypts
+/// the checksum under [`CHECKSUM_NONCE`].
+pub fn decrypt_object_checksum(
+    encrypted_checksum: &[u8],
+    encrypted_metadata_encrypted_key: &[u8],
+    encrypted_metadata_nonce: &[u8],
+    cipher: CipherSuite,
+    derived_content_key: &Key,
+) -> Result<Vec<u8>> {
+    let nonce = nonce_from_slice(encrypted_metadata_nonce)?;
+    let metadata_key = decrypt_key(
+        encrypted_metadata_encrypted_key,
+        cipher,
+        derived_content_key,
+        &nonce,
+    )?;
+    Ok(decrypt(
+        encrypted_checksum,
+        cipher,
+        &metadata_key,
+        &CHECKSUM_NONCE,
+    )?)
 }
 
 /// Decrypt object `encrypted_metadata` (Go `DecryptUserData`).
@@ -473,8 +527,17 @@ mod tests {
     #[test]
     fn stream_meta_block_size_is_encrypted_block() {
         let key = Key::from_bytes([9u8; 32]);
-        let user =
-            encrypt_user_data(&[], 64 * 1024 * 1024, 11, 1, CipherSuite::AES_GCM, &key, 0).unwrap();
+        let user = encrypt_user_data(
+            &[],
+            64 * 1024 * 1024,
+            11,
+            1,
+            CipherSuite::AES_GCM,
+            &key,
+            0,
+            None,
+        )
+        .unwrap();
         let meta = StreamMeta::decode(user.encrypted_metadata.as_slice()).unwrap();
         assert_eq!(
             meta.encryption_block_size,
@@ -489,6 +552,7 @@ mod tests {
             CipherSuite::AES_GCM,
             &key,
             DEFAULT_ENCRYPTED_BLOCK_SIZE,
+            None,
         )
         .unwrap();
         let meta = StreamMeta::decode(user.encrypted_metadata.as_slice()).unwrap();
@@ -506,8 +570,10 @@ mod tests {
             CipherSuite::AES_GCM,
             &key,
             0,
+            None,
         )
         .unwrap();
+        assert!(user.encrypted_checksum.is_empty());
         let (meta, custom) = decrypt_user_data(
             &user.encrypted_metadata,
             &user.encrypted_metadata_encrypted_key,
@@ -531,8 +597,17 @@ mod tests {
             )
             .is_err()
         );
-        let user =
-            encrypt_user_data(&[], 64 * 1024 * 1024, 1, 2, CipherSuite::AES_GCM, &key, 0).unwrap();
+        let user = encrypt_user_data(
+            &[],
+            64 * 1024 * 1024,
+            1,
+            2,
+            CipherSuite::AES_GCM,
+            &key,
+            0,
+            None,
+        )
+        .unwrap();
         let (meta, _) = decrypt_user_data(
             &user.encrypted_metadata,
             &user.encrypted_metadata_encrypted_key,
@@ -552,6 +627,69 @@ mod tests {
         .unwrap();
         assert!(custom.user_defined.is_empty());
         assert_eq!(meta.number_of_segments, 2);
+    }
+
+    #[test]
+    fn checksum_encrypts_under_metadata_key_and_round_trips() {
+        let key = Key::from_bytes([9u8; 32]);
+        let plain = [0xC5u8; 32];
+        let user = encrypt_user_data(
+            &[],
+            64 * 1024 * 1024,
+            11,
+            1,
+            CipherSuite::AES_GCM,
+            &key,
+            0,
+            Some(&plain),
+        )
+        .unwrap();
+        // Never on the wire in the clear, and distinct from the ETag
+        // ciphertext (different nonce under the same key).
+        assert_ne!(user.encrypted_checksum, plain.to_vec());
+        assert_ne!(user.encrypted_checksum, user.encrypted_etag);
+        assert_eq!(CHECKSUM_NONCE[0], 2);
+        assert_eq!(ETAG_NONCE[0], 1);
+        assert_ne!(CHECKSUM_NONCE, ETAG_NONCE);
+        assert_ne!(CHECKSUM_NONCE, ZERO_NONCE);
+        let got = decrypt_object_checksum(
+            &user.encrypted_checksum,
+            &user.encrypted_metadata_encrypted_key,
+            &user.encrypted_metadata_nonce,
+            CipherSuite::AES_GCM,
+            &key,
+        )
+        .unwrap();
+        assert_eq!(got, plain);
+        // A different derived content key cannot unwrap the metadata key.
+        assert!(
+            decrypt_object_checksum(
+                &user.encrypted_checksum,
+                &user.encrypted_metadata_encrypted_key,
+                &user.encrypted_metadata_nonce,
+                CipherSuite::AES_GCM,
+                &Key::from_bytes([7u8; 32]),
+            )
+            .is_err()
+        );
+        // The ETag nonce does not decrypt the checksum.
+        let nonce = nonce_from_slice(&user.encrypted_metadata_nonce).unwrap();
+        let metadata_key = decrypt_key(
+            &user.encrypted_metadata_encrypted_key,
+            CipherSuite::AES_GCM,
+            &key,
+            &nonce,
+        )
+        .unwrap();
+        assert!(
+            decrypt(
+                &user.encrypted_checksum,
+                CipherSuite::AES_GCM,
+                &metadata_key,
+                &ETAG_NONCE
+            )
+            .is_err()
+        );
     }
 
     #[test]

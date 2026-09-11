@@ -16,6 +16,7 @@ prost-types.workspace = true
 rustls.workspace = true
 storj.workspace = true
 storj-access.workspace = true
+storj-encryption.workspace = true
 storj-proto.workspace = true
 storj-rpc.workspace = true
 storj-uplink.workspace = true

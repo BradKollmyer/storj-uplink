@@ -424,10 +424,14 @@ impl MetainfoClient {
         encryption_parameters: Option<storj_proto::encryption::EncryptionParameters>,
         retention: Option<metainfo::Retention>,
         legal_hold: bool,
-        checksum: Option<ObjectChecksum>,
+        checksum: Option<&ObjectChecksum>,
     ) -> Result<metainfo::BeginObjectResponse> {
-        let (checksum_algorithm, is_checksum_composite, encrypted_checksum) =
-            checksum_fields(checksum);
+        // Only the algorithm and composite flag are announced here. The
+        // value is encrypted under the metadata key, which does not exist
+        // until commit; the satellite (`VerifyForBegin`) allows a pending
+        // object to carry an algorithm without a value for exactly this
+        // reason, and rejects a value without a metadata key/nonce.
+        let (checksum_algorithm, is_checksum_composite) = checksum_header(checksum);
         let req = BeginObjectRequest {
             header: Some(self.header()),
             bucket: bucket.as_bytes().to_vec(),
@@ -438,7 +442,6 @@ impl MetainfoClient {
             legal_hold,
             checksum_algorithm,
             is_checksum_composite,
-            encrypted_checksum,
             ..Default::default()
         };
         let items = self
@@ -465,10 +468,11 @@ impl MetainfoClient {
         key: &str,
         stream_id: Vec<u8>,
         user: storj_uplink::upload::EncryptedUserData,
-        checksum: Option<ObjectChecksum>,
+        checksum: Option<&ObjectChecksum>,
     ) -> Result<metainfo::CommitObjectResponse> {
-        let (checksum_algorithm, is_checksum_composite, encrypted_checksum) =
-            checksum_fields(checksum);
+        // `user.encrypted_checksum` is the caller's plaintext value encrypted
+        // under the same metadata key as `encrypted_etag` (`encrypt_user_data`).
+        let (checksum_algorithm, is_checksum_composite) = checksum_header(checksum);
         let req = CommitObjectRequest {
             header: Some(self.header()),
             stream_id,
@@ -479,7 +483,7 @@ impl MetainfoClient {
             skip_override_encrypted_metadata: false,
             checksum_algorithm,
             is_checksum_composite,
-            encrypted_checksum,
+            encrypted_checksum: user.encrypted_checksum,
             ..Default::default()
         };
         let items = self
@@ -1240,9 +1244,10 @@ impl MetainfoClient {
     }
 }
 
-fn checksum_fields(checksum: Option<ObjectChecksum>) -> (i32, bool, Vec<u8>) {
+/// `(checksum_algorithm, is_checksum_composite)` for begin/commit requests.
+fn checksum_header(checksum: Option<&ObjectChecksum>) -> (i32, bool) {
     checksum
-        .map(|cs| (cs.algorithm.to_proto(), cs.composite, cs.encrypted_value))
+        .map(|cs| (cs.algorithm.to_proto(), cs.composite))
         .unwrap_or_default()
 }
 

@@ -118,6 +118,12 @@ impl Project {
     ) -> Result<Upload> {
         require_bucket_name(bucket)?;
         require_object_key(key)?;
+        // The value is encrypted and sent by `Upload::commit`, so it must be
+        // present now; fail before BeginObject rather than leaving a pending
+        // object behind.
+        if let Some(cs) = &opts.checksum {
+            cs.validate(true)?;
+        }
         let enc_path =
             storj_encryption::encrypt_path(bucket, key, &self.inner.store).map_err(map_enc)?;
         let enc_params = storj_proto::encryption::EncryptionParameters {
@@ -136,7 +142,7 @@ impl Project {
                     .as_ref()
                     .map(crate::object_lock::retention_to_proto),
                 opts.legal_hold,
-                opts.checksum.clone(),
+                opts.checksum.as_ref(),
             )
             .await?;
         let content_key =
@@ -296,6 +302,7 @@ impl Project {
             cipher,
             &content_key,
             block_size,
+            None,
         )
         .map_err(map_uplink)?;
         self.inner
@@ -325,6 +332,12 @@ impl Project {
     ) -> Result<UploadInfo> {
         require_bucket_name(bucket)?;
         require_object_key(key)?;
+        // A multipart checksum (composite or not) is usually unknown until
+        // the parts are done, so only the algorithm is announced here and
+        // the value may be empty; `commit_upload` supplies and encrypts it.
+        if let Some(cs) = &opts.checksum {
+            cs.validate(false)?;
+        }
         let enc_path =
             storj_encryption::encrypt_path(bucket, key, &self.inner.store).map_err(map_enc)?;
         let enc_params = storj_proto::encryption::EncryptionParameters {
@@ -343,7 +356,7 @@ impl Project {
                     .as_ref()
                     .map(crate::object_lock::retention_to_proto),
                 opts.legal_hold,
-                opts.checksum,
+                opts.checksum.as_ref(),
             )
             .await?;
         Ok(UploadInfo {
@@ -445,6 +458,9 @@ impl Project {
         require_bucket_name(bucket)?;
         require_object_key(key)?;
         crate::verify_custom_metadata(&opts.custom_metadata)?;
+        if let Some(cs) = &opts.checksum {
+            cs.validate(true)?;
+        }
         let stream_id = decode_upload_id(upload_id)?;
         let content_key =
             storj_encryption::derive_content_key(bucket, key.as_bytes(), &self.inner.store)
@@ -462,12 +478,13 @@ impl Project {
             storj_encryption::CipherSuite::AES_GCM,
             &content_key,
             crate::constants::ENCRYPTION_BLOCK_SIZE,
+            checksum_plaintext(opts.checksum.as_ref()),
         )
         .map_err(map_uplink)?;
         let committed = self
             .inner
             .metainfo
-            .commit_object(bucket, key, stream_id, user, opts.checksum)
+            .commit_object(bucket, key, stream_id, user, opts.checksum.as_ref())
             .await?;
         let mut obj = object_from_proto(committed.object, key);
         obj.custom = custom_pairs.into_iter().collect();
@@ -689,6 +706,15 @@ pub(crate) fn require_object_key(key: &str) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Plaintext checksum to encrypt at commit; `None` when no algorithm is set
+/// so the proto field stays empty (the satellite rejects a value without an
+/// algorithm).
+fn checksum_plaintext(checksum: Option<&crate::types::ObjectChecksum>) -> Option<&[u8]> {
+    checksum
+        .filter(|cs| cs.algorithm != crate::types::ObjectChecksumAlgorithm::None)
+        .map(|cs| cs.value.as_slice())
 }
 
 fn decode_upload_id(upload_id: &str) -> Result<Vec<u8>> {
@@ -1270,6 +1296,7 @@ pub(crate) async fn commit_upload(mut inner: UploadInner) -> Result<Object> {
         inner.cipher,
         &inner.content_key,
         inner.block_size,
+        checksum_plaintext(inner.checksum.as_ref()),
     )
     .map_err(map_uplink)?;
 
@@ -1281,7 +1308,7 @@ pub(crate) async fn commit_upload(mut inner: UploadInner) -> Result<Object> {
             &inner.key,
             inner.stream_id,
             user,
-            inner.checksum,
+            inner.checksum.as_ref(),
         )
         .await?;
     abort_on_drop.disarm();

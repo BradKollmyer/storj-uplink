@@ -161,7 +161,9 @@ impl From<tokio::task::JoinError> for Error {
 pub enum ErrorKind {
     /// Invalid caller-supplied TLS certificate chain or private key.
     InvalidTlsIdentity,
-    /// Custom metadata contains an empty key or NUL byte.
+    /// Custom metadata contains an empty key or NUL byte, or the object
+    /// checksum options are inconsistent (value without algorithm, or a
+    /// missing value at commit).
     MetadataInvalid,
     /// Rate limited by the satellite.
     TooManyRequests,

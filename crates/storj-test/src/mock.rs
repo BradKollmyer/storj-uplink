@@ -116,6 +116,20 @@ struct CommittedObject {
     segments: Vec<StoredSegment>,
 }
 
+/// Checksum the mock stored for a committed object (see
+/// [`MockSatellite::committed_checksum`]).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommittedChecksum {
+    /// Proto `ObjectChecksumAlgorithm` value.
+    pub algorithm: i32,
+    /// `is_checksum_composite`.
+    pub composite: bool,
+    /// `encrypted_checksum` exactly as sent on `CommitObject`.
+    pub encrypted_value: Vec<u8>,
+    /// Decrypted value, or the decryption error.
+    pub value: Result<Vec<u8>, String>,
+}
+
 struct MockState {
     api_key: Vec<u8>,
     project_salt: Vec<u8>,
@@ -336,6 +350,41 @@ impl MockSatellite {
     /// Aborted stream ids.
     pub fn aborted_count(&self) -> usize {
         self.state.lock().expect("mock state").aborted.len()
+    }
+
+    /// Checksum fields the satellite stored for the committed object at
+    /// plaintext `key`, with the value decrypted the way a reader using
+    /// `include_checksum` would (metadata key from the commit, then
+    /// `CHECKSUM_NONCE`). `value` is `Err` when decryption fails.
+    pub fn committed_checksum(&self, bucket: &str, key: &str) -> Option<CommittedChecksum> {
+        let st = self.state.lock().expect("mock state");
+        let (_, rec) = st.committed.iter().find(|((b, enc_key), _)| {
+            b == bucket
+                && mock_plain_key(bucket, enc_key).is_some_and(|(plain, _)| plain == key.as_bytes())
+        })?;
+        let obj = &rec.object;
+        let value = if obj.encrypted_checksum.is_empty() {
+            Ok(Vec::new())
+        } else {
+            mock_content_key(bucket, &obj.encrypted_object_key)
+                .ok_or_else(|| "unknown root key".to_string())
+                .and_then(|content_key| {
+                    storj_uplink::pipeline::decrypt_object_checksum(
+                        &obj.encrypted_checksum,
+                        &obj.encrypted_metadata_encrypted_key,
+                        &obj.encrypted_metadata_nonce,
+                        metadata_cipher(&obj.encrypted_metadata),
+                        &content_key,
+                    )
+                    .map_err(|e| e.to_string())
+                })
+        };
+        Some(CommittedChecksum {
+            algorithm: obj.checksum_algorithm,
+            composite: obj.is_checksum_composite,
+            encrypted_value: obj.encrypted_checksum.clone(),
+            value,
+        })
     }
 
     /// Next `CommitObject` returns an error (then clears).
@@ -885,6 +934,25 @@ fn begin_object(
             "object lock is not enabled for this bucket".into(),
         ));
     }
+    // Satellite `validateChecksumOptionsForBegin` + metabase `VerifyForBegin`:
+    // a pending object may announce an algorithm without a value, but a value
+    // needs the metadata key/nonce it was encrypted under, which no client can
+    // have before commit.
+    check_checksum_options(
+        req.checksum_algorithm,
+        req.is_checksum_composite,
+        &req.encrypted_checksum,
+        false,
+    )?;
+    if !req.encrypted_checksum.is_empty()
+        && (req.encrypted_metadata_nonce.is_empty()
+            || req.encrypted_metadata_encrypted_key.is_empty())
+    {
+        return Err((
+            RPC_INVALID_ARGUMENT,
+            "encrypted metadata nonce and key must be set when an encrypted checksum is set".into(),
+        ));
+    }
     st.next_id += 1;
     let stream_id = st.next_id.to_be_bytes().to_vec();
     let expires = req.expires_at.map(|t| {
@@ -935,14 +1003,13 @@ fn commit_object(
         st.fail_commit = false;
         return Err((RPC_INTERNAL, "commit object failed".into()));
     }
-    if req.checksum_algorithm != storj_proto::metainfo::ObjectChecksumAlgorithm::None as i32
-        && req.encrypted_checksum.is_empty()
-    {
-        return Err((
-            RPC_INVALID_ARGUMENT,
-            "encrypted checksum is required when checksum algorithm is set".into(),
-        ));
-    }
+    // Satellite `validateChecksumOptions` (commit requires the value).
+    check_checksum_options(
+        req.checksum_algorithm,
+        req.is_checksum_composite,
+        &req.encrypted_checksum,
+        true,
+    )?;
     {
         let pending = st
             .pending
@@ -951,6 +1018,27 @@ fn commit_object(
         let mut segments = pending.segments.clone();
         segments.sort_by_key(|s| (s.position.part_number, s.position.index));
         check_multipart_limits(&segments)?;
+        // Stricter than the satellite, which cannot decrypt: the checksum
+        // must be the caller's value encrypted under the metadata key/nonce
+        // of this very commit, the way `encrypted_etag` is, or a Go reader
+        // using `include_checksum` could never decrypt it. Only checkable
+        // when the client used the mock's root key (see `access()`).
+        if !req.encrypted_checksum.is_empty()
+            && let Some(content_key) = mock_content_key(&pending.bucket, &pending.enc_key)
+            && storj_uplink::pipeline::decrypt_object_checksum(
+                &req.encrypted_checksum,
+                &req.encrypted_metadata_encrypted_key,
+                &req.encrypted_metadata_nonce,
+                metadata_cipher(&req.encrypted_metadata),
+                &content_key,
+            )
+            .is_err()
+        {
+            return Err((
+                RPC_INVALID_ARGUMENT,
+                "encrypted checksum does not decrypt under the object's metadata key".into(),
+            ));
+        }
     }
     let pending = st
         .pending
@@ -2198,6 +2286,84 @@ fn check_action(header: &Option<RequestHeader>, action: Action) -> Result<(), (u
         }
     }
     Ok(())
+}
+
+/// Satellite `validateChecksumOptionsForBegin` / `validateChecksumOptions`.
+fn check_checksum_options(
+    algorithm: i32,
+    composite: bool,
+    encrypted_checksum: &[u8],
+    require_value: bool,
+) -> Result<(), (u64, String)> {
+    use storj_proto::metainfo::ObjectChecksumAlgorithm as Algo;
+    let none = Algo::None as i32;
+    if algorithm < none || algorithm > Algo::Sha256 as i32 {
+        return Err((RPC_INVALID_ARGUMENT, "checksum algorithm is invalid".into()));
+    }
+    if algorithm == none {
+        if composite {
+            return Err((
+                RPC_INVALID_ARGUMENT,
+                "checksum composite flag requires a checksum algorithm".into(),
+            ));
+        }
+        if !encrypted_checksum.is_empty() {
+            return Err((
+                RPC_INVALID_ARGUMENT,
+                "encrypted checksum requires a checksum algorithm".into(),
+            ));
+        }
+    } else if require_value && encrypted_checksum.is_empty() {
+        return Err((
+            RPC_INVALID_ARGUMENT,
+            "encrypted checksum is required when checksum algorithm is set".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Root key every grant from `MockSatellite::access*` carries.
+const MOCK_ROOT_KEY: [u8; 32] = [1u8; 32];
+
+fn mock_store(path_cipher: storj_encryption::CipherSuite) -> storj_encryption::Store {
+    let mut store = storj_encryption::Store::new();
+    store.set_default_key(storj_encryption::Key::from_bytes(MOCK_ROOT_KEY));
+    store.set_default_path_cipher(path_cipher);
+    store
+}
+
+/// Plaintext object key for `enc_key` under the mock root key, trying the
+/// path ciphers `access_with_path_cipher` hands out. `None` when the client
+/// used a root key the mock does not know (e.g. `request_with_passphrase`).
+fn mock_plain_key(bucket: &str, enc_key: &[u8]) -> Option<(Vec<u8>, storj_encryption::Store)> {
+    for cipher in [
+        storj_encryption::CipherSuite::AES_GCM,
+        storj_encryption::CipherSuite::SECRET_BOX,
+        storj_encryption::CipherSuite::NULL,
+    ] {
+        let store = mock_store(cipher);
+        if let Ok(plain) = storj_encryption::decrypt_path(bucket, enc_key, &store) {
+            return Some((plain, store));
+        }
+    }
+    None
+}
+
+/// Derived content key (Go `DeriveContentKey`) for a committed/pending
+/// object, when the mock can recover the plaintext key.
+fn mock_content_key(bucket: &str, enc_key: &[u8]) -> Option<storj_encryption::Key> {
+    let (plain, store) = mock_plain_key(bucket, enc_key)?;
+    storj_encryption::derive_content_key(bucket, &plain, &store).ok()
+}
+
+/// Cipher recorded in a commit's `StreamMeta.encryption_type` (AES-GCM if unset).
+fn metadata_cipher(encrypted_metadata: &[u8]) -> storj_encryption::CipherSuite {
+    match storj_uplink::pipeline::StreamMeta::decode(encrypted_metadata) {
+        Ok(meta) if meta.encryption_type != 0 => {
+            storj_encryption::CipherSuite(meta.encryption_type)
+        }
+        _ => storj_encryption::CipherSuite::AES_GCM,
+    }
 }
 
 /// Secret the mock's root API key was minted with (see `MockSatellite::start`).

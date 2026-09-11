@@ -25,7 +25,7 @@ published so the facade can resolve on crates.io; they are not a stable API.
 - `verify_custom_metadata` and consistent validation before metadata mutation
   or network requests.
 - Exact-key pending upload listing, downloads of a selected object version,
-  caller-supplied object checksum fields on begin/commit, and bucket creation
+  caller-supplied object checksums on begin/commit, and bucket creation
   options for Object Lock and placement.
 
 ### Breaking changes and migration
@@ -36,6 +36,12 @@ published so the facade can resolve on crates.io; they are not a stable API.
 - `DownloadOptions` adds `version`; `UploadOptions` and `CommitUploadOptions`
   add `checksum`. For 1.0 behavior use an empty version and `checksum: None`,
   or supply the original fields with `..Default::default()`.
+- `ObjectChecksum` takes the plaintext checksum in `value` (renamed from
+  `encrypted_value`). The library encrypts it under the object's metadata key
+  at commit, exactly like the ETag; `BeginObject` announces only the
+  algorithm and composite flag. Callers must not pre-encrypt. Inconsistent
+  checksum options (a value without an algorithm, or a missing value at
+  commit) fail with `ErrorKind::MetadataInvalid` before any RPC.
 - Default transport changes from TCP/TLS to advertised Noise for replay-safe
   storage-node piece RPCs; metadata and unadvertised nodes still use TLS.
   Set `transport: TransportMode::Tcp` to retain the 1.0 transport policy.

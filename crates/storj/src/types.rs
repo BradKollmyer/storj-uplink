@@ -119,8 +119,12 @@ pub struct UploadOptions {
     pub retention: Option<Retention>,
     /// Place a legal hold at creation (Go `UploadOptions.LegalHold`).
     pub legal_hold: bool,
-    /// Object checksum sent on `BeginObject` / `CommitObject`. `None` leaves
-    /// the proto fields at their defaults (`NONE`).
+    /// Object checksum. `BeginObject` announces the algorithm and composite
+    /// flag only; the plaintext `value` is encrypted under the object's
+    /// metadata key and sent on `CommitObject`. For `upload_object` the value
+    /// is therefore required up front; for `begin_upload` it is ignored and
+    /// the commit-time value comes from `CommitUploadOptions::checksum`.
+    /// `None` leaves the proto fields at their defaults (`NONE`).
     pub checksum: Option<ObjectChecksum>,
 }
 
@@ -269,16 +273,51 @@ impl ObjectChecksumAlgorithm {
     }
 }
 
-/// Checksum fields sent on `BeginObject` / `CommitObject`.
+/// Object checksum supplied by the caller in plaintext.
+///
+/// The library encrypts `value` for the satellite: on commit it is encrypted
+/// under the object's random metadata key, exactly like the ETag, so it is
+/// never visible to the satellite and can be decrypted by any reader that
+/// can decrypt the object's metadata. `BeginObject` announces only
+/// `algorithm` and `composite`; the encrypted value is sent on
+/// `CommitObject`, the first point at which the metadata key exists.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ObjectChecksum {
     /// Algorithm; `None` is proto `NONE`.
     pub algorithm: ObjectChecksumAlgorithm,
     /// Whether the checksum is a composite of part checksums.
     pub composite: bool,
-    /// Encrypted checksum bytes. Commit requires this when `algorithm` is not
-    /// [`ObjectChecksumAlgorithm::None`].
-    pub encrypted_value: Vec<u8>,
+    /// Plaintext checksum bytes (for example the 32 raw bytes of a SHA-256).
+    /// Required at commit when `algorithm` is not
+    /// [`ObjectChecksumAlgorithm::None`]; must be empty when it is.
+    pub value: Vec<u8>,
+}
+
+impl ObjectChecksum {
+    /// Satellite `validateChecksumOptions`, applied before any RPC.
+    /// `require_value` is true at commit, where the value must be present.
+    pub(crate) fn validate(&self, require_value: bool) -> Result<()> {
+        if self.algorithm == ObjectChecksumAlgorithm::None {
+            if self.composite {
+                return Err(Error::new(
+                    ErrorKind::MetadataInvalid,
+                    "checksum composite flag requires a checksum algorithm",
+                ));
+            }
+            if !self.value.is_empty() {
+                return Err(Error::new(
+                    ErrorKind::MetadataInvalid,
+                    "checksum value requires a checksum algorithm",
+                ));
+            }
+        } else if require_value && self.value.is_empty() {
+            return Err(Error::new(
+                ErrorKind::MetadataInvalid,
+                "checksum value is required when a checksum algorithm is set",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Options for `commit_upload`.
@@ -286,8 +325,9 @@ pub struct ObjectChecksum {
 pub struct CommitUploadOptions {
     /// Custom metadata applied at commit.
     pub custom_metadata: CustomMetadata,
-    /// Object checksum sent on `CommitObject`. `None` leaves the proto fields
-    /// at their defaults (`NONE`).
+    /// Object checksum for `CommitObject`; the plaintext `value` is
+    /// encrypted under the object's metadata key before it is sent. `None`
+    /// leaves the proto fields at their defaults (`NONE`).
     pub checksum: Option<ObjectChecksum>,
 }
 

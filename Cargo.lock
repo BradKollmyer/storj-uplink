@@ -1705,6 +1705,7 @@ dependencies = [
  "snow",
  "storj",
  "storj-access",
+ "storj-encryption",
  "storj-proto",
  "storj-rpc",
  "storj-uplink",
