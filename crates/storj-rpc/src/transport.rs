@@ -540,7 +540,8 @@ pub async fn dial_noise_with_options(
         start: Instant::now(),
         outcome: Outcome::Error,
     };
-    let mut initiator = crate::noise::Initiator::new(protocol, public_key)?;
+    let initiator = crate::noise::Initiator::new(protocol, public_key)?;
+    let public_key = public_key.to_vec();
     event.outcome = Outcome::Cancelled;
     let address = address.to_owned();
     let network = options.network.clone();
@@ -548,19 +549,25 @@ pub async fn dial_noise_with_options(
     let start: NoiseStart = Box::new(move |payload| {
         Box::pin(async move {
             // Start the deadline when first I/O triggers the actual dial, not while
-            // an unused connection is held. It covers DNS, both candidates and IK.
+            // an unused connection is held. It covers DNS, address candidates and IK.
             let connect = async {
-                initiator.set_payload(&payload)?;
-                let (stream, response) = noise_exchange(
+                let mut first = Some(initiator);
+                let stream = noise_exchange(
                     &address,
-                    &initiator.message,
+                    || {
+                        let mut initiator = match first.take() {
+                            Some(initiator) => initiator,
+                            None => crate::noise::Initiator::new(protocol, &public_key)?,
+                        };
+                        initiator.set_payload(&payload)?;
+                        Ok(initiator)
+                    },
                     &network,
                     fast_open_advertised && network.tcp_fast_open,
                 )
                 .await?;
-                let stream = initiator.finish(stream, &response)?;
                 Ok(Transport {
-                    io: Box::new(stream),
+                    io: stream,
                     peer_cert: Vec::new(),
                     kind: TransportKind::Noise,
                 })
@@ -603,42 +610,47 @@ pub async fn dial_noise_with_options(
 
 async fn noise_exchange(
     address: &str,
-    message: &[u8],
+    make_initiator: impl FnMut() -> io::Result<crate::noise::Initiator>,
     network: &NetworkOptions,
     fast_open: bool,
-) -> io::Result<(Box<dyn Io>, Vec<u8>)> {
+) -> io::Result<Box<dyn Io>> {
     let addresses: Vec<_> = tokio::net::lookup_host(address).await?.collect();
-    noise_exchange_with(&addresses, message, fast_open, |addr, fast| async move {
-        let socket = crate::socket::socket(addr, network)?;
-        #[cfg(any(
-            windows,
-            target_os = "linux",
-            target_os = "android",
-            target_os = "freebsd",
-            target_os = "openbsd",
-            target_os = "netbsd",
-            target_os = "dragonfly",
-            target_os = "macos",
-            target_os = "ios",
-            target_os = "watchos",
-            target_os = "tvos"
-        ))]
-        if fast {
-            return Ok(
-                Box::new(tokio_tfo::TfoStream::connect_with_socket(socket, addr).await?)
-                    as Box<dyn Io>,
-            );
-        }
-        // On other platforms the Fast Open attempt fails before sending bytes;
-        // the race immediately uses ordinary TCP, without a tokio-tfo dependency.
-        if fast {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "TCP Fast Open unavailable",
-            ));
-        }
-        Ok(Box::new(socket.connect(addr).await?) as Box<dyn Io>)
-    })
+    noise_exchange_with(
+        &addresses,
+        make_initiator,
+        fast_open,
+        |addr, fast| async move {
+            let socket = crate::socket::socket(addr, network)?;
+            #[cfg(any(
+                windows,
+                target_os = "linux",
+                target_os = "android",
+                target_os = "freebsd",
+                target_os = "openbsd",
+                target_os = "netbsd",
+                target_os = "dragonfly",
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "watchos",
+                target_os = "tvos"
+            ))]
+            if fast {
+                return Ok(
+                    Box::new(tokio_tfo::TfoStream::connect_with_socket(socket, addr).await?)
+                        as Box<dyn Io>,
+                );
+            }
+            // On other platforms the Fast Open attempt fails before sending bytes;
+            // the race immediately uses ordinary TCP, without a tokio-tfo dependency.
+            if fast {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "TCP Fast Open unavailable",
+                ));
+            }
+            Ok(Box::new(socket.connect(addr).await?) as Box<dyn Io>)
+        },
+    )
     .await
 }
 
@@ -646,52 +658,51 @@ async fn noise_exchange(
 // depending on the host kernel, resolver order, or socket settings.
 async fn noise_exchange_with<C, F>(
     addresses: &[std::net::SocketAddr],
-    message: &[u8],
+    mut make_initiator: impl FnMut() -> io::Result<crate::noise::Initiator>,
     fast_open: bool,
     connect: C,
-) -> io::Result<(Box<dyn Io>, Vec<u8>)>
+) -> io::Result<Box<dyn Io>>
 where
     C: Fn(std::net::SocketAddr, bool) -> F,
     F: Future<Output = io::Result<Box<dyn Io>>>,
 {
     use futures_util::{StreamExt, stream::FuturesUnordered};
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    // The advertisement gate guarantees at least two suppressed copies for
-    // Fast Open. Share that conservative budget across ALL resolved addresses,
-    // including ordinary TCP fallbacks. Without that guarantee send one copy.
-    let remaining = AtomicUsize::new(if fast_open { 2 } else { 1 });
-    let attempt = |addr, fast| {
-        let remaining = &remaining;
-        let connect = &connect;
-        async move {
-            let stream = connect(addr, fast).await?;
-            remaining
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
-                .map_err(|_| io::Error::other("Noise handshake copy budget exhausted"))?;
-            // Never refund: an error/cancellation may follow a partial write.
-            crate::noise::exchange(stream, message).await
-        }
-    };
     let mut candidates = FuturesUnordered::new();
     for (i, &addr) in addresses.iter().enumerate() {
-        let attempt = &attempt;
+        // Each address has a fresh IK exchange. Only the two legs for this
+        // address reuse a message, staying within the advertised debounce limit
+        // without denying other addresses a handshake when this one stalls.
+        let initiator = make_initiator()?;
+        let connect = &connect;
         candidates.push(async move {
             if i > 0 {
                 tokio::time::sleep(Duration::from_millis(250).saturating_mul(i as u32)).await;
             }
-            let normal = attempt(addr, false);
-            if !fast_open { return normal.await; }
-            let fast = attempt(addr, true);
-            tokio::pin!(fast);
-            tokio::select! {
-                result = &mut fast => return match result { Ok(v) => Ok(v), Err(_) => normal.await },
-                _ = tokio::time::sleep(Duration::from_millis(250)) => {}
-            }
-            tokio::pin!(normal);
-            tokio::select! {
-                result = &mut fast => match result { Ok(v) => Ok(v), Err(_) => normal.await },
-                result = &mut normal => match result { Ok(v) => Ok(v), Err(_) => fast.await },
-            }
+            let exchange = async {
+                let attempt = |fast| {
+                    let message = &initiator.message;
+                    async move {
+                        let stream = connect(addr, fast).await?;
+                        crate::noise::exchange(stream, message).await
+                    }
+                };
+                let normal = attempt(false);
+                if !fast_open { return normal.await; }
+                let fast = attempt(true);
+                tokio::pin!(fast);
+                tokio::select! {
+                    result = &mut fast => return match result { Ok(v) => Ok(v), Err(_) => normal.await },
+                    _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+                }
+                tokio::pin!(normal);
+                tokio::select! {
+                    result = &mut fast => match result { Ok(v) => Ok(v), Err(_) => normal.await },
+                    result = &mut normal => match result { Ok(v) => Ok(v), Err(_) => fast.await },
+                }
+            };
+            let (stream, response) = exchange.await?;
+            // An unauthenticated response cannot win the address race.
+            Ok(Box::new(initiator.finish(stream, &response)?) as Box<dyn Io>)
         });
     }
     let mut last = io::Error::other("address resolved to no endpoints");
@@ -709,6 +720,12 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn initiator(protocol: i32, key: &[u8], payload: &[u8]) -> io::Result<crate::noise::Initiator> {
+        let mut initiator = crate::noise::Initiator::new(protocol, key)?;
+        initiator.set_payload(payload)?;
+        Ok(initiator)
+    }
 
     #[tokio::test]
     async fn stalled_fast_open_fallback_reuses_identical_early_handshake() {
@@ -746,14 +763,12 @@ mod tests {
             noise.write_all(b"pong").await.unwrap();
             noise.flush().await.unwrap();
         });
-        let mut initiator = crate::noise::Initiator::new(1, &key.public).unwrap();
-        initiator.set_payload(b"ping").unwrap();
         tokio::time::timeout(Duration::from_secs(4), async {
             // Simulate a connected TFO leg over ordinary TCP. The first server
             // stalls its response; the second wins. No kernel TFO is required.
-            let (stream, response) = noise_exchange_with(
+            let mut stream = noise_exchange_with(
                 &[address.parse().unwrap()],
-                &initiator.message,
+                || initiator(1, &key.public, b"ping"),
                 true,
                 |addr, _fast| async move {
                     Ok(Box::new(TcpStream::connect(addr).await?) as Box<dyn Io>)
@@ -761,10 +776,9 @@ mod tests {
             )
             .await
             .unwrap();
-            let mut io = initiator.finish(stream, &response).unwrap();
-            io.flush().await.unwrap();
+            stream.flush().await.unwrap();
             let mut got = [0; 4];
-            io.read_exact(&mut got).await.unwrap();
+            stream.read_exact(&mut got).await.unwrap();
             assert_eq!(&got, b"pong");
             server.await.unwrap();
         })
@@ -777,14 +791,12 @@ mod tests {
         let key = snow::Builder::new("Noise_IK_25519_ChaChaPoly_BLAKE2b".parse().unwrap())
             .generate_keypair()
             .unwrap();
-        let mut initiator = crate::noise::Initiator::new(1, &key.public).unwrap();
-        initiator.set_payload(b"ping").unwrap();
         let attempts = Arc::new(Mutex::new(Vec::new()));
         let seen = attempts.clone();
         tokio::time::timeout(Duration::from_secs(2), async {
-            let (stream, response) = noise_exchange_with(
+            let mut stream = noise_exchange_with(
                 &["127.0.0.1:1".parse().unwrap()],
-                &initiator.message,
+                || initiator(1, &key.public, b"ping"),
                 true,
                 |_, fast| {
                     seen.lock().unwrap().push(fast);
@@ -813,7 +825,6 @@ mod tests {
             )
             .await
             .unwrap();
-            let mut stream = initiator.finish(stream, &response).unwrap();
             let mut response = [0; 4];
             stream.read_exact(&mut response).await.unwrap();
             assert_eq!(&response, b"pong");
@@ -824,16 +835,88 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn noise_handshake_copy_budget_is_shared_across_addresses() {
+    async fn noise_address_race_survives_stalled_or_unauthenticated_first_address() {
+        let addresses = ["[::1]:1", "127.0.0.1:1"].map(|addr| addr.parse().unwrap());
+        for protocol in [1, 2] {
+            for fast in [false, true] {
+                for reject in [false, true] {
+                    let key =
+                        snow::Builder::new("Noise_IK_25519_ChaChaPoly_BLAKE2b".parse().unwrap())
+                            .generate_keypair()
+                            .unwrap();
+                    let servers = Mutex::new(Vec::new());
+                    let mut stream = tokio::time::timeout(
+                        Duration::from_secs(2),
+                        noise_exchange_with(
+                            &addresses,
+                            || initiator(protocol, &key.public, b"ping"),
+                            fast,
+                            |addr, _| {
+                                let private = key.private.clone();
+                                let (client, mut server) = tokio::io::duplex(4096);
+                                servers.lock().unwrap().push(tokio::spawn(async move {
+                                    let mut prefix = [0; 8];
+                                    server.read_exact(&mut prefix).await.unwrap();
+                                    assert_eq!(&prefix, crate::noise::HEADER);
+                                    if addr.is_ipv6() {
+                                        let mut header = [0; 4];
+                                        server.read_exact(&mut header).await.unwrap();
+                                        let len = ((header[1] as usize) << 16)
+                                            | ((header[2] as usize) << 8)
+                                            | header[3] as usize;
+                                        server.read_exact(&mut vec![0; len]).await.unwrap();
+                                        if reject {
+                                            // A correctly framed but unauthenticated IK response.
+                                            server.write_all(&[0x80, 0, 0, 48]).await.unwrap();
+                                            server.write_all(&[0; 48]).await.unwrap();
+                                            return;
+                                        }
+                                        std::future::pending::<()>().await;
+                                    }
+                                    let mut stream = crate::noise::NoiseStream::accept(
+                                        server, protocol, &private,
+                                    )
+                                    .await
+                                    .unwrap();
+                                    let mut payload = [0; 4];
+                                    stream.read_exact(&mut payload).await.unwrap();
+                                    assert_eq!(&payload, b"ping");
+                                    stream.write_all(b"pong").await.unwrap();
+                                    stream.flush().await.unwrap();
+                                }));
+                                async move { Ok(Box::new(client) as Box<dyn Io>) }
+                            },
+                        ),
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+                    let mut response = [0; 4];
+                    stream.read_exact(&mut response).await.unwrap();
+                    assert_eq!(&response, b"pong");
+                    for server in servers.into_inner().unwrap() {
+                        server.abort();
+                        match server.await {
+                            Ok(()) => {}
+                            Err(error) => assert!(error.is_cancelled()),
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn noise_handshake_copies_are_bounded_per_address() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         // Both address families, multiple addresses, and a response slower than
-        // every stagger. All connections succeed; only budgeted ones send bytes.
+        // every stagger. Every address must get its own handshake.
         let addresses = ["[::1]:1", "127.0.0.1:1", "127.0.0.2:1"].map(|addr| addr.parse().unwrap());
         for (fast, reject, expected) in [
-            (true, false, 2),
-            (false, false, 1),
-            (true, true, 2),
-            (false, true, 1),
+            (true, false, 6),
+            (false, false, 3),
+            (true, true, 6),
+            (false, true, 3),
         ] {
             let copies = Arc::new(Mutex::new(Vec::new()));
             let attempts = Arc::new(AtomicUsize::new(0));
@@ -841,43 +924,46 @@ mod tests {
             let key = snow::Builder::new("Noise_IK_25519_ChaChaPoly_BLAKE2b".parse().unwrap())
                 .generate_keypair()
                 .unwrap();
-            let mut initiator = crate::noise::Initiator::new(1, &key.public).unwrap();
-            initiator.set_payload(b"early request").unwrap();
             let server_handles = Mutex::new(&mut servers);
             let result = tokio::time::timeout(
                 Duration::from_millis(1100),
-                noise_exchange_with(&addresses, &initiator.message, fast, |_, _| {
-                    attempts.fetch_add(1, Ordering::Relaxed);
-                    let copies = copies.clone();
-                    let (client, mut server) = tokio::io::duplex(4096);
-                    server_handles
-                        .lock()
-                        .unwrap()
-                        .push(tokio::spawn(async move {
-                            let mut prefix = [0; 12];
-                            if server.read_exact(&mut prefix).await.is_err() {
-                                return;
-                            }
-                            assert_eq!(&prefix[..8], crate::noise::HEADER);
-                            let len = ((prefix[9] as usize) << 16)
-                                | ((prefix[10] as usize) << 8)
-                                | prefix[11] as usize;
-                            let mut message = vec![0; len];
-                            server.read_exact(&mut message).await.unwrap();
-                            copies
-                                .lock()
-                                .unwrap()
-                                .push([prefix.as_slice(), message.as_slice()].concat());
-                            if reject {
-                                // Failure after the handshake was sent must not
-                                // refund a copy for another address or TFO leg.
-                                server.write_all(&[0; 4]).await.unwrap();
-                                return;
-                            }
-                            std::future::pending::<()>().await;
-                        }));
-                    async move { Ok(Box::new(client) as Box<dyn Io>) }
-                }),
+                noise_exchange_with(
+                    &addresses,
+                    || initiator(1, &key.public, b"early request"),
+                    fast,
+                    |addr, _| {
+                        attempts.fetch_add(1, Ordering::Relaxed);
+                        let copies = copies.clone();
+                        let (client, mut server) = tokio::io::duplex(4096);
+                        server_handles
+                            .lock()
+                            .unwrap()
+                            .push(tokio::spawn(async move {
+                                let mut prefix = [0; 12];
+                                if server.read_exact(&mut prefix).await.is_err() {
+                                    return;
+                                }
+                                assert_eq!(&prefix[..8], crate::noise::HEADER);
+                                let len = ((prefix[9] as usize) << 16)
+                                    | ((prefix[10] as usize) << 8)
+                                    | prefix[11] as usize;
+                                let mut message = vec![0; len];
+                                server.read_exact(&mut message).await.unwrap();
+                                copies
+                                    .lock()
+                                    .unwrap()
+                                    .push((addr, [prefix.as_slice(), message.as_slice()].concat()));
+                                if reject {
+                                    // A rejected handshake must not cause more than
+                                    // two identical copies for this address.
+                                    server.write_all(&[0; 4]).await.unwrap();
+                                    return;
+                                }
+                                std::future::pending::<()>().await;
+                            }));
+                        async move { Ok(Box::new(client) as Box<dyn Io>) }
+                    },
+                ),
             )
             .await;
             if reject {
@@ -888,7 +974,21 @@ mod tests {
             assert_eq!(attempts.load(Ordering::Relaxed), if fast { 6 } else { 3 });
             let copies = copies.lock().unwrap();
             assert_eq!(copies.len(), expected);
-            assert!(copies.iter().all(|m| m == &initiator.message));
+            let mut messages = Vec::new();
+            for addr in addresses {
+                let sent: Vec<_> = copies
+                    .iter()
+                    .filter(|(a, _)| *a == addr)
+                    .map(|(_, m)| m)
+                    .collect();
+                assert_eq!(sent.len(), if fast { 2 } else { 1 });
+                assert!(sent.iter().all(|m| *m == sent[0]));
+                assert!(
+                    !messages.contains(&sent[0]),
+                    "addresses must use fresh IK messages"
+                );
+                messages.push(sent[0]);
+            }
             for server in servers {
                 server.abort();
             }

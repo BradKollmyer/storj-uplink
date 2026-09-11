@@ -53,9 +53,10 @@ published so the facade can resolve on crates.io; they are not a stable API.
 - Piece response identities now match Go's validation: verify leaf against CA,
   pin the CA's NodeID, and parse optional remaining certificates without
   requiring a self-signed tail. TLS/QUIC retain full-chain validation.
-- Cap identical Noise handshakes across all resolved addresses at two when
-  duplicate suppression is advertised, otherwise one. Connections that fail
-  before any handshake write do not consume the budget.
+- Use a fresh Noise handshake per resolved address so a stalled address cannot
+  exhaust the handshake budget for healthy alternatives. Each handshake has at
+  most two identical copies when duplicate suppression is advertised, otherwise
+  one. Authenticate responses before selecting the winning address.
 - Gate `tokio-tfo` to its supported targets; other targets use ordinary TCP.
 - Test stalled and unavailable Fast Open using controlled connections instead
   of requiring the host kernel to enable TFO.

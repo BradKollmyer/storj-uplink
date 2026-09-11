@@ -104,9 +104,10 @@ Connection telemetry reports `TransportKind::Noise` for these connections.
 `Config::network` controls `noise_early_data`, `tcp_fast_open`, and
 `background_qos` (all enabled by default). Fast Open races ordinary TCP after
 250 ms only when the satellite advertises Fast Open and a debounce limit of at
-least two. Across all resolved addresses, at most two identical handshakes
-are sent (one without advertised suppression). Failed connects consume no
-handshake budget; attempts that may have written bytes are never refunded.
+least two. Each resolved address uses a fresh Noise handshake, so a stalled
+address cannot prevent another from authenticating. The Fast Open and ordinary
+TCP legs for one address send at most two identical copies; without advertised
+suppression, that address sends one copy over ordinary TCP.
 Unavailable Fast Open support allows ordinary TCP to proceed. The optional
 TFO dependency is compiled only on platforms supported by `tokio-tfo`. TCP address candidates also race
 to avoid a stalled IPv6 route blocking IPv4. On Linux, background QoS requests
