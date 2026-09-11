@@ -65,6 +65,8 @@ struct BucketRec {
     objects: usize,
     lock_config: Option<ObjectLockConfiguration>,
     object_locks: BTreeMap<(Vec<u8>, Vec<u8>), ObjectLockRec>,
+    /// Self-serve placement bytes from `CreateBucketRequest.placement`.
+    placement: Vec<u8>,
 }
 
 #[derive(Clone, Default)]
@@ -443,8 +445,19 @@ impl MockSatellite {
                 objects: 0,
                 lock_config: None,
                 object_locks: BTreeMap::new(),
+                placement: Vec::new(),
             })
             .objects += 1;
+    }
+
+    /// Placement constraint stored for `bucket` (`CreateBucketRequest.placement`).
+    pub fn bucket_placement(&self, bucket: &str) -> Option<Vec<u8>> {
+        self.state
+            .lock()
+            .expect("mock state")
+            .buckets
+            .get(bucket)
+            .map(|rec| rec.placement.clone())
     }
 
     /// Insert a committed object at `enc_key` (undecryptable-sibling tests).
@@ -459,6 +472,7 @@ impl MockSatellite {
                 objects: 0,
                 lock_config: None,
                 object_locks: BTreeMap::new(),
+                placement: Vec::new(),
             })
             .objects += 1;
         st.committed.insert(
@@ -605,6 +619,7 @@ fn handle_rpc(
                     objects: 0,
                     lock_config,
                     object_locks: BTreeMap::new(),
+                    placement: req.placement,
                 },
             );
             Ok(CreateBucketResponse {
@@ -1071,6 +1086,7 @@ fn commit_object(
         checksum_algorithm: req.checksum_algorithm,
         is_checksum_composite: req.is_checksum_composite,
         encrypted_checksum: req.encrypted_checksum,
+        expires_at: pending.expires.map(timestamp),
         ..Default::default()
     };
     if obj.object_version.is_empty() {
@@ -1465,6 +1481,19 @@ fn apply_relocated(
     }
     if !dest_exists && let Some(bucket) = st.buckets.get_mut(&dest_bucket) {
         bucket.objects += 1;
+    }
+    // Satellite copy/move carries Object Lock from the source object.
+    let src_bucket = String::from_utf8_lossy(&src.object.bucket).into_owned();
+    let src_lock = st.buckets.get(&src_bucket).and_then(|b| {
+        b.object_locks
+            .get(&(src.object.encrypted_object_key.clone(), Vec::new()))
+            .cloned()
+    });
+    if let Some(lock) = src_lock
+        && let Some(dest) = st.buckets.get_mut(&dest_bucket)
+    {
+        dest.object_locks
+            .insert((dest_enc.clone(), Vec::new()), lock);
     }
     st.committed.insert(
         (dest_bucket, dest_enc),

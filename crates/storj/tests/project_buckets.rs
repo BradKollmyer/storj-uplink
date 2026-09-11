@@ -144,6 +144,28 @@ async fn create_bucket_with_object_lock_enabled() {
     );
 }
 
+#[tokio::test]
+async fn create_bucket_with_placement() {
+    let mock = MockSatellite::start().await;
+    let project = open_test_project(&mock).await;
+    let name = unique_bucket();
+    project
+        .create_bucket_with(
+            &name,
+            CreateBucketOptions {
+                placement: b"eu1".to_vec(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create with placement");
+    assert_eq!(mock.bucket_placement(&name).as_deref(), Some(&b"eu1"[..]));
+    project
+        .create_bucket(&unique_bucket())
+        .await
+        .expect("default placement");
+}
+
 async fn open_test_project(mock: &MockSatellite) -> Project {
     Project::open(&mock.access())
         .await

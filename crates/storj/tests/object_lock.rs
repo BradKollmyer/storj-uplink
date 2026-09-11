@@ -412,6 +412,79 @@ async fn bucket_object_lock_configuration() {
 }
 
 #[tokio::test]
+async fn copy_and_move_preserve_object_lock() {
+    let mock = MockSatellite::start().await;
+    let project = open_test_project(&mock).await;
+    let bucket = unique_bucket();
+    project
+        .create_bucket_with(
+            &bucket,
+            CreateBucketOptions {
+                object_lock_enabled: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create with lock");
+
+    let until = SystemTime::UNIX_EPOCH + Duration::from_secs(1_900_000_000);
+    let retention = Retention {
+        mode: RetentionMode::Compliance,
+        retain_until: until,
+    };
+    let mut upload = project
+        .upload_object(
+            &bucket,
+            "src",
+            UploadOptions {
+                retention: Some(retention.clone()),
+                legal_hold: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("upload");
+    upload.write_all(b"locked").await.expect("write");
+    upload.commit().await.expect("commit");
+
+    project
+        .copy_object(&bucket, "src", &bucket, "copied")
+        .await
+        .expect("copy");
+    assert_eq!(
+        project
+            .get_object_retention(&bucket, "copied", None)
+            .await
+            .expect("copied retention"),
+        Some(retention.clone())
+    );
+    assert!(
+        project
+            .get_object_legal_hold(&bucket, "copied", None)
+            .await
+            .expect("copied legal hold")
+    );
+
+    project
+        .move_object(&bucket, "copied", &bucket, "moved")
+        .await
+        .expect("move");
+    assert_eq!(
+        project
+            .get_object_retention(&bucket, "moved", None)
+            .await
+            .expect("moved retention"),
+        Some(retention)
+    );
+    assert!(
+        project
+            .get_object_legal_hold(&bucket, "moved", None)
+            .await
+            .expect("moved legal hold")
+    );
+}
+
+#[tokio::test]
 async fn get_retention_none_when_only_legal_hold_set() {
     let mock = MockSatellite::start().await;
     let project = open_test_project(&mock).await;

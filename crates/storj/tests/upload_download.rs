@@ -2,10 +2,10 @@
 //!
 //! Sizes from the design exit criterion: empty, 1B, inline±1, 64MiB, 64MiB+1.
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use storj::constants::MAX_SEGMENT_SIZE;
-use storj::{DownloadOptions, ErrorKind, Project};
+use storj::{DownloadOptions, ErrorKind, Project, UploadOptions};
 use storj_test::{INTEROP_SIZES, MockSatellite, size_label};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -217,6 +217,32 @@ async fn download_missing_object() {
         Err(e) => e,
     };
     assert_eq!(err.kind(), ErrorKind::ObjectNotFound);
+}
+
+#[tokio::test]
+async fn upload_expires_at_round_trips() {
+    let mock = MockSatellite::start().await;
+    let project = open_project(&mock).await;
+    let bucket = unique("exp");
+    project.ensure_bucket(&bucket).await.unwrap();
+    let expires = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000_000);
+
+    let mut upload = project
+        .upload_object(
+            &bucket,
+            "ttl.txt",
+            UploadOptions {
+                expires: Some(expires),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    upload.write_all(b"ttl").await.unwrap();
+    let obj = upload.commit().await.expect("commit");
+    assert_eq!(obj.system.expires, Some(expires));
+    let st = project.stat_object(&bucket, "ttl.txt").await.expect("stat");
+    assert_eq!(st.system.expires, Some(expires));
 }
 
 #[tokio::test]

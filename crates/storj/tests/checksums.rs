@@ -242,6 +242,41 @@ async fn multipart_begin_and_commit_checksum() {
 }
 
 #[tokio::test]
+async fn copy_and_move_preserve_checksums() {
+    let mock = MockSatellite::start().await;
+    let project = open_project(&mock).await;
+    let bucket = unique("cksum-copy");
+    project.ensure_bucket(&bucket).await.unwrap();
+    let plain = vec![0xCDu8; 32];
+
+    let mut upload = project
+        .upload_object(
+            &bucket,
+            "src.bin",
+            UploadOptions {
+                checksum: Some(sha256_checksum(plain.clone())),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    upload.write_all(b"checksummed copy").await.unwrap();
+    upload.commit().await.unwrap();
+
+    project
+        .copy_object(&bucket, "src.bin", &bucket, "dst.bin")
+        .await
+        .expect("copy");
+    assert_round_trip(&mock, &bucket, "dst.bin", &plain, false);
+
+    project
+        .move_object(&bucket, "dst.bin", &bucket, "moved.bin")
+        .await
+        .expect("move");
+    assert_round_trip(&mock, &bucket, "moved.bin", &plain, false);
+}
+
+#[tokio::test]
 async fn each_commit_uses_its_own_metadata_key() {
     let mock = MockSatellite::start().await;
     let project = open_project(&mock).await;

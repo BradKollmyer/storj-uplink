@@ -16,11 +16,17 @@ env.
 | `share_restrict.rs` | `share()` intersection | yes |
 | `ec_golden.rs` | infectious RS (Berlekamp-Welch still ignore) | yes |
 | `signing_golden.rs` | Go-signed order limits / piece hashes verify with the leaf cert, not the CA | yes |
-| `project_buckets.rs` | Bucket CRUD (mock) | yes |
+| `project_buckets.rs` | Bucket CRUD, Object Lock at create, placement (mock) | yes |
 | `project_objects.rs` | List/stat/delete/copy/move/revoke (mock) | yes |
-| `upload_download.rs` | Pipeline including 64MiB+1 (mock) | yes |
-| `multipart.rs` | Begin/Part/Commit (mock) | yes |
-| `object_lock.rs` | Retention / legal hold (mock) | yes |
+| `upload_download.rs` | Pipeline including 64MiB+1, versioned download, expiry (mock) | yes |
+| `multipart.rs` | Begin/Part/Commit, pending-stream listing (mock) | yes |
+| `object_lock.rs` | Retention / legal hold / copy-move lock (mock) | yes |
+| `checksums.rs` | Object checksums, metadata update, copy/move (mock) | yes |
+| `metadata_validation.rs` | Custom metadata UTF-8 / NUL (mock) | yes |
+| `mock_faults.rs` | Stalled nodes, RetryBeginSegmentPieces (mock) | yes |
+| `telemetry_quic.rs` | QUIC / Noise / TLS transports (mock) | yes |
+| `diagnostics.rs` | Transfer diagnostics (mock) | yes |
+| `tls_identity.rs` | Caller-supplied TLS identity (mock) | yes |
 | `interop.rs` | Go↔Rust grant + size matrix including `64MiB+1` | ignore + `STORJ_INTEROP=1` (objects also need `STORJ_INTEROP_ACCESS` / `STORJ_SIM_ACCESS`) |
 | `sim.rs` | `storj-sim` walkthrough | ignore + `STORJ_SIM=1` |
 
