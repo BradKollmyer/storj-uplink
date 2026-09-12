@@ -1245,7 +1245,11 @@ fn begin_delete(
     if let Some(bucket) = st.buckets.get_mut(&name) {
         bucket.objects = bucket.objects.saturating_sub(1);
     }
-    let object = if st.omit_delete_meta {
+    // Go DeleteObject: metadata is omitted when the key cannot read or list.
+    let hide_meta = st.omit_delete_meta
+        || (check_action(&req.header, Action::Read).is_err()
+            && check_action(&req.header, Action::List).is_err());
+    let object = if hide_meta {
         None
     } else {
         Some(rec.object.clone())

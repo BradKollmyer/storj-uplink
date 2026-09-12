@@ -122,3 +122,22 @@ fn share_empty_permission_is_error() {
     assert_eq!(e.kind(), storj::ErrorKind::InvalidGrant);
     assert!(e.to_string().contains("permission is empty"));
 }
+
+#[test]
+fn share_rejects_not_after_before_not_before() {
+    let root = parse_fixture();
+    let now = std::time::SystemTime::now();
+    let e = root
+        .share(
+            Permission {
+                allow_download: true,
+                not_before: Some(now + std::time::Duration::from_secs(3600)),
+                not_after: Some(now),
+                ..Permission::default()
+            },
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(e.kind(), storj::ErrorKind::InvalidGrant);
+    assert!(e.to_string().contains("invalid time range"), "{e}");
+}

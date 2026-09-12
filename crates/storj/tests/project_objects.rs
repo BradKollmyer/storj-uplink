@@ -490,6 +490,126 @@ async fn revoke_access_child_parent_still_works() {
     assert_eq!(err.kind(), ErrorKind::PermissionDenied);
 }
 
+/// Go TestSharePermissions: each CRUD bit is independently enforced.
+#[tokio::test]
+async fn share_permission_bits() {
+    let mock = MockSatellite::start().await;
+    let parent = open_test_project(&mock).await;
+    let combos = [
+        (true, true, true, true),
+        (true, false, false, false),
+        (false, true, false, false),
+        (false, false, true, false),
+        (false, false, false, true),
+    ];
+    for (i, (allow_download, allow_upload, allow_list, allow_delete)) in
+        combos.into_iter().enumerate()
+    {
+        let bucket = unique(&format!("perm{i}"));
+        parent.ensure_bucket(&bucket).await.unwrap();
+        upload(&parent, &bucket, "test.dat", b"payload").await;
+
+        let shared = mock
+            .access()
+            .share(
+                Permission {
+                    allow_download,
+                    allow_upload,
+                    allow_list,
+                    allow_delete,
+                    ..Permission::default()
+                },
+                &[],
+            )
+            .expect("share");
+        let project = Project::open(&shared).await.expect("open restricted");
+
+        match project
+            .download_object(&bucket, "test.dat", Default::default())
+            .await
+        {
+            Ok(mut dl) => {
+                assert!(allow_download, "download succeeded without AllowDownload");
+                let mut got = Vec::new();
+                dl.read_to_end(&mut got).await.unwrap();
+                assert_eq!(got, b"payload");
+            }
+            Err(e) => {
+                assert!(!allow_download, "download failed: {e}");
+                assert_eq!(e.kind(), ErrorKind::PermissionDenied, "{e}");
+            }
+        }
+
+        match project
+            .upload_object(&bucket, "new.dat", Default::default())
+            .await
+        {
+            Ok(mut u) => {
+                u.write_all(b"new").await.unwrap();
+                let committed = u.commit().await;
+                if allow_upload {
+                    committed.expect("upload commit");
+                } else {
+                    assert_eq!(committed.unwrap_err().kind(), ErrorKind::PermissionDenied);
+                }
+            }
+            Err(e) => {
+                assert!(!allow_upload, "upload_object failed: {e}");
+                assert_eq!(e.kind(), ErrorKind::PermissionDenied, "{e}");
+            }
+        }
+
+        if allow_list {
+            let listed = collect(&project, &bucket, ListObjectsOptions::default()).await;
+            assert!(
+                listed.iter().any(|o| o.key == "test.dat"),
+                "list missing test.dat: {listed:?}"
+            );
+        } else {
+            let mut s = project.list_objects(&bucket, ListObjectsOptions::default());
+            let err = s.next().await.expect("list error").unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::PermissionDenied, "{err}");
+        }
+
+        match project.delete_object(&bucket, "test.dat").await {
+            Ok(obj) => {
+                assert!(allow_delete, "delete succeeded without AllowDelete");
+                if allow_download || allow_list {
+                    assert!(obj.is_some(), "delete should return metadata");
+                } else {
+                    assert!(obj.is_none(), "delete without read/list returns None");
+                }
+            }
+            Err(e) => {
+                assert!(!allow_delete, "delete failed: {e}");
+                assert_eq!(e.kind(), ErrorKind::PermissionDenied, "{e}");
+            }
+        }
+
+        project.close().await.ok();
+    }
+}
+
+/// Go TestSharePermisionsNotAfterNotBefore: not_before in the future is unusable.
+#[tokio::test]
+async fn share_not_before_in_the_future_is_denied() {
+    let mock = MockSatellite::start().await;
+    let now = std::time::SystemTime::now();
+    let shared = mock
+        .access()
+        .share(
+            Permission {
+                not_before: Some(now + std::time::Duration::from_secs(3600)),
+                ..Permission::full()
+            },
+            &[],
+        )
+        .expect("share");
+    let project = Project::open(&shared).await.expect("open");
+    let err = project.ensure_bucket(&unique("nbefore")).await.unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::PermissionDenied, "{err}");
+}
+
 /// Go TestDeleteCopiedObject: copies are independent of the original.
 #[tokio::test]
 async fn copy_of_copy_survives_deleting_original() {
