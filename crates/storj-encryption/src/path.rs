@@ -124,6 +124,63 @@ pub fn encrypt_path_with_cipher(
     encrypt_path_bytes(bucket, path.as_bytes(), Some(path_cipher), store)
 }
 
+/// Parent encryption info for a listing prefix (Go `encryption.GetPrefixInfo`).
+///
+/// `encrypted_prefix` sent to the satellite is `parent_enc` (AES-GCM) or the
+/// raw prefix including the trailing slash (EncNull). Listed keys decrypt
+/// under `parent_key`.
+#[derive(Clone, Debug)]
+pub struct PrefixInfo {
+    /// Path cipher at the matched store base.
+    pub path_cipher: CipherSuite,
+    /// Path key of the parent (one component above `prefix`).
+    pub parent_key: Key,
+    /// Encrypted parent path, without a trailing slash.
+    pub parent_enc: Vec<u8>,
+}
+
+/// Prefix info for listing `bucket`/`prefix` (Go `GetPrefixInfo`).
+///
+/// For prefix `/` the parent is the first empty component, not the empty
+/// path, so `parent_enc` is a non-empty encrypted empty component.
+pub fn get_prefix_info(bucket: &str, prefix: &str, store: &Store) -> Result<PrefixInfo> {
+    let lookup = store.lookup_unencrypted(bucket, prefix.as_bytes());
+    let Some(base) = lookup.base else {
+        return Err(Error::missing_encryption_base(bucket, prefix.as_bytes()));
+    };
+    let path_cipher = if base.path_cipher.0 == 0 {
+        CipherSuite::AES_GCM
+    } else {
+        base.path_cipher
+    };
+
+    let mut key = base.key.clone();
+    if base.default {
+        key = key.derive_path_component(bucket.as_bytes());
+    }
+    let mut parent_key = key.clone();
+    let mut parent_enc_parts: Vec<Vec<u8>> = Vec::new();
+    if !base.default && !base.encrypted.is_empty() {
+        parent_enc_parts.push(base.encrypted);
+    }
+
+    let mut component_enc = Vec::new();
+    for (i, component) in lookup.remaining.enumerate() {
+        if i > 0 {
+            parent_key = key.clone();
+            parent_enc_parts.push(std::mem::take(&mut component_enc));
+        }
+        component_enc = encrypt_path_component(&component, path_cipher, &key)?;
+        key = key.derive_path_component(&component);
+    }
+
+    Ok(PrefixInfo {
+        path_cipher,
+        parent_key,
+        parent_enc: join_components(&parent_enc_parts),
+    })
+}
+
 /// Encrypt a listing prefix. A trailing `/` is stripped, encrypted, then reattached
 /// so it is not treated as an extra empty component (Go `EncryptPrefixWithStoreCipher`).
 pub fn encrypt_prefix(bucket: &str, path: &str, store: &Store) -> Result<Vec<u8>> {
@@ -573,6 +630,20 @@ mod tests {
             let dec = decrypt_path("bucket", &enc, &store).unwrap();
             assert_eq!(dec, path.as_bytes(), "path={path:?}");
         }
+    }
+
+    #[test]
+    fn prefix_info_slash_parent_is_empty_component() {
+        let store = default_store(CipherSuite::AES_GCM);
+        let empty = get_prefix_info("bucket", "", &store).unwrap();
+        assert!(empty.parent_enc.is_empty());
+        let slash = get_prefix_info("bucket", "/", &store).unwrap();
+        assert!(!slash.parent_enc.is_empty());
+        assert_ne!(slash.parent_key.as_bytes(), empty.parent_key.as_bytes());
+        let p = get_prefix_info("bucket", "p/", &store).unwrap();
+        assert_eq!(p.parent_enc, encrypt_path("bucket", "p", &store).unwrap());
+        let dbl = get_prefix_info("bucket", "//", &store).unwrap();
+        assert_eq!(dbl.parent_enc, encrypt_path("bucket", "/", &store).unwrap());
     }
 
     #[test]

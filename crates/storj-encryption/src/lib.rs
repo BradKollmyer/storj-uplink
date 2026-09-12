@@ -33,8 +33,9 @@ pub use key::{
 };
 pub use pad::{UINT32_SIZE, make_padding, pad, unpad, unpad_len};
 pub use path::{
-    PathIter, decrypt_iterator, decrypt_path, decrypt_path_with_cipher, derive_content_key,
-    derive_path_key, encrypt_iterator, encrypt_path, encrypt_path_with_cipher, encrypt_prefix,
+    PathIter, PrefixInfo, decrypt_iterator, decrypt_path, decrypt_path_with_cipher,
+    derive_content_key, derive_path_key, encrypt_iterator, encrypt_path, encrypt_path_with_cipher,
+    encrypt_prefix, get_prefix_info,
 };
 pub use secretbox::{SECRETBOX_OVERHEAD, SecretboxDecrypter, SecretboxEncrypter};
 pub use store::{Base, Lookup, Store};

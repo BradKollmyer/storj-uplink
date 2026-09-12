@@ -490,6 +490,127 @@ async fn revoke_access_child_parent_still_works() {
     assert_eq!(err.kind(), ErrorKind::PermissionDenied);
 }
 
+/// Go TestDeleteCopiedObject: copies are independent of the original.
+#[tokio::test]
+async fn copy_of_copy_survives_deleting_original() {
+    let mock = MockSatellite::start().await;
+    let project = open_test_project(&mock).await;
+    let bucket = unique("cpchain");
+    project.ensure_bucket(&bucket).await.unwrap();
+    upload(&project, &bucket, "a", b"payload").await;
+
+    project
+        .copy_object(&bucket, "a", &bucket, "b")
+        .await
+        .expect("copy a->b");
+    project
+        .copy_object(&bucket, "b", &bucket, "c")
+        .await
+        .expect("copy b->c");
+
+    project.delete_object(&bucket, "a").await.expect("delete a");
+    assert_eq!(download_bytes(&project, &bucket, "b").await, b"payload");
+    assert_eq!(download_bytes(&project, &bucket, "c").await, b"payload");
+
+    project.delete_object(&bucket, "b").await.expect("delete b");
+    assert_eq!(download_bytes(&project, &bucket, "c").await, b"payload");
+}
+
+/// Go TestOverwriteExistingCopyDestination.
+#[tokio::test]
+async fn copy_overwrites_existing_destination() {
+    let mock = MockSatellite::start().await;
+    let project = open_test_project(&mock).await;
+    let bucket = unique("cpow");
+    project.ensure_bucket(&bucket).await.unwrap();
+    upload(&project, &bucket, "a", b"payload1").await;
+    upload(&project, &bucket, "b", b"payload2").await;
+
+    project
+        .copy_object(&bucket, "a", &bucket, "b")
+        .await
+        .expect("copy a->b");
+    assert_eq!(download_bytes(&project, &bucket, "b").await, b"payload1");
+    assert_eq!(download_bytes(&project, &bucket, "a").await, b"payload1");
+}
+
+/// Go TestListObjects_DifficultNames: `/`, `//`, `///` as keys and prefixes.
+#[tokio::test]
+async fn list_objects_difficult_names() {
+    let mock = MockSatellite::start().await;
+    let project = open_test_project(&mock).await;
+    let bucket = unique("slash");
+    project.ensure_bucket(&bucket).await.unwrap();
+    upload(&project, &bucket, "/", b"one").await;
+    upload(&project, &bucket, "//", b"two").await;
+    upload(&project, &bucket, "///", b"three").await;
+
+    let root = collect(
+        &project,
+        &bucket,
+        ListObjectsOptions {
+            prefix: String::new(),
+            recursive: false,
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(root.len(), 1, "{root:?}");
+    assert!(root[0].is_prefix);
+    assert_eq!(root[0].key, "/");
+
+    let slash = collect(
+        &project,
+        &bucket,
+        ListObjectsOptions {
+            prefix: "/".into(),
+            recursive: false,
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(slash.len(), 2, "{slash:?}");
+    assert!(!slash[0].is_prefix && slash[0].key == "/");
+    assert!(slash[1].is_prefix && slash[1].key == "//");
+
+    let dbl = collect(
+        &project,
+        &bucket,
+        ListObjectsOptions {
+            prefix: "//".into(),
+            recursive: false,
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(dbl.len(), 2, "{dbl:?}");
+    assert!(!dbl[0].is_prefix && dbl[0].key == "//");
+    assert!(dbl[1].is_prefix && dbl[1].key == "///");
+
+    let tpl = collect(
+        &project,
+        &bucket,
+        ListObjectsOptions {
+            prefix: "///".into(),
+            recursive: false,
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(tpl.len(), 1, "{tpl:?}");
+    assert!(!tpl[0].is_prefix && tpl[0].key == "///");
+}
+
+async fn download_bytes(project: &Project, bucket: &str, key: &str) -> Vec<u8> {
+    let mut download = project
+        .download_object(bucket, key, Default::default())
+        .await
+        .expect("download");
+    let mut got = Vec::new();
+    download.read_to_end(&mut got).await.unwrap();
+    got
+}
+
 #[tokio::test]
 async fn revoke_access_cannot_revoke_self() {
     let mock = MockSatellite::start().await;

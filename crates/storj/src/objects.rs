@@ -4,8 +4,8 @@ use std::collections::VecDeque;
 
 use futures_util::stream;
 use storj_encryption::{
-    CipherSuite, Key, PathIter, decrypt_iterator, derive_content_key, derive_path_key,
-    encrypt_iterator, encrypt_path,
+    CipherSuite, Key, PathIter, decrypt_iterator, derive_content_key, encrypt_iterator,
+    encrypt_path, get_prefix_info,
 };
 use storj_proto::metainfo::{
     EncryptedKeyAndNonce, FinishCopyObjectRequest, FinishMoveObjectRequest, ObjectListItem,
@@ -256,34 +256,19 @@ pub(crate) struct ListKeyCodec {
 
 impl ListKeyCodec {
     pub(crate) fn new(project: &Project, bucket: &str, prefix: &str) -> Result<Self> {
-        let parent_plain = prefix.strip_suffix('/').unwrap_or(prefix);
-        let parent_key = derive_path_key(bucket, parent_plain.as_bytes(), &project.inner.store)
-            .map_err(map_enc)?;
-        let path_cipher = project
-            .inner
-            .store
-            .lookup_unencrypted(bucket, parent_plain.as_bytes())
-            .base
-            .map(|b| {
-                if b.path_cipher.0 == 0 {
-                    CipherSuite::AES_GCM
-                } else {
-                    b.path_cipher
-                }
-            })
-            .unwrap_or(CipherSuite::AES_GCM);
+        let info = get_prefix_info(bucket, prefix, &project.inner.store).map_err(map_enc)?;
         // EncNull: satellite does a raw byte-prefix match of the original prefix
         // (including trailing `/`). AES-GCM uses GetPrefixInfo.ParentEnc (no slash).
-        let arbitrary_prefix = path_cipher == CipherSuite::NULL;
+        let arbitrary_prefix = info.path_cipher == CipherSuite::NULL;
         let encrypted_prefix = if arbitrary_prefix {
             prefix.as_bytes().to_vec()
         } else {
-            encrypt_path(bucket, parent_plain, &project.inner.store).map_err(map_enc)?
+            info.parent_enc
         };
         Ok(Self {
             prefix: prefix.to_owned(),
-            parent_key,
-            path_cipher,
+            parent_key: info.parent_key,
+            path_cipher: info.path_cipher,
             encrypted_prefix,
             arbitrary_prefix,
         })
