@@ -590,6 +590,39 @@ async fn share_permission_bits() {
     }
 }
 
+/// Go TestAccessMaxObjectTTL: shared max_object_ttl is applied at BeginObject.
+#[tokio::test]
+async fn share_max_object_ttl_sets_expires() {
+    let mock = MockSatellite::start().await;
+    let ttl = std::time::Duration::from_secs(3600);
+    let shared = mock
+        .access()
+        .share(
+            Permission {
+                max_object_ttl: Some(ttl),
+                ..Permission::full()
+            },
+            &[],
+        )
+        .expect("share");
+    let project = Project::open(&shared).await.expect("open");
+    let bucket = unique("ttl");
+    project.ensure_bucket(&bucket).await.unwrap();
+    let before = std::time::SystemTime::now();
+    upload(&project, &bucket, "object", b"ttl-body").await;
+    let st = project.stat_object(&bucket, "object").await.expect("stat");
+    let expires = st.system.expires.expect("expires from max_object_ttl");
+    let expected = before + ttl;
+    let delta = expires
+        .duration_since(expected)
+        .or_else(|_| expected.duration_since(expires))
+        .unwrap();
+    assert!(
+        delta < std::time::Duration::from_secs(60),
+        "expires {expires:?} want ~{expected:?}"
+    );
+}
+
 /// Go TestSharePermisionsNotAfterNotBefore: not_before in the future is unusable.
 #[tokio::test]
 async fn share_not_before_in_the_future_is_denied() {

@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use prost::Message;
 use storj_proto::metainfo::{
@@ -1074,9 +1074,13 @@ fn begin_object(
     }
     st.next_id += 1;
     let stream_id = st.next_id.to_be_bytes().to_vec();
-    let expires = req.expires_at.map(|t| {
-        UNIX_EPOCH + std::time::Duration::new(t.seconds.max(0) as u64, t.nanos.max(0) as u32)
-    });
+    let mut expires = req
+        .expires_at
+        .map(|t| UNIX_EPOCH + Duration::new(t.seconds.max(0) as u64, t.nanos.max(0) as u32));
+    if let Some(ttl) = caveat_max_object_ttl(&req.header) {
+        let ttl_exp = SystemTime::now() + ttl;
+        expires = Some(expires.map_or(ttl_exp, |e| e.min(ttl_exp)));
+    }
     st.pending.insert(
         stream_id.clone(),
         PendingObject {
@@ -2552,6 +2556,24 @@ fn check_key(header: &Option<RequestHeader>, state: &MockState) -> Result<(), (u
         }
     }
     Ok(())
+}
+
+/// Tightest `max_object_ttl` across caveats (Go macaroon max object TTL).
+fn caveat_max_object_ttl(header: &Option<RequestHeader>) -> Option<Duration> {
+    let got = header.as_ref().map(|h| h.api_key.as_slice()).unwrap_or(&[]);
+    let Ok(mac) = storj_access::Macaroon::parse(got) else {
+        return None;
+    };
+    let mut min = None;
+    for raw in mac.caveats() {
+        let Ok(c) = storj_access::Caveat::decode(raw) else {
+            continue;
+        };
+        if let Some(ttl) = c.max_object_ttl {
+            min = Some(min.map_or(ttl, |m: Duration| m.min(ttl)));
+        }
+    }
+    min
 }
 
 fn parse_api_key(raw: &[u8]) -> Option<storj_access::ApiKey> {
