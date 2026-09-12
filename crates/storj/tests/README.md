@@ -29,7 +29,7 @@ env.
 | `tls_identity.rs` | Caller-supplied TLS identity (mock) | yes |
 | `interop.rs` | Go↔Rust grant + size matrix including `64MiB+1` | ignore + `STORJ_INTEROP=1` (objects also need `STORJ_INTEROP_ACCESS` / `STORJ_SIM_ACCESS`) |
 | `sim.rs` | `storj-sim` walkthrough | ignore + `STORJ_SIM=1` |
-| `live.rs` | Production satellite smoke (inline + 64 KiB remote) | ignore + `STORJ_LIVE=1` (`STORJ_ACCESS` or `.env`) |
+| `live.rs` | Production satellite smoke plus walkthrough (prefix list, range, copy, abort, `share()`, TCP vs Noise) | ignore + `STORJ_LIVE=1` (`STORJ_ACCESS` or `.env`) |
 | `live_concurrent.rs` | Concurrent remote uploads (rustic-style) | ignore + `STORJ_LIVE=1` (`STORJ_ACCESS` or `.env`) |
 
 ## Commands

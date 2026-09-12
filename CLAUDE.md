@@ -143,6 +143,9 @@ enforce them, and Go-produced fixtures pin several. Keep them true:
   `BeginDeleteObject` alone. Listing responses (objects and pending uploads)
   carry prefix-relative keys encrypted under the prefix's parent key.
 - Go never retries commit/begin/delete RPCs on transport errors; neither do we.
+- Copy and move use the dedicated `BeginCopyObject` / `FinishCopyObject` (and
+  move) RPCs. Production `CompressedBatch` rejects those item types
+  (`unsupported request type`).
 
 When a live run fails, the fastest loop is the local storj-sim (see the tests
 README); the mocks should then be extended to reject the same input.

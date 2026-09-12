@@ -30,6 +30,14 @@ pub const COMMIT_SEGMENT: &str = "/metainfo.Metainfo/CommitSegment";
 pub const MAKE_INLINE_SEGMENT: &str = "/metainfo.Metainfo/MakeInlineSegment";
 /// Replace failed piece order limits (`RetryBeginSegmentPieces`).
 pub const RETRY_BEGIN_SEGMENT_PIECES: &str = "/metainfo.Metainfo/RetryBeginSegmentPieces";
+/// Server-side copy begin. Not accepted inside `CompressedBatch` on production.
+pub const BEGIN_COPY_OBJECT: &str = "/metainfo.Metainfo/BeginCopyObject";
+/// Server-side copy finish.
+pub const FINISH_COPY_OBJECT: &str = "/metainfo.Metainfo/FinishCopyObject";
+/// Server-side move begin. Not accepted inside `CompressedBatch` on production.
+pub const BEGIN_MOVE_OBJECT: &str = "/metainfo.Metainfo/BeginMoveObject";
+/// Server-side move finish.
+pub const FINISH_MOVE_OBJECT: &str = "/metainfo.Metainfo/FinishMoveObject";
 /// Abort / delete a pending object (`BeginDeleteObject`).
 pub const BEGIN_DELETE_OBJECT: &str = "/metainfo.Metainfo/BeginDeleteObject";
 /// Finish object delete (`FinishDeleteObject`).

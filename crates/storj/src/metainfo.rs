@@ -947,22 +947,15 @@ impl MetainfoClient {
             new_encrypted_object_key,
             ..Default::default()
         };
-        let items = self
-            .compressed_batch(
-                vec![BatchRequestItem {
-                    request: Some(batch_request_item::Request::ObjectBeginCopy(req)),
-                }],
+        let body = self
+            .invoke(
+                rpc::BEGIN_COPY_OBJECT,
+                &req.encode_to_vec(),
                 src_bucket,
                 src_key,
             )
             .await?;
-        match Self::expect_one(items, "BeginCopyObject")? {
-            batch_response_item::Response::ObjectBeginCopy(r) => Ok(r),
-            _ => Err(Error::new(
-                ErrorKind::Protocol,
-                "unexpected BeginCopyObject response",
-            )),
-        }
+        metainfo::BeginCopyObjectResponse::decode(body.as_slice()).map_err(map_decode)
     }
 
     pub(crate) async fn finish_copy_object(
@@ -972,22 +965,15 @@ impl MetainfoClient {
         mut req: FinishCopyObjectRequest,
     ) -> Result<metainfo::FinishCopyObjectResponse> {
         req.header = Some(self.header());
-        let items = self
-            .compressed_batch(
-                vec![BatchRequestItem {
-                    request: Some(batch_request_item::Request::ObjectFinishCopy(req)),
-                }],
+        let body = self
+            .invoke(
+                rpc::FINISH_COPY_OBJECT,
+                &req.encode_to_vec(),
                 dst_bucket,
                 dst_key,
             )
             .await?;
-        match Self::expect_one(items, "FinishCopyObject")? {
-            batch_response_item::Response::ObjectFinishCopy(r) => Ok(r),
-            _ => Err(Error::new(
-                ErrorKind::Protocol,
-                "unexpected FinishCopyObject response",
-            )),
-        }
+        metainfo::FinishCopyObjectResponse::decode(body.as_slice()).map_err(map_decode)
     }
 
     pub(crate) async fn begin_move_object(
@@ -1005,22 +991,15 @@ impl MetainfoClient {
             new_bucket: new_bucket.as_bytes().to_vec(),
             new_encrypted_object_key,
         };
-        let items = self
-            .compressed_batch(
-                vec![BatchRequestItem {
-                    request: Some(batch_request_item::Request::ObjectBeginMove(req)),
-                }],
+        let body = self
+            .invoke(
+                rpc::BEGIN_MOVE_OBJECT,
+                &req.encode_to_vec(),
                 src_bucket,
                 src_key,
             )
             .await?;
-        match Self::expect_one(items, "BeginMoveObject")? {
-            batch_response_item::Response::ObjectBeginMove(r) => Ok(r),
-            _ => Err(Error::new(
-                ErrorKind::Protocol,
-                "unexpected BeginMoveObject response",
-            )),
-        }
+        metainfo::BeginMoveObjectResponse::decode(body.as_slice()).map_err(map_decode)
     }
 
     pub(crate) async fn finish_move_object(
@@ -1030,22 +1009,16 @@ impl MetainfoClient {
         mut req: FinishMoveObjectRequest,
     ) -> Result<()> {
         req.header = Some(self.header());
-        let items = self
-            .compressed_batch(
-                vec![BatchRequestItem {
-                    request: Some(batch_request_item::Request::ObjectFinishMove(req)),
-                }],
+        let body = self
+            .invoke(
+                rpc::FINISH_MOVE_OBJECT,
+                &req.encode_to_vec(),
                 src_bucket,
                 src_key,
             )
             .await?;
-        match Self::expect_one(items, "FinishMoveObject")? {
-            batch_response_item::Response::ObjectFinishMove(_) => Ok(()),
-            _ => Err(Error::new(
-                ErrorKind::Protocol,
-                "unexpected FinishMoveObject response",
-            )),
-        }
+        let _ = metainfo::FinishMoveObjectResponse::decode(body.as_slice()).map_err(map_decode)?;
+        Ok(())
     }
 
     pub(crate) async fn update_object_metadata(

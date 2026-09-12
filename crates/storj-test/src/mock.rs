@@ -895,6 +895,22 @@ fn handle_rpc(
             rec.legal_hold = req.enabled;
             Ok(SetObjectLegalHoldResponse {}.encode_to_vec())
         }
+        rpc::BEGIN_COPY_OBJECT => {
+            let req = BeginCopyObjectRequest::decode(body).map_err(decode_err)?;
+            Ok(begin_copy(req, state)?.encode_to_vec())
+        }
+        rpc::FINISH_COPY_OBJECT => {
+            let req = FinishCopyObjectRequest::decode(body).map_err(decode_err)?;
+            Ok(finish_copy(req, state)?.encode_to_vec())
+        }
+        rpc::BEGIN_MOVE_OBJECT => {
+            let req = BeginMoveObjectRequest::decode(body).map_err(decode_err)?;
+            Ok(begin_move(req, state)?.encode_to_vec())
+        }
+        rpc::FINISH_MOVE_OBJECT => {
+            let req = FinishMoveObjectRequest::decode(body).map_err(decode_err)?;
+            Ok(finish_move(req, state)?.encode_to_vec())
+        }
         rpc::COMPRESSED_BATCH => {
             let req = CompressedBatchRequest::decode(body).map_err(decode_err)?;
             let batch = decode_batch_request(&req)
