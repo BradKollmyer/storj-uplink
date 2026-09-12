@@ -4,6 +4,7 @@
 
 use std::time::{Duration, SystemTime};
 
+use futures_util::StreamExt;
 use storj::constants::MAX_SEGMENT_SIZE;
 use storj::{DownloadOptions, ErrorKind, Project, UploadOptions};
 use storj_test::{INTEROP_SIZES, MockSatellite, size_label};
@@ -699,4 +700,91 @@ async fn wait_for_abort(mock: &storj_test::MockSatellite) {
     while mock.aborted_count() == 0 && std::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+}
+
+async fn download_bytes(project: &Project, bucket: &str, key: &str) -> Vec<u8> {
+    let mut download = project
+        .download_object(bucket, key, Default::default())
+        .await
+        .expect("download");
+    let mut got = Vec::new();
+    download.read_to_end(&mut got).await.expect("read");
+    got
+}
+
+/// Go TestConcurrentUploadToSamePath / TestConcurrentUploadAndCommit:
+/// last committed payload wins; aborting a loser must not delete the winner.
+#[tokio::test]
+async fn last_commit_wins_same_key() {
+    let mock = MockSatellite::start().await;
+    let project = open_project(&mock).await;
+    let bucket = unique("samekey");
+    project.ensure_bucket(&bucket).await.unwrap();
+    let key = "same.dat";
+
+    let mut first = project
+        .upload_object(&bucket, key, Default::default())
+        .await
+        .unwrap();
+    first.write_all(b"first-payload").await.unwrap();
+
+    let mut second = project
+        .upload_object(&bucket, key, Default::default())
+        .await
+        .unwrap();
+    second.write_all(b"second-payload").await.unwrap();
+
+    first.commit().await.expect("first commit");
+    assert_eq!(
+        download_bytes(&project, &bucket, key).await,
+        b"first-payload"
+    );
+
+    second.abort().await.expect("abort loser");
+    assert_eq!(
+        download_bytes(&project, &bucket, key).await,
+        b"first-payload",
+        "abort of a loser must not delete the winner"
+    );
+
+    let mut third = project
+        .upload_object(&bucket, key, Default::default())
+        .await
+        .unwrap();
+    third.write_all(b"third-payload").await.unwrap();
+    third.commit().await.expect("later commit");
+    assert_eq!(
+        download_bytes(&project, &bucket, key).await,
+        b"third-payload"
+    );
+}
+
+/// Go TestAbortUpload: abort leaves ObjectNotFound and no pending streams.
+#[tokio::test]
+async fn abort_then_stat_and_list_uploads() {
+    let mock = MockSatellite::start().await;
+    let project = open_project(&mock).await;
+    let bucket = unique("abstat");
+    project.ensure_bucket(&bucket).await.unwrap();
+    let key = "gone.bin";
+
+    let mut upload = project
+        .upload_object(&bucket, key, Default::default())
+        .await
+        .unwrap();
+    upload.write_all(b"nope").await.unwrap();
+    upload.abort().await.unwrap();
+
+    let err = project.stat_object(&bucket, key).await.unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::ObjectNotFound);
+
+    let pending: Vec<_> = project
+        .list_uploads(&bucket, Default::default())
+        .collect()
+        .await;
+    let pending: Vec<_> = pending.into_iter().collect::<Result<Vec<_>, _>>().unwrap();
+    assert!(
+        pending.iter().all(|u| u.key != key),
+        "aborted upload must not list: {pending:?}"
+    );
 }
