@@ -638,8 +638,9 @@ impl DownloadedPieces {
 /// Download pieces until `k` succeed, then cancel the rest (long-tail).
 ///
 /// Only `k + LAUNCH_MARGIN` pieces are requested initially; each failure
-/// promotes the next unused assignment. If no piece completes for `hedge_delay`,
-/// another assignment starts without cancelling the slow pieces. Speculative
+/// promotes the next unused assignment. Every `hedge_delay` while more pieces
+/// are needed, another assignment starts without cancelling slow pieces. Piece
+/// completions do not postpone this deadline. Speculative
 /// spares (including the initial margin) are capped at about 20% of `k`, with a
 /// minimum of two and maximum of `k`. Failures can require further replacements.
 /// Every launched piece signs an order for its full byte range. Unused assignments
@@ -850,17 +851,24 @@ where
         .max(2)
         .min(required)
         .saturating_sub(margin);
+    // Keep the timer alive across completions. Recreating it in the select loop
+    // lets trickling successes defer all spares until the slowest tail remains.
+    // Reset only after a hedge launch; do not catch up with a burst of launches
+    // if the executor was busy when the deadline passed.
+    let hedge_timer = tokio::time::sleep(hedge_delay);
+    tokio::pin!(hedge_timer);
     while !set.is_empty() {
         let joined = tokio::select! {
             biased;
             // Prefer a ready result over an unnecessary extra download.
             joined = set.join_next() => joined,
-            () = tokio::time::sleep(hedge_delay),
+            () = &mut hedge_timer,
                 if !hedge_delay.is_zero() && hedges_left > 0 && !queue.is_empty() => {
                 if let Some(asg) = queue.pop_front() {
                     set.spawn(download(asg));
                     attempted += 1;
                     hedges_left -= 1;
+                    hedge_timer.as_mut().reset(tokio::time::Instant::now() + hedge_delay);
                 }
                 continue;
             }
@@ -1189,6 +1197,45 @@ mod tests {
             "slow surplus tasks are cancelled and drained"
         );
         assert_eq!(collected.unused.len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn trickling_completions_do_not_postpone_the_hedge_deadline() {
+        use std::sync::{Arc, Mutex};
+        let started = tokio::time::Instant::now();
+        let launches = Arc::new(Mutex::new(Vec::new()));
+        let collected = collect_piece_downloads(
+            (0..40).collect(),
+            29,
+            1,
+            Duration::from_secs(1),
+            0,
+            256,
+            |piece| {
+                launches.lock().unwrap().push((piece, started.elapsed()));
+                async move {
+                    let delay = match piece {
+                        0..=26 => 900 * (piece as u64 + 1),
+                        27..=29 => 60_000,
+                        _ => 10,
+                    };
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                    Ok((piece, vec![42]))
+                }
+            },
+        )
+        .await
+        .unwrap();
+        let launches = launches.lock().unwrap();
+        let first_hedge = launches.iter().find(|(piece, _)| *piece == 30).unwrap();
+        assert_eq!(first_hedge.1, Duration::from_secs(1));
+        assert_eq!(
+            launches.len(),
+            35,
+            "the existing spare budget must not grow"
+        );
+        assert_eq!(collected.shares.len(), 29);
+        assert!(started.elapsed() < Duration::from_secs(22));
     }
 
     #[tokio::test(start_paused = true)]

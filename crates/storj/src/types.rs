@@ -403,7 +403,8 @@ pub struct Config {
     /// 10 minutes. A slow-but-progressing transfer never trips it; a peer that
     /// stops responding fails within this bound instead of hanging forever.
     pub message_timeout: Option<Duration>,
-    /// Start an extra piece after this long without a completed piece download.
+    /// Interval between extra piece launches while more shares are needed.
+    /// Completed pieces do not postpone the next speculative launch.
     /// `None` uses one second; zero disables speculative downloads. Slow pieces
     /// keep running until enough shares succeed. Spares are bounded to about
     /// 20% of the required shares (at least two, at most the required count).
