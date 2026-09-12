@@ -2,7 +2,9 @@
 //!
 //! One in-flight RPC per connection (same as Go). During a remote segment
 //! upload the client talks to `n` storage nodes at once, so the cap **must**
-//! be at least the RS scheme `n` (production default 110).
+//! be at least the RS scheme `n` (production default 110). Concurrent object
+//! transfers need a multiple of `n` or they serialize (and can stall) on
+//! checkout.
 
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
@@ -18,7 +20,14 @@ use crate::{Error, Result};
 /// when using that scheme.
 pub const DEFAULT_SCHEME_N: usize = 110;
 
-/// Pool sizing. [`Self::for_redundancy_n`] guarantees `max_connections >= n`.
+/// Remote segments that may transfer at once with [`PoolConfig::default`].
+///
+/// One segment checks out up to RS `n` connections. rustic `--backup-connections`
+/// and overlapping parent-tree downloads need several segments in flight.
+pub const DEFAULT_CONCURRENT_SEGMENTS: usize = 8;
+
+/// Pool sizing. [`Self::for_redundancy_n`] is one segment (`max_connections = n`).
+/// [`Self::default`] allows [`DEFAULT_CONCURRENT_SEGMENTS`] segments in flight.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PoolConfig {
     /// Maximum concurrent SN connections (idle + in-use). Always ≥ scheme `n`.
@@ -28,11 +37,20 @@ pub struct PoolConfig {
 }
 
 impl PoolConfig {
-    /// Cap the pool at least at RS total pieces `n`.
+    /// Cap the pool at RS total pieces `n` (one remote segment).
     #[must_use]
     pub fn for_redundancy_n(n: usize) -> Self {
+        Self::for_redundancy_n_and_concurrency(n, 1)
+    }
+
+    /// Cap the pool at `n * concurrent_segments` so that many remote segments
+    /// can check out a full RS cohort without waiting.
+    #[must_use]
+    pub fn for_redundancy_n_and_concurrency(n: usize, concurrent_segments: usize) -> Self {
+        let n = n.max(1);
+        let concurrent = concurrent_segments.max(1);
         Self {
-            max_connections: n.max(1),
+            max_connections: n.saturating_mul(concurrent),
             idle_timeout: Duration::from_secs(5 * 60),
         }
     }
@@ -40,7 +58,7 @@ impl PoolConfig {
 
 impl Default for PoolConfig {
     fn default() -> Self {
-        Self::for_redundancy_n(DEFAULT_SCHEME_N)
+        Self::for_redundancy_n_and_concurrency(DEFAULT_SCHEME_N, DEFAULT_CONCURRENT_SEGMENTS)
     }
 }
 
@@ -284,6 +302,55 @@ impl<T> Drop for Pooled<T> {
     }
 }
 
+/// Holds a checked-out connection and **does not** recycle it unless [`Self::keep`]
+/// is called after a finished RPC.
+///
+/// Long-tail `JoinSet::abort_all` cancels in-flight piece tasks. Dropping a
+/// `Pooled` mid-RPC would idle a half-closed socket; the next checkout hangs
+/// until `message_timeout` (10 minutes). Call [`Self::keep`] only after the
+/// piece RPC returns and the transport still holds a connection.
+pub struct HeldPooled<T> {
+    pooled: Option<Pooled<T>>,
+    keep: bool,
+}
+
+impl<T> HeldPooled<T> {
+    /// Start in skip-recycle mode.
+    #[must_use]
+    pub fn new(pooled: Pooled<T>) -> Self {
+        Self {
+            pooled: Some(pooled),
+            keep: false,
+        }
+    }
+
+    /// Borrow the inner connection.
+    #[must_use]
+    pub fn get(&self) -> Option<&T> {
+        self.pooled.as_ref().and_then(Pooled::get)
+    }
+
+    /// Borrow the inner connection mutably.
+    pub fn get_mut(&mut self) -> Option<&mut T> {
+        self.pooled.as_mut().and_then(Pooled::get_mut)
+    }
+
+    /// Recycle this connection on drop (successful, still-connected RPC).
+    pub fn keep(&mut self) {
+        self.keep = true;
+    }
+}
+
+impl<T> Drop for HeldPooled<T> {
+    fn drop(&mut self) {
+        if let Some(mut pooled) = self.pooled.take()
+            && !self.keep
+        {
+            pooled.skip_recycle();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,12 +363,19 @@ mod tests {
 
     #[test]
     fn cap_at_least_scheme_n() {
-        assert!(PoolConfig::default().max_connections >= DEFAULT_SCHEME_N);
-        assert!(PoolConfig::for_redundancy_n(110).max_connections >= 110);
-        assert!(PoolConfig::for_redundancy_n(4).max_connections >= 4);
+        assert_eq!(
+            PoolConfig::default().max_connections,
+            DEFAULT_SCHEME_N * DEFAULT_CONCURRENT_SEGMENTS
+        );
+        assert_eq!(PoolConfig::for_redundancy_n(110).max_connections, 110);
+        assert_eq!(PoolConfig::for_redundancy_n(4).max_connections, 4);
         assert_eq!(PoolConfig::for_redundancy_n(0).max_connections, 1);
+        assert_eq!(
+            PoolConfig::for_redundancy_n_and_concurrency(110, 10).max_connections,
+            1100
+        );
         let pool = ConnectionPool::<u32>::new(PoolConfig::for_redundancy_n(110));
-        assert!(pool.max_connections() >= 110);
+        assert_eq!(pool.max_connections(), 110);
     }
 
     #[tokio::test]
@@ -424,5 +498,37 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(dials.load(Ordering::SeqCst), 2, "skipped conn must redial");
+    }
+
+    #[tokio::test]
+    async fn held_pooled_skips_recycle_unless_keep() {
+        let pool = ConnectionPool::new(PoolConfig::for_redundancy_n(1));
+        let node = nid(1);
+        let dials = Arc::new(AtomicUsize::new(0));
+        {
+            let dials = Arc::clone(&dials);
+            let pooled = pool
+                .checkout(node, || async move {
+                    dials.fetch_add(1, Ordering::SeqCst);
+                    Ok::<_, Error>(1u32)
+                })
+                .await
+                .unwrap();
+            drop(HeldPooled::new(pooled));
+        }
+        assert_eq!(pool.idle_count(), 0);
+        let dials2 = Arc::clone(&dials);
+        let pooled = pool
+            .checkout(node, || async move {
+                dials2.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, Error>(2u32)
+            })
+            .await
+            .unwrap();
+        assert_eq!(dials.load(Ordering::SeqCst), 2);
+        let mut held = HeldPooled::new(pooled);
+        held.keep();
+        drop(held);
+        assert_eq!(pool.idle_count(), 1);
     }
 }

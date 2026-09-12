@@ -27,12 +27,14 @@ published so the facade can resolve on crates.io; they are not a stable API.
 - Exact-key pending upload listing, downloads of a selected object version,
   caller-supplied object checksums on begin/commit, and bucket creation
   options for Object Lock and placement.
+- `Config.concurrent_segments` (default 8): storage-node pool cap is this
+  times RS `n`, so several remote segments can transfer at once.
 
 ### Breaking changes and migration
 
-- `Config` adds `tls_identity`, `transport`, `network`, and `telemetry`. Complete
-  1.0 literals must add these fields or end with `..Default::default()`.
-  Option structs remain constructible by literal.
+- `Config` adds `tls_identity`, `transport`, `network`, `telemetry`, and
+  `concurrent_segments`. Complete 1.0 literals must add these fields or end
+  with `..Default::default()`. Option structs remain constructible by literal.
 - `DownloadOptions` adds `version`; `UploadOptions` and `CommitUploadOptions`
   add `checksum`. For 1.0 behavior use an empty version and `checksum: None`,
   or supply the original fields with `..Default::default()`.
@@ -83,6 +85,11 @@ published so the facade can resolve on crates.io; they are not a stable API.
   of requiring the host kernel to enable TFO.
 - Clarify that Noise early data currently contains DRPC INVOKE only; the first
   piece request is sent after authentication.
+- Do not idle a storage-node connection after a cancelled or failed piece RPC.
+  Long-tail abort was recycling half-closed sockets; the next checkout could
+  hang until `message_timeout` (10 minutes). Successful RPCs still recycle.
+- Size the default SN pool for eight concurrent remote segments so parallel
+  object uploads no longer serialize on a single RS cohort of connections.
 
 
 ### Changed

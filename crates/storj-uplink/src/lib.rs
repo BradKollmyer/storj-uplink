@@ -20,7 +20,9 @@ pub use orders::{
     verify_order, verify_order_limit, verify_piece_hash_node, verify_piece_hash_uplink,
 };
 pub use piecestore::{Client, Config as PieceConfig};
-pub use pool::{ConnectionPool, DEFAULT_SCHEME_N, PoolConfig, Pooled};
+pub use pool::{
+    ConnectionPool, DEFAULT_CONCURRENT_SEGMENTS, DEFAULT_SCHEME_N, HeldPooled, PoolConfig, Pooled,
+};
 
 /// Piecestore / order-limit errors.
 #[derive(Debug, thiserror::Error)]

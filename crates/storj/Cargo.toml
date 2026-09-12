@@ -36,7 +36,7 @@ storj-access.workspace = true
 storj-ec.workspace = true
 storj-proto.workspace = true
 storj-test.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util", "time"] }
 futures-util.workspace = true
 
 [[example]]

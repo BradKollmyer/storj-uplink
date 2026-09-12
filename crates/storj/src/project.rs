@@ -71,7 +71,10 @@ impl Project {
                 store,
                 identity,
                 pool: storj_uplink::pool::ConnectionPool::new(
-                    storj_uplink::pool::PoolConfig::default(),
+                    storj_uplink::pool::PoolConfig::for_redundancy_n_and_concurrency(
+                        storj_uplink::DEFAULT_SCHEME_N,
+                        config.concurrent_segments_or_default(),
+                    ),
                 ),
                 satellite_cert,
                 dial_timeout,

@@ -85,6 +85,7 @@ fn config_remains_constructible_by_literal() {
             congestion_control: None,
         },
         telemetry: None,
+        concurrent_segments: None,
     };
     assert_eq!(c, Config::default());
     assert!(c.user_agent.is_none());

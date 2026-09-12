@@ -18,7 +18,7 @@ use tokio::task::JoinSet;
 use crate::orders::PiecePrivateKey;
 use crate::piecestore::{Client, Config as PieceConfig};
 use crate::pipeline::Redundancy;
-use crate::pool::{ConnectionPool, Pooled};
+use crate::pool::{ConnectionPool, HeldPooled, Pooled};
 use crate::{Error, Result};
 
 /// Authenticated piecestore connection plus the peer leaf (piece-hash verify).
@@ -495,33 +495,22 @@ async fn upload_one_piece(
         })
         .await
         .map_err(|e| (asg.piece_num, e))?;
-    struct RecycleOnDrop {
-        pooled: Option<Pooled<SnTransport>>,
-    }
-    impl Drop for RecycleOnDrop {
-        fn drop(&mut self) {
-            if let Some(mut pooled) = self.pooled.take()
-                && pooled.get().is_none_or(|t| t.conn.is_none())
-            {
-                pooled.skip_recycle();
-            }
-        }
-    }
-    let mut held = RecycleOnDrop {
-        pooled: Some(pooled),
-    };
+    let mut held = HeldPooled::new(pooled);
     let transport = held
-        .pooled
-        .as_mut()
-        .and_then(Pooled::get_mut)
+        .get_mut()
         .ok_or_else(|| (asg.piece_num, Error::protocol("pooled SN conn missing")))?;
     let data: &[u8] = pieces.get(idx).map(Vec::as_slice).unwrap_or(&[]);
     match put_piece(transport, &satellite_cert, &piece_key, &asg.limit, data).await {
-        Ok(hash) => Ok(SegmentPieceUploadResult {
-            piece_num: asg.piece_num,
-            node_id: asg.node_id.as_bytes().to_vec(),
-            hash: Some(hash),
-        }),
+        Ok(hash) => {
+            if held.get().is_some_and(|t| t.conn.is_some()) {
+                held.keep();
+            }
+            Ok(SegmentPieceUploadResult {
+                piece_num: asg.piece_num,
+                node_id: asg.node_id.as_bytes().to_vec(),
+                hash: Some(hash),
+            })
+        }
         Err(e) => Err((asg.piece_num, e)),
     }
 }

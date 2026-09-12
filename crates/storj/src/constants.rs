@@ -38,6 +38,9 @@ pub const ARGON2_PARALLELISM_DERIVE: u32 = 1;
 /// Default satellite dial timeout when `Config::dial_timeout` is `None` or zero.
 pub const DEFAULT_DIAL_TIMEOUT_SECS: u64 = 20;
 
+/// Default remote segments in flight. SN pool cap is this times RS `n`.
+pub const DEFAULT_CONCURRENT_SEGMENTS: usize = storj_uplink::DEFAULT_CONCURRENT_SEGMENTS;
+
 /// Multipart: minimum part size except the last (satellite config).
 pub const MIN_MULTIPART_PART_SIZE: u64 = 5 * 1024 * 1024;
 /// Multipart: maximum number of parts.

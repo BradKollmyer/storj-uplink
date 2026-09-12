@@ -403,6 +403,9 @@ pub struct Config {
     /// 10 minutes. A slow-but-progressing transfer never trips it; a peer that
     /// stops responding fails within this bound instead of hanging forever.
     pub message_timeout: Option<Duration>,
+    /// How many remote segments may upload or download at once. The storage-node
+    /// pool cap is this times RS `n` (production 110). `None` or 0 → 8.
+    pub concurrent_segments: Option<usize>,
 }
 
 impl Config {
@@ -421,6 +424,15 @@ impl Config {
         match self.message_timeout {
             None | Some(Duration::ZERO) => storj_rpc::conn::DEFAULT_TIMEOUT,
             Some(d) => d,
+        }
+    }
+
+    /// Effective remote-segment concurrency (`None`/zero → 8).
+    #[must_use]
+    pub fn concurrent_segments_or_default(&self) -> usize {
+        match self.concurrent_segments {
+            None | Some(0) => crate::constants::DEFAULT_CONCURRENT_SEGMENTS,
+            Some(n) => n,
         }
     }
 }
@@ -522,6 +534,23 @@ mod tests {
         assert_eq!(
             Config::default().dial_timeout_or_default(),
             Duration::from_secs(20)
+        );
+        assert_eq!(Config::default().concurrent_segments_or_default(), 8);
+        assert_eq!(
+            Config {
+                concurrent_segments: Some(0),
+                ..Default::default()
+            }
+            .concurrent_segments_or_default(),
+            8
+        );
+        assert_eq!(
+            Config {
+                concurrent_segments: Some(10),
+                ..Default::default()
+            }
+            .concurrent_segments_or_default(),
+            10
         );
     }
 

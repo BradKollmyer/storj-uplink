@@ -16,7 +16,7 @@ use tokio::task::JoinSet;
 use crate::orders::PiecePrivateKey;
 use crate::piecestore::{Client, Config as PieceConfig};
 use crate::pipeline::Redundancy;
-use crate::pool::Pooled;
+use crate::pool::{HeldPooled, Pooled};
 use crate::segment::{PieceAssignment, SnPool, SnTransport};
 use crate::{Error, Result};
 
@@ -887,31 +887,13 @@ async fn download_one_piece(
         })
         .await
         .map_err(|e| failure(e, DownloadStage::Connection))?;
-    struct RecycleOnDrop {
-        pooled: Option<Pooled<SnTransport>>,
-    }
-    impl Drop for RecycleOnDrop {
-        fn drop(&mut self) {
-            if let Some(mut pooled) = self.pooled.take()
-                && pooled.get().is_none_or(|t| t.conn.is_none())
-            {
-                pooled.skip_recycle();
-            }
-        }
-    }
-    let mut held = RecycleOnDrop {
-        pooled: Some(pooled),
-    };
-    let transport = held
-        .pooled
-        .as_mut()
-        .and_then(Pooled::get_mut)
-        .ok_or_else(|| {
-            failure(
-                Error::protocol("pooled SN conn missing"),
-                DownloadStage::Connection,
-            )
-        })?;
+    let mut held = HeldPooled::new(pooled);
+    let transport = held.get_mut().ok_or_else(|| {
+        failure(
+            Error::protocol("pooled SN conn missing"),
+            DownloadStage::Connection,
+        )
+    })?;
     match get_piece(
         transport,
         &satellite_cert,
@@ -922,7 +904,12 @@ async fn download_one_piece(
     )
     .await
     {
-        Ok(data) => Ok((asg.piece_num, data)),
+        Ok(data) => {
+            if held.get().is_some_and(|t| t.conn.is_some()) {
+                held.keep();
+            }
+            Ok((asg.piece_num, data))
+        }
         Err(e) => {
             let stage = match e {
                 Error::InvalidDownloadRange { .. }
