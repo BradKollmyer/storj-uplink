@@ -3,9 +3,10 @@
 //! or a parent directory. A `.env` file does not enable the tests by itself.
 //!
 //! `upload_download_inline_and_remote` is a short smoke check. `satellite_walkthrough`
-//! covers prefix listing, ranged download, copy, abort, restricted grants, and
-//! TCP vs default Noise. Uses `STORJ_BUCKET` when set; otherwise creates a
-//! unique bucket and deletes it afterwards.
+//! covers prefix listing, ranged download, copy, move, abort, small multipart,
+//! custom metadata, cross-bucket copy, restricted grants, and TCP vs default
+//! Noise. Uses `STORJ_BUCKET` when set; otherwise creates a unique bucket and
+//! deletes it afterwards.
 //!
 //! ```text
 //! STORJ_LIVE=1 cargo test -p storj --test live -- --ignored --nocapture
@@ -15,8 +16,8 @@ use std::time::Duration;
 
 use futures_util::StreamExt;
 use storj::{
-    Access, Config, DownloadOptions, ErrorKind, ListObjectsOptions, Permission, SharePrefix,
-    TransportMode,
+    Access, CommitUploadOptions, Config, CustomMetadata, DownloadOptions, ErrorKind,
+    ListObjectsOptions, ListUploadsOptions, Permission, SharePrefix, TransportMode,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::timeout;
@@ -233,6 +234,16 @@ async fn upload_download_inline_and_remote() {
     project.close().await.ok();
 }
 
+fn unique(prefix: &str) -> String {
+    format!(
+        "{prefix}-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    )
+}
+
 /// Wire paths that passed mocks and failed a real satellite: prefix-relative
 /// listing keys, SN ranged reads, copy RPCs, abort = BeginDeleteObject only,
 /// live `share()` enforcement, and TLS piece transfers vs default Noise.
@@ -339,6 +350,147 @@ async fn satellite_walkthrough() {
             .await
             .expect("copy timed out");
             eprintln!("copy ok: {copy_key}");
+
+            let moved_src = format!("{prefix}move-src.bin");
+            let moved_dst = format!("{prefix}move-dst.bin");
+            timeout(Duration::from_secs(60), async {
+                upload(&project, &bucket, &moved_src, b"move-me").await;
+                project
+                    .move_object(&bucket, &moved_src, &bucket, &moved_dst)
+                    .await
+                    .unwrap_or_else(|e| panic!("move_object: {e}"));
+                let err = project
+                    .stat_object(&bucket, &moved_src)
+                    .await
+                    .expect_err("moved source must be gone");
+                assert_eq!(err.kind(), ErrorKind::ObjectNotFound, "{err}");
+                let got = download(&project, &bucket, &moved_dst).await;
+                assert_eq!(got, b"move-me");
+            })
+            .await
+            .expect("move timed out");
+            eprintln!("move ok: {moved_dst}");
+
+            let mp_key = format!("{prefix}mp/small.bin");
+            timeout(Duration::from_secs(90), async {
+                let info = project
+                    .begin_upload(&bucket, &mp_key, Default::default())
+                    .await
+                    .expect("begin_upload");
+                let mut part = project
+                    .upload_part(&bucket, &mp_key, &info.upload_id, 1)
+                    .await
+                    .expect("upload_part");
+                part.write_all(b"tiny-part").await.expect("write part");
+                part.commit().await.expect("commit part");
+                project
+                    .commit_upload(
+                        &bucket,
+                        &mp_key,
+                        &info.upload_id,
+                        CommitUploadOptions::default(),
+                    )
+                    .await
+                    .expect("commit_upload");
+                let got = download(&project, &bucket, &mp_key).await;
+                assert_eq!(got, b"tiny-part");
+
+                let aborted_mp = format!("{prefix}mp/aborted.bin");
+                let info = project
+                    .begin_upload(&bucket, &aborted_mp, Default::default())
+                    .await
+                    .expect("begin_upload abort");
+                let mut part = project
+                    .upload_part(&bucket, &aborted_mp, &info.upload_id, 1)
+                    .await
+                    .expect("upload_part abort");
+                part.write_all(b"nope").await.expect("write abort part");
+                part.commit().await.expect("commit abort part");
+                project
+                    .abort_upload(&bucket, &aborted_mp, &info.upload_id)
+                    .await
+                    .expect("abort_upload");
+                let mut pending = Vec::new();
+                let mut stream = project.list_uploads(
+                    &bucket,
+                    ListUploadsOptions {
+                        prefix: format!("{prefix}mp/"),
+                        ..Default::default()
+                    },
+                );
+                while let Some(item) = stream.next().await {
+                    pending.push(item.unwrap_or_else(|e| panic!("list_uploads: {e}")));
+                }
+                assert!(
+                    pending.iter().all(|u| u.key != aborted_mp),
+                    "aborted multipart still listed: {pending:?}"
+                );
+            })
+            .await
+            .expect("multipart timed out");
+            eprintln!("multipart ok: {mp_key}");
+
+            let meta_key = format!("{prefix}meta.txt");
+            timeout(Duration::from_secs(60), async {
+                let mut upload = project
+                    .upload_object(&bucket, &meta_key, Default::default())
+                    .await
+                    .expect("upload_object meta");
+                let mut custom = CustomMetadata::new();
+                custom.insert("app:title".into(), "one".into());
+                upload
+                    .set_custom_metadata(custom)
+                    .await
+                    .expect("set_custom_metadata");
+                upload.write_all(b"meta-body").await.expect("write meta");
+                upload.commit().await.expect("commit meta");
+                let st = project
+                    .stat_object(&bucket, &meta_key)
+                    .await
+                    .expect("stat meta");
+                assert_eq!(st.custom.get("app:title").map(String::as_str), Some("one"));
+
+                let mut updated = CustomMetadata::new();
+                updated.insert("app:title".into(), "two".into());
+                project
+                    .update_object_metadata(&bucket, &meta_key, updated)
+                    .await
+                    .expect("update_object_metadata");
+                let st = project
+                    .stat_object(&bucket, &meta_key)
+                    .await
+                    .expect("stat meta after update");
+                assert_eq!(st.custom.get("app:title").map(String::as_str), Some("two"));
+                let got = download(&project, &bucket, &meta_key).await;
+                assert_eq!(got, b"meta-body");
+            })
+            .await
+            .expect("custom metadata timed out");
+            eprintln!("custom metadata ok: {meta_key}");
+
+            let xcopy_src = format!("{prefix}xcopy.bin");
+            let extra_bucket = unique("walk-xcopy");
+            timeout(Duration::from_secs(90), async {
+                project
+                    .ensure_bucket(&extra_bucket)
+                    .await
+                    .unwrap_or_else(|e| panic!("ensure extra bucket {extra_bucket}: {e}"));
+                upload(&project, &bucket, &xcopy_src, b"cross-bucket").await;
+                let copied = project
+                    .copy_object(&bucket, &xcopy_src, &extra_bucket, "dest.bin")
+                    .await;
+                let got = match &copied {
+                    Ok(_) => Some(download(&project, &extra_bucket, "dest.bin").await),
+                    Err(_) => None,
+                };
+                let deleted = project.delete_bucket_with_objects(&extra_bucket).await;
+                copied.unwrap_or_else(|e| panic!("cross-bucket copy: {e}"));
+                assert_eq!(got.as_deref(), Some(b"cross-bucket".as_slice()));
+                deleted.unwrap_or_else(|e| panic!("delete extra bucket {extra_bucket}: {e}"));
+            })
+            .await
+            .expect("cross-bucket copy timed out");
+            eprintln!("cross-bucket copy ok: {extra_bucket}");
 
             let aborted_key = format!("{prefix}aborted.bin");
             timeout(Duration::from_secs(60), async {
