@@ -404,7 +404,8 @@ pub struct Config {
     /// stops responding fails within this bound instead of hanging forever.
     pub message_timeout: Option<Duration>,
     /// How many remote segments may upload or download at once. The storage-node
-    /// pool cap is this times RS `n` (production 110). `None` or 0 → 8.
+    /// pool cap is this times RS `n` (production 110). `None` or 0 → 10.
+    /// Extra segments wait for a free slot rather than dialing past the cap.
     pub concurrent_segments: Option<usize>,
 }
 
@@ -427,7 +428,7 @@ impl Config {
         }
     }
 
-    /// Effective remote-segment concurrency (`None`/zero → 8).
+    /// Effective remote-segment concurrency (`None`/zero → 10).
     #[must_use]
     pub fn concurrent_segments_or_default(&self) -> usize {
         match self.concurrent_segments {
@@ -535,22 +536,22 @@ mod tests {
             Config::default().dial_timeout_or_default(),
             Duration::from_secs(20)
         );
-        assert_eq!(Config::default().concurrent_segments_or_default(), 8);
+        assert_eq!(Config::default().concurrent_segments_or_default(), 10);
         assert_eq!(
             Config {
                 concurrent_segments: Some(0),
                 ..Default::default()
             }
             .concurrent_segments_or_default(),
-            8
+            10
         );
         assert_eq!(
             Config {
-                concurrent_segments: Some(10),
+                concurrent_segments: Some(4),
                 ..Default::default()
             }
             .concurrent_segments_or_default(),
-            10
+            4
         );
     }
 

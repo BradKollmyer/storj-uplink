@@ -21,10 +21,8 @@ use crate::{Error, Result};
 pub const DEFAULT_SCHEME_N: usize = 110;
 
 /// Remote segments that may transfer at once with [`PoolConfig::default`].
-///
-/// One segment checks out up to RS `n` connections. rustic `--backup-connections`
-/// and overlapping parent-tree downloads need several segments in flight.
-pub const DEFAULT_CONCURRENT_SEGMENTS: usize = 8;
+/// One segment checks out up to RS `n` connections.
+pub const DEFAULT_CONCURRENT_SEGMENTS: usize = 10;
 
 /// Pool sizing. [`Self::for_redundancy_n`] is one segment (`max_connections = n`).
 /// [`Self::default`] allows [`DEFAULT_CONCURRENT_SEGMENTS`] segments in flight.
@@ -305,10 +303,9 @@ impl<T> Drop for Pooled<T> {
 /// Holds a checked-out connection and **does not** recycle it unless [`Self::keep`]
 /// is called after a finished RPC.
 ///
-/// Long-tail `JoinSet::abort_all` cancels in-flight piece tasks. Dropping a
-/// `Pooled` mid-RPC would idle a half-closed socket; the next checkout hangs
-/// until `message_timeout` (10 minutes). Call [`Self::keep`] only after the
-/// piece RPC returns and the transport still holds a connection.
+/// Recycling mid-RPC idles a half-closed socket; the next checkout can hang
+/// until `message_timeout`. Call [`Self::keep`] only after the piece RPC
+/// returns and the transport still holds a connection.
 pub struct HeldPooled<T> {
     pooled: Option<Pooled<T>>,
     keep: bool,

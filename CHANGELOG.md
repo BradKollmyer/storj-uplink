@@ -27,7 +27,7 @@ published so the facade can resolve on crates.io; they are not a stable API.
 - Exact-key pending upload listing, downloads of a selected object version,
   caller-supplied object checksums on begin/commit, and bucket creation
   options for Object Lock and placement.
-- `Config.concurrent_segments` (default 8): storage-node pool cap is this
+- `Config.concurrent_segments` (default 10): storage-node pool cap is this
   times RS `n`, so several remote segments can transfer at once.
 
 ### Breaking changes and migration
@@ -88,7 +88,7 @@ published so the facade can resolve on crates.io; they are not a stable API.
 - Do not idle a storage-node connection after a cancelled or failed piece RPC.
   Long-tail abort was recycling half-closed sockets; the next checkout could
   hang until `message_timeout` (10 minutes). Successful RPCs still recycle.
-- Size the default SN pool for eight concurrent remote segments so parallel
+- Size the default SN pool for ten concurrent remote segments so parallel
   object uploads no longer serialize on a single RS cohort of connections.
 
 

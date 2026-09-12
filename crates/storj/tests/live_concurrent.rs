@@ -1,7 +1,7 @@
 //! Live satellite probe for concurrent object uploads.
 //!
 //! Reproduces the rustic `--backup-connections 10` pattern: N remote
-//! segments sharing one SN connection pool (default cap = RS `n` = 110).
+//! segments sharing one SN connection pool (default cap = `n` × 10).
 //!
 //! ```text
 //! STORJ_ACCESS=... cargo test -p storj --test live_concurrent -- --ignored --nocapture
@@ -166,17 +166,12 @@ async fn concurrent_remote_uploads_do_not_hang() {
             .expect("10 concurrent 8 MiB upload timed out");
 
             eprintln!("phase 10 x 8 MiB download");
-            match timeout(
+            timeout(
                 Duration::from_secs(120),
                 run_serial_downloads(&project, &bucket, &keys10, eight_mib),
             )
             .await
-            {
-                Ok(()) => {}
-                Err(_) => eprintln!(
-                    "10-object download timed out (uploads already succeeded; likely SN/port pressure)"
-                ),
-            }
+            .expect("10-object download timed out");
         }
     };
     storj_test::with_bucket_cleanup(&project, &bucket, body).await;
