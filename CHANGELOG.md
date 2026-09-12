@@ -60,6 +60,8 @@ published so the facade can resolve on crates.io; they are not a stable API.
   equivalents) instead of `CompressedBatch`. Production satellites reject
   those batch item types with "unsupported request type"; Go uplink already
   uses the unary RPCs.
+- List with prefix `/` uses Go `GetPrefixInfo`: the parent is the first empty
+  path component, not the empty path.
 - Probe previously failing encryption blocks when retrying malformed pieces
   to avoid repeated full-segment decoding for late corruption.
 - Match satellite copy/move Object Lock behavior in the mock: use destination
