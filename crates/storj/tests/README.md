@@ -29,6 +29,8 @@ env.
 | `tls_identity.rs` | Caller-supplied TLS identity (mock) | yes |
 | `interop.rs` | Go↔Rust grant + size matrix including `64MiB+1` | ignore + `STORJ_INTEROP=1` (objects also need `STORJ_INTEROP_ACCESS` / `STORJ_SIM_ACCESS`) |
 | `sim.rs` | `storj-sim` walkthrough | ignore + `STORJ_SIM=1` |
+| `live.rs` | Production satellite smoke (inline + 64 KiB remote) | ignore + `STORJ_LIVE=1` (`STORJ_ACCESS` or `.env`) |
+| `live_concurrent.rs` | Concurrent remote uploads (rustic-style) | ignore + `STORJ_LIVE=1` (`STORJ_ACCESS` or `.env`) |
 
 ## Commands
 
@@ -39,10 +41,28 @@ go run -C scripts/interop . parse "$(tr -d '\n' < crates/storj/tests/fixtures/gr
 STORJ_INTEROP=1 cargo test -p storj --test interop -- --ignored --skip writer_reader_size_matrix
 STORJ_INTEROP=1 STORJ_INTEROP_ACCESS=... cargo test -p storj --test interop writer_reader_size_matrix -- --ignored
 STORJ_SIM=1 STORJ_SIM_ACCESS=... cargo test -p storj --test sim -- --ignored
+STORJ_LIVE=1 cargo test -p storj --test live -- --ignored --nocapture
+STORJ_LIVE=1 cargo test -p storj --test live_concurrent -- --ignored --nocapture
 cargo test -p storj --test encryption_golden --test grant_golden
 ```
 
-`cargo test -p storj -- --ignored` still runs interop/sim tests that need Go or a satellite. Use `--test interop` / `--test sim` as above.
+`cargo test -p storj -- --ignored` still compiles interop/sim/live tests; live
+tests also require `STORJ_LIVE=1` so a `.env` file cannot start a long satellite
+run by itself. Use `--test interop` / `--test sim` / `--test live` as above.
+
+## Live satellite (`.env`)
+
+Ignored tests in `live.rs` and `live_concurrent.rs` talk to a real satellite.
+They do not run under `cargo test` or `cargo test -- --ignored` unless
+`STORJ_LIVE=1` is set in the process environment. Credentials (`STORJ_ACCESS`)
+come from the process environment or a `.env` file in the workspace root or a
+parent directory (see `.env.example`). Existing process variables win over the
+file. `STORJ_ENV_FILE` selects an explicit path. `.env` must not be used to
+opt the tests in.
+
+When `STORJ_BUCKET` is set, tests write under a unique object-key prefix in
+that bucket and delete only those objects. Otherwise they create a unique
+bucket and delete it afterwards.
 
 ## Interop matrix (v1.0 exit criterion)
 

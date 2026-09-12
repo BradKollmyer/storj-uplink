@@ -217,7 +217,15 @@ cargo test -p storj --test quic_go_interop -- --ignored # local Go QUIC listener
 ```
 
 Object-matrix interop and `storj-sim` need a live grant (`STORJ_INTEROP_ACCESS` /
-`STORJ_SIM_ACCESS`). See [crates/storj/tests/README.md](crates/storj/tests/README.md).
+`STORJ_SIM_ACCESS`). Production-satellite smoke tests are `#[ignore]` and also
+need `STORJ_LIVE=1`; they load `STORJ_ACCESS` from the environment or a `.env`
+file:
+
+```bash
+STORJ_LIVE=1 cargo test -p storj --test live -- --ignored --nocapture
+```
+
+See [crates/storj/tests/README.md](crates/storj/tests/README.md).
 
 ## Contributing
 

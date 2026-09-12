@@ -44,9 +44,14 @@ and `proto/README.md` together.
 
 CI runs on `main` and pull requests (not every feature-branch push).
 
-Live tests (all `#[ignore]`, opt-in by env; they create and delete their own bucket):
+Live tests (all `#[ignore]`, opt-in by env; they create and delete their own
+bucket, or write under a unique prefix in `STORJ_BUCKET`). `live` /
+`live_concurrent` need `STORJ_LIVE=1` and load `STORJ_ACCESS` from a `.env`
+file in the workspace or a parent directory (`.env` does not enable them):
 
 ```bash
+STORJ_LIVE=1 cargo test -p storj --test live -- --ignored --nocapture
+STORJ_LIVE=1 cargo test -p storj --test live_concurrent -- --ignored --nocapture
 STORJ_INTEROP=1 cargo test -p storj --test interop -- --ignored --skip writer_reader_size_matrix   # grant round trips, needs Go only
 STORJ_SIM=1 STORJ_INTEROP=1 STORJ_SIM_ACCESS=<grant> cargo test -p storj --test sim --test interop -- --ignored --nocapture
 ```

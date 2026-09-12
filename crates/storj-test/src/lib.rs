@@ -5,14 +5,18 @@
 //! 2. Golden / protocol tests run by default against checked-in Go fixtures.
 //! 3. Interop (`STORJ_INTEROP=1`) builds Go uplink as a helper.
 //! 4. Sim (`STORJ_SIM=1` + `STORJ_SIM_ACCESS`) talks to `storj-sim`.
+//! 5. Live satellite tests (`#[ignore]` + `STORJ_LIVE=1`) load `STORJ_ACCESS`
+//!    from the environment or a `.env` file (see [`load_dotenv`]).
 
 use std::path::{Path, PathBuf};
 
 use storj::constants::{MAX_INLINE_SEGMENT_SIZE, MAX_SEGMENT_SIZE};
 
 mod listener;
+mod live;
 pub mod mock;
 pub mod mock_sn;
+pub use live::{LiveTarget, live_access, live_bucket, load_dotenv, with_live_cleanup};
 pub use mock::MockSatellite;
 pub use mock_sn::MockStorageNode;
 
@@ -65,8 +69,17 @@ pub fn sim_enabled() -> bool {
     env_flag("STORJ_SIM")
 }
 
+/// True when live satellite tests should run (`STORJ_LIVE=1` / `true` / `yes`).
+///
+/// Checked against the process environment only. A `.env` file may supply
+/// `STORJ_ACCESS` but does not opt these long-running tests in.
+pub fn live_enabled() -> bool {
+    env_flag("STORJ_LIVE")
+}
+
 /// Access grant serialized string from `storj-sim network env GATEWAY_0_ACCESS`.
 pub fn sim_access() -> Option<String> {
+    load_dotenv();
     std::env::var("STORJ_SIM_ACCESS")
         .ok()
         .filter(|s| !s.is_empty())
@@ -74,8 +87,9 @@ pub fn sim_access() -> Option<String> {
 
 /// Live satellite grant for object-level Go↔Rust interop.
 ///
-/// `STORJ_INTEROP_ACCESS` wins; otherwise `STORJ_SIM_ACCESS`.
+/// `STORJ_INTEROP_ACCESS` wins; otherwise `STORJ_SIM_ACCESS`. Loads `.env`.
 pub fn interop_access() -> Option<String> {
+    load_dotenv();
     std::env::var("STORJ_INTEROP_ACCESS")
         .ok()
         .filter(|s| !s.is_empty())
