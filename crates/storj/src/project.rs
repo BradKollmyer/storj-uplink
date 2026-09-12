@@ -39,6 +39,7 @@ pub(crate) struct ProjectInner {
     pub(crate) satellite_cert: Vec<u8>,
     pub(crate) dial_timeout: std::time::Duration,
     pub(crate) message_timeout: std::time::Duration,
+    pub(crate) download_hedge_delay: std::time::Duration,
 }
 
 /// Handle to a satellite project. `Clone` via `Arc`. `Send + Sync`.
@@ -79,6 +80,7 @@ impl Project {
                 satellite_cert,
                 dial_timeout,
                 message_timeout,
+                download_hedge_delay: config.download_hedge_delay_or_default(),
             }),
         })
     }
@@ -1192,6 +1194,7 @@ async fn decrypt_one_segment(
         size: piece_size,
         dial_timeout: project.dial_timeout,
         message_timeout: project.message_timeout,
+        hedge_delay: project.download_hedge_delay,
     })
     .await
     .map_err(map_uplink)?;
@@ -1729,6 +1732,7 @@ mod tests {
                 satellite_cert: Vec::new(),
                 dial_timeout: std::time::Duration::from_secs(1),
                 message_timeout: std::time::Duration::from_secs(1),
+                download_hedge_delay: std::time::Duration::from_secs(1),
             }),
         }
     }

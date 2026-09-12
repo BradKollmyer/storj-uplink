@@ -403,6 +403,11 @@ pub struct Config {
     /// 10 minutes. A slow-but-progressing transfer never trips it; a peer that
     /// stops responding fails within this bound instead of hanging forever.
     pub message_timeout: Option<Duration>,
+    /// Start an extra piece after this long without a completed piece download.
+    /// `None` uses one second; zero disables speculative downloads. Slow pieces
+    /// keep running until enough shares succeed. Spares are bounded to about
+    /// 20% of the required shares (at least two, at most the required count).
+    pub download_hedge_delay: Option<Duration>,
     /// How many remote segments may upload or download at once. The storage-node
     /// pool cap is this times RS `n` (production 110). `None` or 0 → 10.
     /// Extra segments wait for a free slot rather than dialing past the cap.
@@ -426,6 +431,11 @@ impl Config {
             None | Some(Duration::ZERO) => storj_rpc::conn::DEFAULT_TIMEOUT,
             Some(d) => d,
         }
+    }
+
+    /// Effective delay between speculative piece downloads; zero disables them.
+    pub fn download_hedge_delay_or_default(&self) -> Duration {
+        self.download_hedge_delay.unwrap_or(Duration::from_secs(1))
     }
 
     /// Effective remote-segment concurrency (`None`/zero → 10).
@@ -553,6 +563,21 @@ mod tests {
             .concurrent_segments_or_default(),
             4
         );
+    }
+
+    #[test]
+    fn download_hedge_delay_preserves_zero_as_disabled() {
+        assert_eq!(
+            Config::default().download_hedge_delay_or_default(),
+            Duration::from_secs(1)
+        );
+        for delay in [Duration::ZERO, Duration::from_millis(500)] {
+            let config = Config {
+                download_hedge_delay: Some(delay),
+                ..Default::default()
+            };
+            assert_eq!(config.download_hedge_delay_or_default(), delay);
+        }
     }
 
     #[test]

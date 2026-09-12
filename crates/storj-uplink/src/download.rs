@@ -558,6 +558,9 @@ pub struct LongTailDownload {
     pub dial_timeout: Duration,
     /// Per-read/write deadline on storage-node connections.
     pub message_timeout: Duration,
+    /// Delay without a completed piece before trying another node. Zero disables
+    /// speculative downloads; the original pieces are never timed out by this.
+    pub hedge_delay: Duration,
 }
 
 /// Extra pieces requested beyond `k` up front so one slow/failed node does
@@ -600,18 +603,26 @@ impl DownloadedPieces {
         let range = (self.offset, self.size);
         let timeouts = (self.dial_timeout, self.message_timeout);
         let connection_options = self.connection_options.clone();
-        match collect_piece_downloads(assignments, 1, 0, self.offset, self.size, move |asg| {
-            download_one_piece(
-                asg,
-                piece_key.clone(),
-                satellite_cert.clone(),
-                identity.clone(),
-                pool.clone(),
-                range,
-                timeouts,
-                connection_options.clone(),
-            )
-        })
+        match collect_piece_downloads(
+            assignments,
+            1,
+            0,
+            Duration::ZERO,
+            self.offset,
+            self.size,
+            move |asg| {
+                download_one_piece(
+                    asg,
+                    piece_key.clone(),
+                    satellite_cert.clone(),
+                    identity.clone(),
+                    pool.clone(),
+                    range,
+                    timeouts,
+                    connection_options.clone(),
+                )
+            },
+        )
         .await
         {
             Ok(collected) => {
@@ -627,11 +638,13 @@ impl DownloadedPieces {
 /// Download pieces until `k` succeed, then cancel the rest (long-tail).
 ///
 /// Only `k + LAUNCH_MARGIN` pieces are requested initially; each failure
-/// promotes the next unused assignment. Every launched piece signs an order
-/// for its full byte range, so this bounds egress to roughly `k + 1` pieces
-/// instead of all `n`. Unused assignments (including ones cancelled by the
-/// long tail) stay on [`DownloadedPieces`] so a later reconstruct failure
-/// can fetch replacements.
+/// promotes the next unused assignment. If no piece completes for `hedge_delay`,
+/// another assignment starts without cancelling the slow pieces. Speculative
+/// spares (including the initial margin) are capped at about 20% of `k`, with a
+/// minimum of two and maximum of `k`. Failures can require further replacements.
+/// Every launched piece signs an order for its full byte range. Unused assignments
+/// (including cancelled ones) stay on [`DownloadedPieces`] so a later reconstruct
+/// failure can fetch replacements.
 pub async fn download_pieces_long_tail(job: LongTailDownload) -> Result<DownloadedPieces> {
     let LongTailDownload {
         connection_options,
@@ -645,9 +658,16 @@ pub async fn download_pieces_long_tail(job: LongTailDownload) -> Result<Download
         size,
         dial_timeout,
         message_timeout,
+        hedge_delay,
     } = job;
-    let collected =
-        collect_piece_downloads(assignments.clone(), rs.k, LAUNCH_MARGIN, offset, size, {
+    let collected = collect_piece_downloads(
+        assignments.clone(),
+        rs.k,
+        LAUNCH_MARGIN,
+        hedge_delay,
+        offset,
+        size,
+        {
             let piece_key = piece_key.clone();
             let satellite_cert = satellite_cert.clone();
             let identity = identity.clone();
@@ -665,8 +685,9 @@ pub async fn download_pieces_long_tail(job: LongTailDownload) -> Result<Download
                     connection_options.clone(),
                 )
             }
-        })
-        .await?;
+        },
+    )
+    .await?;
     let have: HashSet<i32> = collected.shares.iter().map(|(n, _)| *n).collect();
     let unused = assignments
         .into_iter()
@@ -781,10 +802,12 @@ struct Collected<A> {
     unused: VecDeque<A>,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn collect_piece_downloads<A, F, Fut>(
     assignments: Vec<A>,
     required: usize,
     margin: usize,
+    hedge_delay: Duration,
     offset: i64,
     size: i64,
     download: F,
@@ -818,7 +841,31 @@ where
     }
     let mut successes = Vec::new();
     let mut failures = Vec::new();
-    while let Some(joined) = set.join_next().await {
+    // Do not fan out to every node when the whole connection is slow. Count
+    // speculative launches separately from failure replacements so even failed
+    // hedges cannot replenish this budget. Production k=29 allows six spares
+    // in total (35 attempts without failures), including the initial margin.
+    let mut hedges_left = required
+        .div_ceil(5)
+        .max(2)
+        .min(required)
+        .saturating_sub(margin);
+    while !set.is_empty() {
+        let joined = tokio::select! {
+            biased;
+            // Prefer a ready result over an unnecessary extra download.
+            joined = set.join_next() => joined,
+            () = tokio::time::sleep(hedge_delay),
+                if !hedge_delay.is_zero() && hedges_left > 0 && !queue.is_empty() => {
+                if let Some(asg) = queue.pop_front() {
+                    set.spawn(download(asg));
+                    attempted += 1;
+                    hedges_left -= 1;
+                }
+                continue;
+            }
+        };
+        let Some(joined) = joined else { break };
         match joined {
             Ok(Ok(piece)) => {
                 successes.push(piece);
@@ -970,6 +1017,7 @@ mod tests {
             jobs,
             required,
             LAUNCH_MARGIN,
+            Duration::from_secs(1),
             496384,
             256,
             |(piece, delay, error)| async move {
@@ -1078,17 +1126,17 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn leftover_assignments_are_returned() {
-        let collected =
-            collect_piece_downloads(
-                vec![0, 1, 2, 3],
-                2,
-                1,
-                0,
-                1,
-                |n| async move { Ok((n, vec![1])) },
-            )
-            .await
-            .unwrap();
+        let collected = collect_piece_downloads(
+            vec![0, 1, 2, 3],
+            2,
+            1,
+            Duration::from_secs(1),
+            0,
+            1,
+            |n| async move { Ok((n, vec![1])) },
+        )
+        .await
+        .unwrap();
         assert_eq!(collected.shares.len(), 2);
         assert_eq!(
             collected.unused.len(),
@@ -1097,12 +1145,166 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn slow_successes_are_hedged_without_waiting_for_a_timeout() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        struct Finished(Arc<AtomicUsize>);
+        impl Drop for Finished {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let finished = Arc::new(AtomicUsize::new(0));
+        let started = tokio::time::Instant::now();
+        let collected = collect_piece_downloads(
+            vec![(0, 10), (1, 60_000), (2, 60_000), (3, 10), (4, 10)],
+            2,
+            1,
+            Duration::from_secs(1),
+            0,
+            256,
+            |(piece, delay)| {
+                let guard = Finished(Arc::clone(&finished));
+                async move {
+                    let _guard = guard;
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                    Ok((piece, vec![42]))
+                }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            collected.shares.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+            vec![0, 3]
+        );
+        assert!(started.elapsed() >= Duration::from_secs(1));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(
+            finished.load(Ordering::SeqCst),
+            4,
+            "slow surplus tasks are cancelled and drained"
+        );
+        assert_eq!(collected.unused.len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn healthy_downloads_do_not_start_speculative_pieces() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let launched = AtomicUsize::new(0);
+        collect_piece_downloads(
+            (0..80).collect(),
+            29,
+            1,
+            Duration::from_secs(1),
+            0,
+            256,
+            |piece| {
+                launched.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    Ok((piece, vec![42]))
+                }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(launched.load(Ordering::SeqCst), 30);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn speculative_downloads_have_a_fixed_budget() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let launched = AtomicUsize::new(0);
+        let collected = collect_piece_downloads(
+            (0..80).collect(),
+            29,
+            1,
+            Duration::from_secs(1),
+            0,
+            256,
+            |piece| {
+                launched.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    Ok((piece, vec![42]))
+                }
+            },
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(10), collected)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            launched.load(Ordering::SeqCst),
+            35,
+            "do not fan out to all 80 nodes on a slow link"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hedging_can_be_disabled() {
+        let started = tokio::time::Instant::now();
+        let collected = collect_piece_downloads(
+            vec![(0, 10), (1, 2_000), (2, 3_000), (3, 10)],
+            2,
+            1,
+            Duration::ZERO,
+            0,
+            256,
+            |(piece, delay)| async move {
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+                Ok((piece, vec![42]))
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(started.elapsed(), Duration::from_secs(2));
+        assert_eq!(
+            collected.shares.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert_eq!(collected.unused.len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failures_still_get_replacements_after_the_hedge_budget_is_spent() {
+        let pieces = scheduled(
+            vec![
+                (0, 10, None),
+                (1, 60_000, None),
+                (2, 60_000, None),
+                (3, 10, Some(Error::DialTimeout)),
+                (4, 10, None),
+            ],
+            2,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            pieces.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+            vec![0, 4]
+        );
+    }
+
     #[tokio::test]
     async fn invalid_ranges_fail_before_spawning_downloads() {
         for (offset, size) in [(-1, 1), (1, -1), (i64::MAX, 1)] {
-            let err = collect_piece_downloads(vec![()], 1, 0, offset, size, |_| async {
-                panic!("invalid request must not start a node connection");
-            })
+            let err = collect_piece_downloads(
+                vec![()],
+                1,
+                0,
+                Duration::from_secs(1),
+                offset,
+                size,
+                |_| async {
+                    panic!("invalid request must not start a node connection");
+                },
+            )
             .await
             .unwrap_err();
             assert!(matches!(err, Error::InvalidDownloadRange { .. }));

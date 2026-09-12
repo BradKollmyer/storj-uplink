@@ -76,6 +76,7 @@ fn config_remains_constructible_by_literal() {
         user_agent: None,
         dial_timeout: None,
         message_timeout: None,
+        download_hedge_delay: None,
         tls_identity: None,
         transport: storj::TransportMode::Noise,
         network: storj::NetworkOptions {
