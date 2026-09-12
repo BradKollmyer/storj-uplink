@@ -558,8 +558,8 @@ pub struct LongTailDownload {
     pub dial_timeout: Duration,
     /// Per-read/write deadline on storage-node connections.
     pub message_timeout: Duration,
-    /// Delay without a completed piece before trying another node. Zero disables
-    /// speculative downloads; the original pieces are never timed out by this.
+    /// Interval between speculative node launches; completions do not reset it.
+    /// Zero disables speculation. Original pieces are never timed out by this.
     pub hedge_delay: Duration,
 }
 
