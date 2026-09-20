@@ -13,7 +13,7 @@
 ---
 
 This document retains the original 1.0 design and method mapping. The current
-release is **1.1.0**: the expanded literal-constructible
+release is **1.1.1**: the expanded literal-constructible
 `Config` is a breaking change (including `download_hedge_delay` and
 `concurrent_segments`), and public transport/telemetry types are owned
 by the `storj` facade with private conversions to RPC types. See `CHANGELOG.md`

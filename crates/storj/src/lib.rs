@@ -1,6 +1,6 @@
 //! Native Rust Uplink client for the Storj decentralized object store.
 //!
-//! **1.1.0** extends the public `storj::*` API: access grants, buckets,
+//! **1.1.1** extends the public `storj::*` API: access grants, buckets,
 //! objects (multi-segment upload/download), listing, copy/move, multipart,
 //! revoke, and Object Lock. Edge credential registration and linksharing are
 //! outside this crate's scope.

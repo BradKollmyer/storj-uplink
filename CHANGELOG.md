@@ -12,10 +12,13 @@ published so the facade can resolve on crates.io; they are not a stable API.
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-09-19
+
 ### Fixed
 
 - Bump locked `rustls` to 0.23.45 (`RUSTSEC-2026-0285`: TLS 1.3 handshake
   messages incorrectly accepted across encryption level boundaries).
+  All published workspace crates move together to 1.1.1.
 
 ## [1.1.0] - 2026-09-19
 
