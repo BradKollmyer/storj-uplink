@@ -29,12 +29,18 @@ published so the facade can resolve on crates.io; they are not a stable API.
   options for Object Lock and placement.
 - `Config.concurrent_segments` (default 10): storage-node pool cap is this
   times RS `n`, so several remote segments can transfer at once.
+- `Config.download_hedge_delay` (default 1s; zero disables): while a remote
+  segment still needs shares, launch extra pieces on this interval without
+  cancelling slow ones. Completions do not postpone the next launch.
+  Speculative spares, including the initial margin, are capped at about 20%
+  of the required shares (at least two, at most the required count).
 
 ### Breaking changes and migration
 
-- `Config` adds `tls_identity`, `transport`, `network`, `telemetry`, and
-  `concurrent_segments`. Complete 1.0 literals must add these fields or end
-  with `..Default::default()`. Option structs remain constructible by literal.
+- `Config` adds `tls_identity`, `transport`, `network`, `telemetry`,
+  `download_hedge_delay`, and `concurrent_segments`. Complete 1.0 literals
+  must add these fields or end with `..Default::default()`. Option structs
+  remain constructible by literal.
 - `DownloadOptions` adds `version`; `UploadOptions` and `CommitUploadOptions`
   add `checksum`. For 1.0 behavior use an empty version and `checksum: None`,
   or supply the original fields with `..Default::default()`.
@@ -96,6 +102,9 @@ published so the facade can resolve on crates.io; they are not a stable API.
   hang until `message_timeout` (10 minutes). Successful RPCs still recycle.
 - Size the default SN pool for ten concurrent remote segments so parallel
   object uploads no longer serialize on a single RS cohort of connections.
+- Keep a persistent download-hedge timer so trickling piece completions cannot
+  postpone the next speculative launch. The first extra piece starts after
+  `download_hedge_delay`, not after the last completion.
 
 
 ### Changed

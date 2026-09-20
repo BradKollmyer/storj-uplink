@@ -176,12 +176,20 @@ bytes are zeroized when dropped.
 
 Callbacks run synchronously and may run concurrently; keep them fast and
 nonblocking. With panic unwinding, callback panics are caught. There is no
-automatic network exporter or background delivery queue. Existing `Config`
-struct literals from 1.0 must add the four new fields or use
-`..Default::default()`. To retain the 1.0 transport policy, set
-`transport: TransportMode::Tcp`; the new default selects advertised Noise.
-Public transport and telemetry types are defined by `storj`; internal RPC
-types are not part of the facade API.
+automatic network exporter or background delivery queue.
+
+Remote-segment downloads launch extra pieces every `download_hedge_delay`
+(default 1s) while more shares are needed; piece completions do not postpone
+that deadline. `Some(Duration::ZERO)` disables hedging. Speculative launches
+are capped at about 20% of the required shares. `concurrent_segments`
+(default 10) caps how many remote segments transfer at once.
+
+Existing `Config` struct literals from 1.0 must add the new fields
+(`tls_identity`, `transport`, `network`, `telemetry`, `download_hedge_delay`,
+and `concurrent_segments`) or use `..Default::default()`. To retain the 1.0
+transport policy, set `transport: TransportMode::Tcp`; the new default
+selects advertised Noise. Public transport and telemetry types are defined
+by `storj`; internal RPC types are not part of the facade API.
 
 ## Comparison with `uplink` 0.11.0 (FFI)
 

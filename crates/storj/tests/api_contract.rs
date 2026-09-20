@@ -71,7 +71,7 @@ fn permission_full_is_not_2025_four_flag_full() {
 
 #[test]
 fn config_remains_constructible_by_literal() {
-    // 2.0 adds explicit options rather than making the public struct opaque.
+    // 1.1 adds explicit options rather than making the public struct opaque.
     let c = Config {
         user_agent: None,
         dial_timeout: None,
