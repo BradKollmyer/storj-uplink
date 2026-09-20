@@ -10,7 +10,9 @@ The public API is `storj::*` only. Implementation crates (`storj-access`,
 published so the facade can resolve on crates.io; they are not a stable API.
 `storj-test` stays unpublished.
 
-## [1.1.0] - Unreleased
+## [Unreleased]
+
+## [1.1.0] - 2026-09-19
 
 ### Added
 
@@ -57,8 +59,7 @@ published so the facade can resolve on crates.io; they are not a stable API.
   internal-crate re-exports present in unreleased development snapshots have
   been removed. Applications should use `storj::{TransportMode, NetworkOptions,
   Telemetry, TelemetryEvent, ...}`.
-- All published workspace crates move together to 1.1.0. This is release
-  preparation only; no crates have been published by this change.
+- All published workspace crates move together to 1.1.0.
 
 ### Fixed
 

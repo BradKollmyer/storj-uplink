@@ -1,6 +1,6 @@
 //! Native Rust Uplink client for the Storj decentralized object store.
 //!
-//! **1.1.0 (unreleased)** extends the public `storj::*` API: access grants, buckets,
+//! **1.1.0** extends the public `storj::*` API: access grants, buckets,
 //! objects (multi-segment upload/download), listing, copy/move, multipart,
 //! revoke, and Object Lock. Edge credential registration and linksharing are
 //! outside this crate's scope.
@@ -8,7 +8,7 @@
 //! Not a wrapper around `uplink-c`, and not a drop-in for crates.io `uplink`
 //! 0.11.0 (blocking FFI, `!Send`). Spec: `docs/design-native-uplink.md`.
 //!
-//! Until 1.1.0 is published, use a path dependency on this checkout. Callers need their
+//! Depend on this crate from crates.io (`storj = "1.1"`). Callers need their
 //! own Tokio runtime (`tokio` is not re-exported).
 //!
 //! MSRV 1.88, edition 2024. Dual-licensed MIT OR Apache-2.0.
