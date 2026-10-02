@@ -14,7 +14,21 @@ STORJ_COMMON_SHA=d38275a3768ba356144814f3ec5d62eeca670e49
 STORJ_UPLINK_SHA=2fef38720d8395837567da60ab69016099dca9f5
 
 `storj/uplink` at the pin depends on `storj.io/common` at that common SHA
-(`go.mod` pseudoversion `v0.0.0-20260818140313-d38275a3768b`).
+(`go.mod` pseudoversion `v0.0.0-20260818140313-d38275a3768b`). v1.14.5
+(`2fef387`, released 2026-09-01) is still the latest tag.
+
+Reviewed 2026-10-02. `storj/uplink` main `764fb8b` is two commits past the pin
+and still depends on this common SHA. `storj/common` main `58b262d` does not
+change metainfo, orders, encryption, or grant protos. No pin bump.
+
+- `e574a6d` deletes unused Go upload-path API (`PutSingleResult`,
+  `EncodedRanger`). This client never had that path.
+- `764fb8b` returns the real abort error from Go's stream-buffer `WaitWrite`
+  when the writer is between calls. `UploadInner::poll_pending_flush` already
+  returns the segment task's error and keeps it sticky for later writes and
+  `commit`.
+- Common additions since the pin (`sync.WaitGroup.Go`, tee-block release,
+  USDC, a `CheckInResponse` notification) are outside the uplink client.
 
 ## Files
 

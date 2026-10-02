@@ -34,7 +34,7 @@ The crate is a **native protocol implementation**. Existing Rust bindings (`upli
 
 ### Current state
 
-- **Canonical client:** [`github.com/storj/uplink`](https://github.com/storj/uplink) (`storj.io/uplink`), MIT, latest documented release **v1.14.5** (Go docs dated 2026-08-18).
+- **Canonical client:** [`github.com/storj/uplink`](https://github.com/storj/uplink) (`storj.io/uplink`), MIT, latest release **v1.14.5** (2026-09-01, `2fef387`). Main was reviewed 2026-10-02 at `764fb8b`; those commits are internal and do not change the pin (see `proto/README.md`).
 - **C ABI:** [`github.com/storj/uplink-c`](https://github.com/storj/uplink-c) — cgo wrapper of Go uplink. Python, PHP, Node, Java, Ruby, and the existing Rust bindings all wrap this.
 - **Existing Rust:** [`storj-thirdparty/uplink-rust`](https://github.com/storj-thirdparty/uplink-rust) publishes `uplink` 0.11.0 (MIT) and `uplink-sys` 0.8.0 (Apache-2.0), last crates.io release **2025-05-30**. Status is explicitly **beta**; build requires Go; ~21k all-time downloads. No production references are claimed.
 - **Native access-grant-only library:** [`storj/access-python`](https://github.com/storj/access-python) shows Storj itself is willing to reimplement grant restriction outside Go for languages that need it. Object I/O in Python is officially steered toward **boto3 + GatewayMT** ([forum, 2024-02](https://forum.storj.io/t/best-practice-for-using-storj-in-a-python-environment/25359)).
