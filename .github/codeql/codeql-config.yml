@@ -1,4 +1,4 @@
-name: storj-uplink
+name: uplink-rs
 # Integration tests and goldens pin Go vectors with fixed passphrases/keys/nonces.
 # `filter-test-alerts.py` strips trailing `#[cfg(test)] mod` blocks, the
 # unpublished `storj-test` mock crate, and documented production false

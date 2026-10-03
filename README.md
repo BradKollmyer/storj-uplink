@@ -1,4 +1,4 @@
-# storj-uplink
+# uplink-rs
 
 Native Rust [Uplink](https://pkg.go.dev/storj.io/uplink) client for [Storj](https://storj.io).
 
@@ -23,7 +23,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util"] }
 
 Callers need their own Tokio runtime; `tokio` is not re-exported.
 
-Git: `storj = { git = "https://github.com/BradKollmyer/storj-uplink", tag = "v1.1.1" }`.
+Git: `storj = { git = "https://github.com/BradKollmyer/uplink-rs", tag = "v1.1.1" }`.
 From this workspace: `storj = { path = "crates/storj" }`.
 
 The public API is `storj::*` only. Implementation crates (`storj-access`,
