@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for contributing to `storj-uplink`.
+Thanks for contributing to `uplink-rs`.
 
 This project follows the [Contributor Covenant](CODE_OF_CONDUCT.md). Report
 security issues privately as described in [SECURITY.md](SECURITY.md).

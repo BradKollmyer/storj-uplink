@@ -6,8 +6,8 @@
 | **Author** | TBD |
 | **Date** | 2026-09-01 (1.0.0 on `main` 2026-09-02) |
 | **Status** | Implemented |
-| **Audience** | Engineers using or changing `storj-uplink` |
-| **Repo** | `storj-uplink` |
+| **Audience** | Engineers using or changing `uplink-rs` |
+| **Repo** | `uplink-rs` |
 | **Analog** | Go [`storj.io/uplink`](https://pkg.go.dev/storj.io/uplink) v1.14.5; prior Rust [`uplink` 0.11.0](https://docs.rs/uplink/0.11.0/uplink/) (FFI, May 2025) |
 
 ---
@@ -406,7 +406,7 @@ sequenceDiagram
 ### Crate layout
 
 ```
-storj-uplink/                        # workspace root
+uplink-rs/                           # workspace root
 ├── Cargo.toml                       # [workspace] members, resolver = "2"
 ├── LICENSE-MIT
 ├── LICENSE-APACHE
@@ -446,7 +446,7 @@ members = ["crates/*"]
 edition = "2024"
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/<org>/storj-uplink"
+repository = "https://github.com/<org>/uplink-rs"
 version = "0.1.0"
 
 [workspace.dependencies]

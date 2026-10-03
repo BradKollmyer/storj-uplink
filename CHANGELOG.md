@@ -12,6 +12,8 @@ published so the facade can resolve on crates.io; they are not a stable API.
 
 ## [Unreleased]
 
+- Repository name is `uplink-rs` (was `storj-uplink`). The public crate remains `storj`.
+
 ## [1.1.1] - 2026-09-19
 
 ### Fixed

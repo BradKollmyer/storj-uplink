@@ -8,8 +8,8 @@ edition = "2024"
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 version = "1.1.1"
-repository = "https://github.com/BradKollmyer/storj-uplink"
-homepage = "https://github.com/BradKollmyer/storj-uplink"
+repository = "https://github.com/BradKollmyer/uplink-rs"
+homepage = "https://github.com/BradKollmyer/uplink-rs"
 
 [workspace.dependencies]
 storj = { path = "crates/storj", version = "1.1.1" }
