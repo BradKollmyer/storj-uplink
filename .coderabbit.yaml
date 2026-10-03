@@ -7,7 +7,8 @@ reviews:
   poem: false
   in_progress_fortune: false
   auto_review:
-    enabled: true
+    # OSS plan does not auto-review public repos under 10 stars.
+    enabled: false
     drafts: false
   path_filters:
     - "!**/Cargo.lock"
